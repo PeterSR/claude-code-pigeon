@@ -52,8 +52,10 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 		return nil
 	}
 
+	// CurrentSessionID validates the value, so an unsubstituted "${...}"
+	// literal or anything else unsafe already arrives here as "".
 	sid := CurrentSessionID()
-	if sid == "" || strings.Contains(sid, "${") {
+	if sid == "" {
 		// Fail loudly. Guessing which session we belong to is worse than not
 		// running: a wrong guess delivers another session's mail.
 		logf("FATAL: %s is unset -- cannot identify this session.", EnvSessionID)
@@ -95,8 +97,11 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	}
 	logf("armed session=%s spool=%s", sid, spool)
 
+	// Trap before doing anything interruptible, so a signal arriving during
+	// startup is not lost, and release the handlers on the way out.
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	defer signal.Stop(sigc)
 
 	done := make(chan struct{})
 	var closeOnce sync.Once
@@ -105,7 +110,7 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	lines := make(chan *Message, 256)
 
 	go heartbeat(sid, done)
-	go watchdog(CurrentClaudePID(), sigc, logf)
+	go watchdog(CurrentClaudePID(), sigc, done, logf)
 
 	// Direct inbox: resume from our own cursor so mail queued while no monitor
 	// was listening is delivered when one comes back, rather than skipped.
@@ -267,17 +272,27 @@ func heartbeat(sid string, done <-chan struct{}) {
 // watchdog exits when the owning claude process goes away, so a hard-killed
 // session does not leave an orphaned monitor behind. (Never blanket-pkill
 // these: you would kill other sessions' monitors too.)
-func watchdog(pid int, sigc chan<- os.Signal, logf func(string, ...any)) {
+func watchdog(pid int, sigc chan<- os.Signal, done <-chan struct{}, logf func(string, ...any)) {
 	if pid <= 0 {
 		return
 	}
 	want := ProcStart(pid)
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
-	for range t.C {
+	for {
+		select {
+		case <-done:
+			return
+		case <-t.C:
+		}
 		if !ProcessAlive(pid, want) {
 			logf("claude pid %d is gone -- exiting", pid)
-			sigc <- syscall.SIGTERM
+			// Non-blocking: if the shutdown path is already running, nobody
+			// is left to receive this and we must not wedge here.
+			select {
+			case sigc <- syscall.SIGTERM:
+			default:
+			}
 			return
 		}
 	}

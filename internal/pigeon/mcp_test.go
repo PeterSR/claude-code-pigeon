@@ -205,6 +205,97 @@ func TestWhoamiOutsideASession(t *testing.T) {
 	}
 }
 
+func TestListSessionsMarksSelfAndFlagsDeafPeers(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "aaaa1111-2222")
+	liveEntry(t, "aaaa1111-2222", "alpha", "/home/p/api")
+	beta := liveEntry(t, "bbbb2222-3333", "beta", "/home/p/web")
+	beta.Description = "refactoring the parser"
+	if err := WriteEntry(beta); err != nil {
+		t.Fatalf("WriteEntry: %v", err)
+	}
+
+	got := toolText(t, "list_sessions", map[string]any{})
+	for _, want := range []string{"alpha", "beta", "refactoring the parser", "* = this session"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("list_sessions is missing %q:\n%s", want, got)
+		}
+	}
+	// No monitor holds any lock in tests, so every session is deaf. The model
+	// has to be told that plainly, or it will assume its message landed.
+	if !strings.Contains(got, "not listening") {
+		t.Errorf("deaf sessions are not flagged:\n%s", got)
+	}
+	// The caller needs to know which line is itself before it starts messaging.
+	if !strings.Contains(got, "* aaaa1111") {
+		t.Errorf("this session is not marked:\n%s", got)
+	}
+}
+
+func TestListSessionsWhenNobodyIsRegistered(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "aaaa1111-2222")
+	// An empty registry is the normal state before anyone restarts, so it must
+	// read as an answer rather than as an empty table.
+	if got := toolText(t, "list_sessions", map[string]any{}); !strings.Contains(got, "No other Claude Code sessions") {
+		t.Errorf("got %q, want an explicit empty-registry answer", got)
+	}
+}
+
+func TestWhoamiReportsIdentityAndDashesTheBlanks(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "aaaa1111-2222")
+	liveEntry(t, "aaaa1111-2222", "", "/home/p/api")
+
+	got := toolText(t, "whoami", map[string]any{})
+	if !strings.Contains(got, "session:     aaaa1111-2222") {
+		t.Errorf("whoami does not report the session id:\n%s", got)
+	}
+	// An undeclared name must render as a dash rather than a blank, so the
+	// model can tell "not set" from "failed to read".
+	if !strings.Contains(got, "name:        -") {
+		t.Errorf("an undeclared name did not render as a dash:\n%s", got)
+	}
+	// Without a name the address is the short id, and whoami is where a
+	// session learns what to tell a peer.
+	if !strings.Contains(got, "pigeon send aaaa1111") {
+		t.Errorf("whoami does not report a usable address:\n%s", got)
+	}
+}
+
+func TestWhoamiForAnUnregisteredSession(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "cccc3333-4444")
+	// Inside a session but with no entry means the monitor never started: the
+	// answer has to point at that, not just report nothing.
+	got := toolText(t, "whoami", map[string]any{})
+	if !strings.Contains(got, "not registered") {
+		t.Errorf("got %q, want an explanation that the session never registered", got)
+	}
+}
+
+func TestSubscriptionToolsRequireASession(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "")
+	// Subscribing needs an identity to attach the subscription to, so from a
+	// plain shell it must fail rather than guess.
+	if got := toolText(t, "subscribe", map[string]any{"topic": "deploys"}); !strings.Contains(got, "not running inside") {
+		t.Errorf("got %q, want a not-in-a-session error", got)
+	}
+	t.Setenv(EnvSessionID, "aaaa1111-2222")
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+	if got := toolText(t, "subscribe", map[string]any{}); !strings.Contains(got, "required") {
+		t.Errorf("got %q, want a missing-topic error", got)
+	}
+}
+
+func TestPublishRequiresBothFields(t *testing.T) {
+	withHome(t)
+	if got := toolText(t, "publish", map[string]any{"topic": "deploys"}); !strings.Contains(got, "required") {
+		t.Errorf("got %q, want a validation message", got)
+	}
+}
+
 func TestRunMCPHandlesAStream(t *testing.T) {
 	withHome(t)
 	in := strings.NewReader(

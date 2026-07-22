@@ -8,6 +8,10 @@ import (
 	"path/filepath"
 )
 
+// projectURL is the canonical home of the project, surfaced in the generated
+// plugin manifest so an installed plugin says where it came from.
+const projectURL = "https://github.com/PeterSR/claude-code-pigeon"
+
 // Plugin install target. A plugin scaffolded under ~/.claude/skills/<name>
 // auto-loads on the next session as <name>@skills-dir, so there is no
 // marketplace to stand up and nothing to clone -- the binary writes its own
@@ -24,9 +28,17 @@ func pluginDir() (string, error) {
 }
 
 type pluginManifest struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Version     string `json:"version"`
+	Name        string       `json:"name"`
+	Description string       `json:"description"`
+	Version     string       `json:"version"`
+	Author      pluginAuthor `json:"author"`
+	Homepage    string       `json:"homepage,omitempty"`
+	License     string       `json:"license,omitempty"`
+}
+
+type pluginAuthor struct {
+	Name string `json:"name"`
+	URL  string `json:"url,omitempty"`
 }
 
 type monitorSpec struct {
@@ -64,6 +76,9 @@ func Install(version string, w io.Writer) error {
 		Name:        "pigeon",
 		Description: "Message passing between live Claude Code sessions",
 		Version:     version,
+		Author:      pluginAuthor{Name: "PeterSR", URL: projectURL},
+		Homepage:    projectURL,
+		License:     "MIT",
 	}
 	if err := writeJSON(filepath.Join(dir, ".claude-plugin", "plugin.json"), man); err != nil {
 		return err

@@ -7,6 +7,11 @@ All notable changes to this project are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- `pigeon prune` now reclaims topic logs: a log nobody subscribes to is removed, and
+  the prefix every live subscriber has already read is compacted away. Followers
+  detect a replaced log and resume from their cursor rather than replaying it.
+- `pigeon ls` and the `list_sessions` tool say which row is the calling session, and
+  say so explicitly when the caller is not registered or is a plain shell.
 - Builds for Linux, macOS, FreeBSD, OpenBSD and Windows. File locking and process
   liveness are behind a platform abstraction; on Windows the CLI works but the
   monitor stands down, since Claude Code only arms plugin monitors on Unix.
@@ -15,6 +20,14 @@ All notable changes to this project are documented here. Format follows
 - `skills/session-coordination`, an example Claude Code skill. Not installed by
   `pigeon install` -- copy it to `~/.claude/skills/` deliberately.
 - `pigeon version` reports the commit and build date.
+- The generated plugin manifest carries author, homepage and licence, so
+  `claude plugin validate` is warning-free.
+
+### Fixed
+- A message from a shell is now marked as having no reply address. Saying nothing
+  was not enough: recipients read the `shell:user@host` stamp as an address and
+  wasted a call discovering it was not one.
+- `pigeon prune` left the entry lock and cursor file behind.
 
 ## [0.1.0] - 2026-07-22
 

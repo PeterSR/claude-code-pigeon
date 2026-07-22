@@ -48,7 +48,7 @@ const usage = `pigeon -- message passing between live Claude Code sessions
   pigeon whoami                  show this session's identity and address
   pigeon name <name>             declare this session's name (usable as address)
   pigeon describe <text>         declare what this session is working on
-  pigeon prune                   forget sessions whose process is gone
+  pigeon prune                   forget dead sessions and reclaim topic logs
   pigeon monitor                 run the inbox monitor (used by the plugin)
   pigeon mcp                     run the MCP server (used by the plugin)
   pigeon version
@@ -156,6 +156,27 @@ func cmdList(args []string) error {
 	if err := w.Flush(); err != nil {
 		return err
 	}
+
+	// Say plainly which row is the caller, and -- more useful -- say so when
+	// none of them is.
+	self := (*pigeon.Entry)(nil)
+	for _, e := range entries {
+		if e.SessionID == me {
+			self = e
+			break
+		}
+	}
+	switch {
+	case self != nil:
+		fmt.Printf("\n* this session, reachable as: pigeon send %s\n", self.Addr())
+	case me != "":
+		fmt.Printf("\nthis session (%s) is not registered, so nothing can reach it.\n", pigeon.Short(me))
+		fmt.Println("run `pigeon arm`, or install the plugin and restart Claude Code.")
+	default:
+		fmt.Println("\nnot inside a Claude Code session; anything you send is stamped")
+		fmt.Printf("%s and cannot be replied to.\n", pigeon.ShellIdentity())
+	}
+
 	for _, e := range entries {
 		if e.Status == pigeon.StatusDeaf {
 			fmt.Printf("\nwarning: %s is running but its monitor is not listening.\n",
@@ -360,7 +381,27 @@ func cmdPrune() error {
 		return err
 	}
 	fmt.Printf("pruned %d dead session(s)\n", len(before)-len(after))
+
+	// Topic logs are append-only, so reclaim the prefix every live subscriber
+	// has already read, and drop logs nobody subscribes to.
+	res, err := pigeon.PruneTopics()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("removed %d unsubscribed topic log(s), compacted %d, reclaimed %s\n",
+		res.TopicsRemoved, res.TopicsCompacted, humanBytes(res.BytesReclaimed))
 	return nil
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
 }
 
 func ownEntry() (*pigeon.Entry, error) {

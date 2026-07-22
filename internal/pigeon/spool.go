@@ -210,6 +210,11 @@ func Render(m *Message) string {
 	var tail strings.Builder
 	if addr := m.From.Addr(); addr != "" {
 		tail.WriteString(" [reply: pigeon send " + Sanitize(addr) + "]")
+	} else {
+		// Saying nothing is not enough: a recipient reads "from
+		// shell:user@host", assumes it is an address, and wastes a call
+		// discovering it is not. Say so outright.
+		tail.WriteString(" [no reply address: sent from a shell, not a session]")
 	}
 	if m.Topic != "" {
 		tail.WriteString(" [topic: pigeon publish " + Sanitize(m.Topic) + "]")

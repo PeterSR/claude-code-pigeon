@@ -3,6 +3,7 @@ package pigeon
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -73,6 +74,13 @@ func Publish(topic, text string, from Sender) (*Message, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Hold the topic lock so an append cannot land mid-compaction.
+	unlock, err := blockingExclusive(topicLockPath(topic))
+	if err != nil {
+		return nil, err
+	}
+	defer unlock.Close()
+
 	f, err := os.OpenFile(TopicPath(topic), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open topic: %w", err)
@@ -227,4 +235,147 @@ func ListTopics() ([]TopicInfo, error) {
 type TopicInfo struct {
 	Name        string `json:"name"`
 	Subscribers int    `json:"subscribers"`
+}
+
+// --- retention -------------------------------------------------------------
+
+// topicLockPath guards a topic log while it is being rewritten, so an append
+// cannot land in the middle of a compaction.
+func topicLockPath(topic string) string {
+	return filepath.Join(LocksDir(), "topic-"+topic+".lock")
+}
+
+// minCompactBytes is the smallest saving worth rewriting a file for. Below it
+// the churn -- and the offset shuffle every reader has to absorb -- costs more
+// than the disk it reclaims.
+const minCompactBytes = 64 * 1024
+
+// PruneResult reports what a retention pass reclaimed.
+type PruneResult struct {
+	TopicsRemoved   int
+	TopicsCompacted int
+	BytesReclaimed  int64
+}
+
+// PruneTopics reclaims space in topic logs.
+//
+// A topic log is append-only and every subscriber reads it at its own offset,
+// so the prefix that every live subscriber has already passed is dead weight.
+// This drops that prefix and rewinds each subscriber's cursor by the same
+// amount. A topic nobody subscribes to is removed outright.
+//
+// Call it after dead sessions have been pruned: a dead session's stale cursor
+// would otherwise pin the whole history.
+func PruneTopics() (PruneResult, error) {
+	var res PruneResult
+	if err := EnsureDirs(); err != nil {
+		return res, err
+	}
+	paths, err := filepath.Glob(filepath.Join(TopicsDir(), "*.ndjson"))
+	if err != nil {
+		return res, err
+	}
+	sessions, err := ListSessions(false, false)
+	if err != nil {
+		return res, err
+	}
+
+	for _, p := range paths {
+		topic := strings.TrimSuffix(filepath.Base(p), ".ndjson")
+		if ValidTopic(topic) != nil {
+			continue
+		}
+
+		var subs []*Entry
+		for _, e := range sessions {
+			for _, t := range e.Subscriptions {
+				if t == topic {
+					subs = append(subs, e)
+					break
+				}
+			}
+		}
+
+		unlock, err := blockingExclusive(topicLockPath(topic))
+		if err != nil {
+			continue
+		}
+
+		fi, err := os.Stat(p)
+		if err != nil {
+			unlock.Close()
+			continue
+		}
+
+		// Nobody is listening, so nothing in the file can still be wanted.
+		if len(subs) == 0 {
+			if err := os.Remove(p); err == nil {
+				res.TopicsRemoved++
+				res.BytesReclaimed += fi.Size()
+			}
+			unlock.Close()
+			continue
+		}
+
+		cut := fi.Size()
+		for _, e := range subs {
+			if off := readCursors(e.SessionID)[topic]; off < cut {
+				cut = off
+			}
+		}
+		if cut < minCompactBytes {
+			unlock.Close()
+			continue
+		}
+
+		if err := compactFrom(p, cut); err != nil {
+			unlock.Close()
+			continue
+		}
+		// Rewind every subscriber so their offsets still point at the same
+		// messages. A follower notices the file shrank and reloads from here.
+		for _, e := range subs {
+			_ = mutateCursors(e.SessionID, func(m map[string]int64) {
+				if off, ok := m[topic]; ok {
+					m[topic] = off - cut
+				}
+			})
+		}
+		res.TopicsCompacted++
+		res.BytesReclaimed += cut
+		unlock.Close()
+	}
+	return res, nil
+}
+
+// compactFrom rewrites path keeping only the bytes from off onward, via a temp
+// file and a rename so a reader never observes a half-written log.
+func compactFrom(path string, off int64) error {
+	src, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	if _, err := src.Seek(off, io.SeekStart); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "compact-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if _, err := io.Copy(tmp, src); err != nil {
+		tmp.Close()
+		_ = os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	if err := os.Chmod(name, 0o600); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	return os.Rename(name, path)
 }

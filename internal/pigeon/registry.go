@@ -208,9 +208,7 @@ func ListSessions(includeDead, prune bool) ([]*Entry, error) {
 		e.Status = e.status()
 		if e.Status == StatusDead {
 			if prune {
-				_ = os.Remove(p)
-				_ = os.Remove(SpoolPath(e.SessionID))
-				_ = os.Remove(LockPath(e.SessionID))
+				removeSessionFiles(e.SessionID, p)
 			}
 			if !includeDead {
 				continue
@@ -220,6 +218,16 @@ func ListSessions(includeDead, prune bool) ([]*Entry, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt < out[j].StartedAt })
 	return out, nil
+}
+
+// removeSessionFiles clears everything a dead session leaves behind. Missing
+// any of these means `pigeon prune` slowly litters the state directory.
+func removeSessionFiles(sessionID, entryFile string) {
+	_ = os.Remove(entryFile)
+	_ = os.Remove(SpoolPath(sessionID))
+	_ = os.Remove(LockPath(sessionID))
+	_ = os.Remove(filepath.Join(LocksDir(), sessionID+".entry.lock"))
+	_ = os.Remove(cursorPath(sessionID))
 }
 
 // ResolveTarget finds a session by exact id, self-declared name, id prefix, or
@@ -266,6 +274,9 @@ func ResolveTarget(token string) (*Entry, error) {
 			}
 			return nil, fmt.Errorf("%q is ambiguous: %s", token, strings.Join(ids, ", "))
 		}
+	}
+	if strings.HasPrefix(strings.ToLower(token), "shell:") {
+		return nil, fmt.Errorf("%q is a shell, not a session: it has no inbox and cannot be replied to", token)
 	}
 	return nil, fmt.Errorf("no live session matching %q", token)
 }

@@ -82,7 +82,7 @@ func TestSenderAddr(t *testing.T) {
 		{"named session", Sender{Kind: "session", SessionID: "abcdefgh-1", Name: "alpha"}, "alpha"},
 		{"unnamed session", Sender{Kind: "session", SessionID: "abcdefgh-1"}, "abcdefgh"},
 		// A shell has no inbox, so offering a reply handle would be a lie.
-		{"shell", Sender{Kind: "shell", Name: "shell:peter@host"}, ""},
+		{"shell", Sender{Kind: "shell", Name: "shell:alice@workstation"}, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -565,7 +565,7 @@ func TestFollowSourceDeliversNewLinesOnly(t *testing.T) {
 	out := make(chan *Message, 4)
 	stop := make(chan struct{})
 	defer close(stop)
-	go followSource(path, endOffset(path), out, stop, nil, func(string, ...any) {})
+	go followSource(path, endOffset(path), out, stop, nil, nil, func(string, ...any) {})
 
 	post, _ := json.Marshal(&Message{ID: "new", Text: "after", From: Sender{Kind: "shell"}})
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
@@ -597,7 +597,7 @@ func TestFollowSourceRecoversFromTruncation(t *testing.T) {
 	out := make(chan *Message, 4)
 	stop := make(chan struct{})
 	defer close(stop)
-	go followSource(path, endOffset(path), out, stop, nil, func(string, ...any) {})
+	go followSource(path, endOffset(path), out, stop, nil, nil, func(string, ...any) {})
 
 	// Truncate, then write a fresh message: the follower must reset rather
 	// than sit past the end of a shorter file forever.
@@ -788,5 +788,237 @@ func TestQueuedMailSurvivesUntilRead(t *testing.T) {
 	}
 	if got := readCursors(to.SessionID)[inboxCursorKey]; got != 0 {
 		t.Fatalf("inbox cursor = %d, want 0 so queued mail is still pending", got)
+	}
+}
+
+// TestShellSenderIsMarkedUnreplyable guards a real confusion seen in the wild:
+// a session read "from shell:alice@workstation", assumed it was an address, and
+// spent a tool call finding out it was not.
+func TestShellSenderIsMarkedUnreplyable(t *testing.T) {
+	m := &Message{From: Sender{Kind: "shell", Name: "shell:alice@workstation", Cwd: "/x/web-ui"}, Text: "Hello"}
+	got := Render(m)
+	if strings.Contains(got, "reply: pigeon send") {
+		t.Fatalf("offered a reply handle for a shell sender: %q", got)
+	}
+	if !strings.Contains(got, "no reply address") {
+		t.Fatalf("did not say the sender is unreachable: %q", got)
+	}
+}
+
+func TestResolvingAShellTargetExplainsWhy(t *testing.T) {
+	withHome(t)
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+	_, err := ResolveTarget("shell:alice@workstation")
+	if err == nil {
+		t.Fatal("expected an error for a shell target")
+	}
+	if !strings.Contains(err.Error(), "cannot be replied to") {
+		t.Errorf("error was unhelpful: %v", err)
+	}
+}
+
+func TestPruneClearsEverySessionFile(t *testing.T) {
+	withHome(t)
+	// A dead session must not leave locks or cursors behind; prune used to
+	// clear only the entry, spool and liveness lock.
+	if err := WriteEntry(&Entry{SessionID: "dead-9999", PID: 0}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{
+		SpoolPath("dead-9999"),
+		LockPath("dead-9999"),
+		filepath.Join(LocksDir(), "dead-9999.entry.lock"),
+		cursorPath("dead-9999"),
+	} {
+		if err := os.WriteFile(p, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := ListSessions(true, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{
+		entryPath("dead-9999"),
+		SpoolPath("dead-9999"),
+		LockPath("dead-9999"),
+		filepath.Join(LocksDir(), "dead-9999.entry.lock"),
+		cursorPath("dead-9999"),
+	} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("prune left %s behind", filepath.Base(p))
+		}
+	}
+}
+
+// --- topic retention -------------------------------------------------------
+
+func TestPruneTopicsRemovesUnsubscribedLogs(t *testing.T) {
+	withHome(t)
+	if _, err := Publish("orphaned", "nobody listens to this", Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(TopicPath("orphaned")); err != nil {
+		t.Fatalf("topic log missing: %v", err)
+	}
+
+	res, err := PruneTopics()
+	if err != nil {
+		t.Fatalf("PruneTopics: %v", err)
+	}
+	if res.TopicsRemoved != 1 {
+		t.Errorf("TopicsRemoved = %d, want 1", res.TopicsRemoved)
+	}
+	if _, err := os.Stat(TopicPath("orphaned")); !os.IsNotExist(err) {
+		t.Error("a log nobody subscribes to was left on disk")
+	}
+}
+
+func TestPruneTopicsKeepsSubscribedLogs(t *testing.T) {
+	withHome(t)
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+	if err := Subscribe("aaaa1111-2222", "kept"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Publish("kept", "someone is listening", Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PruneTopics(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(TopicPath("kept")); err != nil {
+		t.Errorf("a subscribed topic log was removed: %v", err)
+	}
+}
+
+func TestPruneTopicsCompactsAndRewindsCursors(t *testing.T) {
+	withHome(t)
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+	if err := Subscribe("aaaa1111-2222", "busy"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Enough traffic to clear the compaction threshold.
+	from := Sender{Kind: "shell", Name: "sh"}
+	body := strings.Repeat("x", 250)
+	for i := 0; i < 600; i++ {
+		if _, err := Publish("busy", body, from); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := os.Stat(TopicPath("busy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Size() < minCompactBytes {
+		t.Skipf("log is only %d bytes, below the %d compaction threshold", before.Size(), minCompactBytes)
+	}
+
+	// Pretend the subscriber has read all of it.
+	if err := mutateCursors("aaaa1111-2222", func(m map[string]int64) { m["busy"] = before.Size() }); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := PruneTopics()
+	if err != nil {
+		t.Fatalf("PruneTopics: %v", err)
+	}
+	if res.TopicsCompacted != 1 {
+		t.Fatalf("TopicsCompacted = %d, want 1", res.TopicsCompacted)
+	}
+
+	after, err := os.Stat(TopicPath("busy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != 0 {
+		t.Errorf("log is %d bytes after everyone read it, want 0", after.Size())
+	}
+	// The cursor must move with the data, or the follower would replay.
+	if got := readCursors("aaaa1111-2222")["busy"]; got != 0 {
+		t.Errorf("cursor = %d after compaction, want 0", got)
+	}
+	if res.BytesReclaimed < before.Size() {
+		t.Errorf("BytesReclaimed = %d, want at least %d", res.BytesReclaimed, before.Size())
+	}
+}
+
+func TestPruneTopicsWaitsForTheSlowestSubscriber(t *testing.T) {
+	withHome(t)
+	liveEntry(t, "aaaa1111-2222", "fast", "/tmp/a")
+	liveEntry(t, "bbbb2222-3333", "slow", "/tmp/b")
+	for _, sid := range []string{"aaaa1111-2222", "bbbb2222-3333"} {
+		if err := Subscribe(sid, "shared"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	from := Sender{Kind: "shell", Name: "sh"}
+	for i := 0; i < 600; i++ {
+		if _, err := Publish("shared", strings.Repeat("y", 250), from); err != nil {
+			t.Fatal(err)
+		}
+	}
+	size, err := os.Stat(TopicPath("shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One has read everything; the other has read nothing. Nothing may be cut.
+	if err := mutateCursors("aaaa1111-2222", func(m map[string]int64) { m["shared"] = size.Size() }); err != nil {
+		t.Fatal(err)
+	}
+	if err := mutateCursors("bbbb2222-3333", func(m map[string]int64) { m["shared"] = 0 }); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := PruneTopics(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(TopicPath("shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() != size.Size() {
+		t.Errorf("log shrank from %d to %d despite a subscriber at offset 0",
+			size.Size(), after.Size())
+	}
+}
+
+func TestFollowerResumesFromCursorAfterCompaction(t *testing.T) {
+	dir := withHome(t)
+	path := filepath.Join(dir, "log.ndjson")
+
+	write := func(id string) {
+		b, _ := json.Marshal(&Message{ID: id, Text: id, From: Sender{Kind: "shell"}})
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if _, err := f.Write(append(b, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("old")
+	cut := endOffset(path)
+
+	// The follower starts past the old entry, as a caught-up reader would.
+	saved := int64(0) // where the cursor points *after* the prefix is cut
+	out := make(chan *Message, 8)
+	stop := make(chan struct{})
+	defer close(stop)
+	go followSource(path, cut, out, stop, nil, func() int64 { return saved }, func(string, ...any) {})
+
+	// Compact away the prefix the follower has already passed, then append.
+	if err := compactFrom(path, cut); err != nil {
+		t.Fatal(err)
+	}
+	write("fresh")
+
+	select {
+	case m := <-out:
+		if m.ID != "fresh" {
+			t.Fatalf("got %q; the follower replayed compacted history instead of resuming", m.ID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follower stalled after the log was compacted")
 	}
 }

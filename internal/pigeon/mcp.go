@@ -296,7 +296,20 @@ func mcpList() (string, error) {
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString("\n* = this session")
+	self := ""
+	for _, e := range entries {
+		if e.SessionID == me {
+			self = e.Addr()
+			break
+		}
+	}
+	switch {
+	case self != "":
+		fmt.Fprintf(&b, "\n* = this session. Others reach you as %q.", self)
+	case me != "":
+		fmt.Fprintf(&b, "\nThis session (%s) is not in the list: it has no listening monitor, "+
+			"so other sessions cannot reach it.", Short(me))
+	}
 	return b.String(), nil
 }
 

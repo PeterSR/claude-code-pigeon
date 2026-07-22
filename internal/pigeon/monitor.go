@@ -118,9 +118,10 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	if inboxOffset > endOffset(spool) {
 		inboxOffset = 0
 	}
-	go followSource(spool, inboxOffset, lines, done, func(n int64) {
-		_ = mutateCursors(sid, func(c map[string]int64) { c[inboxCursorKey] = n })
-	}, logf)
+	go followSource(spool, inboxOffset, lines, done,
+		func(n int64) { _ = mutateCursors(sid, func(c map[string]int64) { c[inboxCursorKey] = n }) },
+		func() int64 { return readCursors(sid)[inboxCursorKey] },
+		logf)
 
 	// Topics: started and stopped as subscriptions change.
 	go manageSubscriptions(sid, lines, done, logf)
@@ -196,8 +197,9 @@ func manageSubscriptions(sid string, out chan<- *Message, done <-chan struct{}, 
 			persist := func(n int64) {
 				_ = mutateCursors(sid, func(c map[string]int64) { c[tp] = n })
 			}
+			reload := func() int64 { return readCursors(sid)[tp] }
 			logf("following topic %q from offset %d", topic, off)
-			go followSource(path, off, out, stop, persist, logf)
+			go followSource(path, off, out, stop, persist, reload, logf)
 		}
 
 		for topic, f := range active {
@@ -309,7 +311,16 @@ func endOffset(path string) int64 {
 // file that does not exist yet. persist, when non-nil, records the read offset
 // so a restart resumes rather than replays.
 func followSource(path string, offset int64, out chan<- *Message, stop <-chan struct{},
-	persist func(int64), logf func(string, ...any)) {
+	persist func(int64), reload func() int64, logf func(string, ...any)) {
+
+	// Track file identity, not just size. Compaction replaces the log via
+	// rename, so the inode changes while the size may land anywhere -- a
+	// shrink check alone misses a rewrite that happens to end up the same
+	// length or longer, and the follower then stalls or reads garbage.
+	var seen os.FileInfo
+	if fi, err := os.Stat(path); err == nil {
+		seen = fi
+	}
 
 	for {
 		select {
@@ -323,9 +334,32 @@ func followSource(path string, offset int64, out chan<- *Message, stop <-chan st
 			time.Sleep(pollInterval)
 			continue
 		}
-		if fi.Size() < offset {
-			logf("%s truncated -- resetting", path)
-			offset = 0
+		replaced := seen != nil && !os.SameFile(seen, fi)
+		seen = fi
+
+		// Identity alone is not enough: the log may have been replaced before
+		// this follower ever saw the original. Every valid offset in an NDJSON
+		// log is either 0 or one byte past a newline, so a misaligned offset
+		// is proof the file underneath changed.
+		if !replaced && offset > 0 && offset <= fi.Size() && !atRecordBoundary(path, offset) {
+			replaced = true
+		}
+
+		if replaced || fi.Size() < offset {
+			// The file shrank. That is either a compaction, which rewound our
+			// persisted cursor by the amount it cut, or a genuine truncation.
+			// Trusting the persisted cursor covers both; resetting to zero
+			// would replay the whole log as duplicate notifications.
+			next := int64(0)
+			if reload != nil {
+				next = reload()
+			}
+			if next > fi.Size() {
+				next = 0
+			}
+			logf("%s was replaced or truncated (%d -> %d bytes); resuming at %d",
+				path, offset, fi.Size(), next)
+			offset = next
 		}
 		if fi.Size() == offset {
 			time.Sleep(pollInterval)
@@ -372,6 +406,21 @@ func followSource(path string, offset int64, out chan<- *Message, stop <-chan st
 			persist(offset)
 		}
 	}
+}
+
+// atRecordBoundary reports whether offset sits immediately after a newline,
+// which is the only place a reader of an append-only NDJSON log may resume.
+func atRecordBoundary(path string, offset int64) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return true // cannot tell; do not thrash
+	}
+	defer f.Close()
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], offset-1); err != nil {
+		return true
+	}
+	return b[0] == '\n'
 }
 
 // newRateLimiter returns an emit function that caps output per minute and

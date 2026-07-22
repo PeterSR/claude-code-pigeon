@@ -1,2 +1,4 @@
-pigeon
+/pigeon
+/dist/
 *.tmp
+.agent-workspace/

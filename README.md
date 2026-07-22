@@ -94,7 +94,7 @@ A session can be running while its monitor is not. `pigeon ls` reports three sta
 | Status | Meaning |
 |---|---|
 | `live` | monitor is listening; a message arrives in about a second |
-| `deaf` | the session is running but nothing is listening — messages queue undelivered |
+| `deaf` | the session is running but nothing is listening — see below |
 | `dead` | the process is gone; `pigeon prune` clears it |
 
 This is not a heuristic. The monitor holds an exclusive `flock` for its entire lifetime and
@@ -102,7 +102,11 @@ the kernel releases it the instant that process exits — cleanly, crashed, or `
 so any other process can detect a dead monitor just by trying to take the lock. A stale
 heartbeat catches the rarer case of a monitor that is alive but wedged.
 
-Sending to a `deaf` session warns you, and the message stays on the spool.
+Sending to a `deaf` session warns you. The message is kept on that session's spool, and a
+monitor that starts later for **the same session id** (`claude --resume`) will read it. A
+brand-new session gets a new id and will not see it, so treat `deaf` as "probably will not
+arrive" rather than "will arrive eventually". `pigeon prune` clears the spool once the
+process is gone.
 
 ## Opting a session out
 
@@ -138,7 +142,8 @@ are written to `payloads/` and the recipient gets a path instead.
 ## Limits
 
 - Interactive sessions only. Headless `claude -p` arms no monitors.
-- Unix only.
+- Unix only. PID-reuse detection needs Linux `/proc`; on macOS a recycled PID can make a
+  dead session look alive until something prunes it.
 - One machine. No network transport.
 - 30 notifications per minute per session; beyond that pigeon reports suppression rather
   than being stopped by Claude Code.

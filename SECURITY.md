@@ -20,7 +20,11 @@ sender would like it to read as an instruction. pigeon:
   like a separate turn;
 - replaces `<` and `>` with lookalikes, so a sender cannot forge a closing tag and open a
   block of their own;
-- sanitises sender names and topic names the same way, so a peer cannot spoof another;
+- constrains self-declared names and topic names to a safe character set at the point they
+  are set, and sanitises them again at render time, so a peer cannot spoof another;
+- validates session ids before they are used as path components, so a planted registry
+  entry or a hostile `CLAUDE_CODE_SESSION_ID` cannot steer file operations outside the
+  state directory;
 - phrases every notification as a report about an event, never an imperative.
 
 That last point is not cosmetic: waking a session with imperative text makes the model echo

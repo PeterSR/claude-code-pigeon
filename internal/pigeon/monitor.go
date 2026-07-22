@@ -39,6 +39,13 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 		fmt.Fprintf(stderr, "[pigeon] "+format+"\n", a...)
 	}
 
+	if !MonitorSupported {
+		logf("plugin monitors are not available on this platform; pigeon can send")
+		logf("from here, but cannot receive. Standing down.")
+		block()
+		return nil
+	}
+
 	if OptedOut() {
 		logf("disabled via %s -- standing down", EnvOptOut)
 		block()
@@ -65,13 +72,13 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	// it stops a second monitor double-delivering, and because the kernel
 	// releases it the moment we exit -- cleanly, crashed or SIGKILLed -- other
 	// sessions can detect a dead monitor just by trying to take it.
-	lock, err := os.OpenFile(LockPath(sid), os.O_RDWR|os.O_CREATE, 0o600)
+	// Deliberately never unlinked: removing the file would let a second
+	// process lock a different inode and both believe they hold it.
+	lock, acquired, err := tryExclusive(LockPath(sid))
 	if err != nil {
-		return fmt.Errorf("open lock: %w", err)
+		return err
 	}
-	// Deliberately never unlinked: removing it would let a second process
-	// lock a different inode and both believe they hold it.
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if !acquired {
 		logf("another monitor already owns session %s -- standing down", Short(sid))
 		block()
 		return nil

@@ -1,0 +1,77 @@
+version: 2
+
+project_name: pigeon
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: pigeon
+    main: ./cmd/pigeon
+    binary: pigeon
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.CommitDate}}
+    mod_timestamp: '{{ .CommitTimestamp }}'
+    goos: [linux, darwin, freebsd]
+    goarch: [amd64, arm64]
+    # Plugin monitors only exist on Unix, so Windows is not shipped as a
+    # release artifact even though the code compiles for it.
+
+archives:
+  - id: pigeon
+    ids: [pigeon]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - LICENSE
+      - SECURITY.md
+      - docs/**/*
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: github
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - Merge pull request
+
+release:
+  draft: false
+  prerelease: auto
+  footer: |
+    ## Install
+
+    ```console
+    go install github.com/PeterSR/claude-code-pigeon/cmd/pigeon@{{ .Tag }}
+    pigeon install
+    ```
+
+    Then restart Claude Code. See the README for arming a single session
+    without installing the plugin.

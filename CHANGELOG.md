@@ -6,6 +6,16 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- Builds for Linux, macOS, FreeBSD, OpenBSD and Windows. File locking and process
+  liveness are behind a platform abstraction; on Windows the CLI works but the
+  monitor stands down, since Claude Code only arms plugin monitors on Unix.
+- GoReleaser configuration and a release workflow; CI now also cross-compiles every
+  supported target and validates the release config.
+- `skills/session-coordination`, an example Claude Code skill. Not installed by
+  `pigeon install` -- copy it to `~/.claude/skills/` deliberately.
+- `pigeon version` reports the commit and build date.
+
 ## [0.1.0] - 2026-07-22
 
 First release.

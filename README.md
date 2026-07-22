@@ -87,6 +87,13 @@ The plugin exposes `list_sessions`, `send_message`, `publish`, `subscribe`,
 `unsubscribe`, `list_topics`, `whoami` and `set_identity`, so a session can do all of this
 itself.
 
+### An example skill
+
+`skills/session-coordination/` teaches a session when to reach for these tools, and
+how to treat what arrives. It is **not** installed by `pigeon install` — skills change
+model behaviour, so opting in should be deliberate. Copy it to `~/.claude/skills/` if
+you want it. See [skills/README.md](skills/README.md).
+
 ## Knowing when a session has stopped listening
 
 A session can be running while its monitor is not. `pigeon ls` reports three states:
@@ -142,8 +149,10 @@ are written to `payloads/` and the recipient gets a path instead.
 ## Limits
 
 - Interactive sessions only. Headless `claude -p` arms no monitors.
-- Unix only. PID-reuse detection needs Linux `/proc`; on macOS a recycled PID can make a
-  dead session look alive until something prunes it.
+- Receiving is Unix only. The binary builds and sends from Windows, but Claude Code does
+  not arm plugin monitors there, so a Windows session cannot receive.
+- PID-reuse detection needs Linux `/proc`; elsewhere a recycled PID can make a dead
+  session look alive until something prunes it.
 - One machine. No network transport.
 - 30 notifications per minute per session; beyond that pigeon reports suppression rather
   than being stopped by Claude Code.

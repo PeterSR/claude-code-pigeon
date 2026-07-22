@@ -8,7 +8,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -141,19 +140,7 @@ func RemoveEntry(sessionID string) {
 // process exits -- crash, SIGKILL or clean shutdown alike. So if we can take
 // the lock, nobody is listening.
 func monitorListening(sessionID string) bool {
-	f, err := os.OpenFile(LockPath(sessionID), os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		// Cannot tell; assume listening rather than raise a false alarm.
-		return true
-	}
-	defer f.Close()
-
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return true // held by the monitor
-	}
-	// We got it, so no monitor holds it. Release immediately.
-	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-	return false
+	return !lockIsFree(LockPath(sessionID))
 }
 
 func (e *Entry) status() Status {
@@ -181,11 +168,8 @@ func ProcessAlive(pid int, wantStart string) bool {
 	if pid <= 0 {
 		return false
 	}
-	if err := syscall.Kill(pid, 0); err != nil {
-		if err == syscall.ESRCH {
-			return false
-		}
-		// EPERM means it exists but is not ours.
+	if !processExists(pid) {
+		return false
 	}
 	if wantStart != "" {
 		if got := ProcStart(pid); got != "" && got != wantStart {
@@ -334,19 +318,11 @@ func lockSession(sessionID string) (func(), error) {
 	if err := EnsureDirs(); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(filepath.Join(LocksDir(), sessionID+".entry.lock"),
-		os.O_RDWR|os.O_CREATE, 0o600)
+	c, err := blockingExclusive(filepath.Join(LocksDir(), sessionID+".entry.lock"))
 	if err != nil {
-		return nil, fmt.Errorf("open entry lock: %w", err)
+		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("lock entry: %w", err)
-	}
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}, nil
+	return func() { _ = c.Close() }, nil
 }
 
 // NameTaken reports whether another live session already claims a name.

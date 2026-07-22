@@ -16,7 +16,23 @@ import (
 	"github.com/PeterSR/claude-code-pigeon/internal/pigeon"
 )
 
-var version = "0.1.0"
+// Overridden at build time via -ldflags; see the Makefile and .goreleaser.yaml.
+var (
+	version = "dev"
+	commit  = ""
+	date    = ""
+)
+
+func versionString() string {
+	out := "pigeon " + version
+	if commit != "" {
+		out += " (" + commit + ")"
+	}
+	if date != "" {
+		out += " built " + date
+	}
+	return out
+}
 
 const usage = `pigeon -- message passing between live Claude Code sessions
 
@@ -82,7 +98,7 @@ func main() {
 	case "mcp":
 		err = pigeon.RunMCP(os.Stdin, os.Stdout, version)
 	case "version", "--version", "-v":
-		fmt.Printf("pigeon %s\n", version)
+		fmt.Println(versionString())
 	case "help", "--help", "-h":
 		fmt.Println(usage)
 	default:

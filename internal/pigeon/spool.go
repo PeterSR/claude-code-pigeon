@@ -1,10 +1,12 @@
 package pigeon
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -97,6 +99,48 @@ func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
 
 func SpoolPath(sessionID string) string {
 	return filepath.Join(InboxDir(), sessionID+".ndjson")
+}
+
+// Pending counts messages on a session's spool that no monitor has read.
+//
+// For a live session this is essentially always zero: the monitor tails the
+// spool and emits within about a second, so there is no standing backlog to
+// report. It goes non-zero exactly when the session is deaf, which is the one
+// case worth surfacing -- mail is accumulating for a session id that only
+// `claude --resume` will ever bring back.
+func Pending(sessionID string) int {
+	if ValidSessionID(sessionID) != nil {
+		return 0
+	}
+	path := SpoolPath(sessionID)
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	off := readCursors(sessionID)[inboxCursorKey]
+	// A cursor past the end means the spool was truncated or replaced under
+	// us. Counting from zero over-reports, but reporting nothing pending for a
+	// deaf session is the worse failure of the two.
+	if off < 0 || off > endOffset(path) {
+		off = 0
+	}
+	if off > 0 {
+		if _, err := f.Seek(off, io.SeekStart); err != nil {
+			return 0
+		}
+	}
+
+	n := 0
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		if strings.TrimSpace(sc.Text()) != "" {
+			n++
+		}
+	}
+	return n
 }
 
 func newMessageID() string {
@@ -193,15 +237,25 @@ func Send(to *Entry, text string, from Sender, replyTo string) (*Message, error)
 // session with imperative text makes the model echo "Human:" blocks or
 // fabricate user turns outright (anthropics/claude-code#60360).
 func Render(m *Message) string {
+	// Everything here arrives from a peer, including the fields that look like
+	// metadata: a sender controls its own cwd, name and topic, and a spool line
+	// could have been written by hand. Sanitise and bound each one rather than
+	// trusting that it was checked on the way in.
+	const (
+		maxName  = 40
+		maxWhere = 32
+		maxTopic = 32
+	)
+
 	var b strings.Builder
 	if m.Topic != "" {
-		b.WriteString("[pigeon #" + Sanitize(m.Topic) + "] from ")
+		b.WriteString("[pigeon #" + truncate(Sanitize(m.Topic), maxTopic) + "] from ")
 	} else {
 		b.WriteString("[pigeon] message from ")
 	}
-	b.WriteString(Sanitize(m.From.Display()))
+	b.WriteString(truncate(Sanitize(m.From.Display()), maxName))
 	if where := filepath.Base(m.From.Cwd); where != "" && where != "." && where != "/" {
-		b.WriteString(" (" + Sanitize(where) + ")")
+		b.WriteString(" (" + truncate(Sanitize(where), maxWhere) + ")")
 	}
 	head := b.String()
 
@@ -209,7 +263,7 @@ func Render(m *Message) string {
 	// pointer must never be the thing that gets cut.
 	var tail strings.Builder
 	if addr := m.From.Addr(); addr != "" {
-		tail.WriteString(" [reply: pigeon send " + Sanitize(addr) + "]")
+		tail.WriteString(" [reply: pigeon send " + truncate(Sanitize(addr), maxName) + "]")
 	} else {
 		// Saying nothing is not enough: a recipient reads "from
 		// shell:user@host", assumes it is an address, and wastes a call
@@ -217,10 +271,12 @@ func Render(m *Message) string {
 		tail.WriteString(" [no reply address: sent from a shell, not a session]")
 	}
 	if m.Topic != "" {
-		tail.WriteString(" [topic: pigeon publish " + Sanitize(m.Topic) + "]")
+		tail.WriteString(" [topic: pigeon publish " + truncate(Sanitize(m.Topic), maxTopic) + "]")
 	}
-	if m.Payload != "" {
-		tail.WriteString(" [full text: " + m.Payload + "]")
+	// Only ever point at our own payload directory. A hand-written spool line
+	// could otherwise name any path and have it read back as trustworthy.
+	if p := m.Payload; p != "" && filepath.Dir(p) == PayloadsDir() && filepath.Base(p) != "" {
+		tail.WriteString(" [full text: " + p + "]")
 	}
 
 	room := RenderBudget - len([]rune(head)) - len([]rune(tail.String())) - 4
@@ -230,7 +286,9 @@ func Render(m *Message) string {
 	if room > BodyBudget {
 		room = BodyBudget
 	}
-	return head + " :: " + truncate(m.Text, room) + tail.String()
+	line := head + " :: " + truncate(Sanitize(m.Text), room) + tail.String()
+	// Belt and braces: whatever the pieces did, the line itself is bounded.
+	return truncate(line, RenderBudget)
 }
 
 // ParseMessage reads one spool line.

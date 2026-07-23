@@ -733,12 +733,13 @@ func TestReplyAddressCannotCarryInjection(t *testing.T) {
 }
 
 func TestRenderNeverExceedsTheNotificationClip(t *testing.T) {
+	withHome(t)
 	long := strings.Repeat("z", 5000)
 	m := &Message{
 		From:    Sender{Kind: "session", SessionID: "aaaa1111-2222", Name: strings.Repeat("n", 32), Cwd: "/" + strings.Repeat("d", 80)},
 		Topic:   strings.Repeat("t", 64),
 		Text:    long,
-		Payload: "/home/user/.claude/pigeon/payloads/" + strings.Repeat("p", 40) + ".txt",
+		Payload: filepath.Join(PayloadsDir(), strings.Repeat("p", 40)+".txt"),
 	}
 	got := Render(m)
 	if n := len([]rune(got)); n > RenderBudget {
@@ -1020,5 +1021,69 @@ func TestFollowerResumesFromCursorAfterCompaction(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("follower stalled after the log was compacted")
+	}
+}
+
+// TestRenderRejectsForeignPayloadPaths guards a forgery: a hand-written spool
+// line could otherwise name any path and have it presented to the recipient as
+// "the full text", which is a read primitive dressed up as a convenience.
+func TestRenderRejectsForeignPayloadPaths(t *testing.T) {
+	withHome(t)
+	for _, bad := range []string{"/etc/shadow", "/home/other/.ssh/id_rsa", "relative.txt"} {
+		m := &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "hi", Payload: bad}
+		if got := Render(m); strings.Contains(got, bad) {
+			t.Errorf("Render surfaced a foreign payload path %q: %s", bad, got)
+		}
+	}
+	ours := filepath.Join(PayloadsDir(), "m_abc.txt")
+	m := &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "hi", Payload: ours}
+	if got := Render(m); !strings.Contains(got, ours) {
+		t.Errorf("Render dropped our own payload path: %s", got)
+	}
+}
+
+// TestRenderBoundsPeerControlledFields covers the escape found in review: a
+// peer sets CLAUDE_PROJECT_DIR, so an unbounded cwd defeated the whole budget.
+func TestRenderBoundsPeerControlledFields(t *testing.T) {
+	withHome(t)
+	m := &Message{
+		From:  Sender{Kind: "session", SessionID: "aaaa1111-2222", Cwd: "/" + strings.Repeat("w", 4000)},
+		Topic: strings.Repeat("t", 500),
+		Text:  strings.Repeat("z", 4000),
+	}
+	if n := len([]rune(Render(m))); n > RenderBudget {
+		t.Fatalf("rendered %d chars from peer-controlled fields, over the %d budget", n, RenderBudget)
+	}
+}
+
+// TestPruneRemovesOrphanedStateFiles covers files left behind when a monitor
+// deregisters cleanly: the entry prune searches by is already gone.
+func TestPruneRemovesOrphanedStateFiles(t *testing.T) {
+	withHome(t)
+	orphan := "bbbb2222-3333"
+	for _, p := range []string{
+		SpoolPath(orphan),
+		cursorPath(orphan),
+		LockPath(orphan),
+		filepath.Join(LocksDir(), orphan+".entry.lock"),
+	} {
+		if err := os.WriteFile(p, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A live session's files must survive the sweep.
+	keep := liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+	if err := os.WriteFile(SpoolPath(keep.SessionID), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := reconcileOrphans(); n < 4 {
+		t.Errorf("swept %d orphaned files, want at least 4", n)
+	}
+	if _, err := os.Stat(SpoolPath(orphan)); !os.IsNotExist(err) {
+		t.Error("orphaned spool survived")
+	}
+	if _, err := os.Stat(SpoolPath(keep.SessionID)); err != nil {
+		t.Error("a live session's spool was swept away")
 	}
 }

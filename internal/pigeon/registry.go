@@ -118,12 +118,29 @@ func WriteEntry(e *Entry) error {
 	if err != nil {
 		return err
 	}
-	p := entryPath(e.SessionID)
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
+	// A unique temp file per write. A fixed name lets two concurrent writers
+	// interleave into the same file and rename a half-and-half document into
+	// place, which ReadEntry then rejects -- silently removing the session
+	// from every peer's listing while its monitor sits there looking live.
+	tmp, err := os.CreateTemp(SessionsDir(), "entry-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, p)
+	name := tmp.Name()
+	if _, err := tmp.Write(append(b, '\n')); err != nil {
+		tmp.Close()
+		_ = os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	if err := os.Chmod(name, 0o600); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	return os.Rename(name, entryPath(e.SessionID))
 }
 
 func RemoveEntry(sessionID string) {
@@ -228,6 +245,46 @@ func removeSessionFiles(sessionID, entryFile string) {
 	_ = os.Remove(LockPath(sessionID))
 	_ = os.Remove(filepath.Join(LocksDir(), sessionID+".entry.lock"))
 	_ = os.Remove(cursorPath(sessionID))
+}
+
+// reconcileOrphans clears state belonging to sessions with no registry entry.
+//
+// A monitor deregisters on the way out, which removes the entry that prune
+// searches by -- so every other file that session owned became unreachable and
+// accumulated. Sweep the state directories directly instead.
+// ReconcileOrphans is the exported entry point for the sweep.
+func ReconcileOrphans() int { return reconcileOrphans() }
+
+func reconcileOrphans() int {
+	known := map[string]bool{}
+	entries, err := filepath.Glob(filepath.Join(SessionsDir(), "*.json"))
+	if err == nil {
+		for _, p := range entries {
+			known[strings.TrimSuffix(filepath.Base(p), ".json")] = true
+		}
+	}
+
+	removed := 0
+	sweep := func(dir, suffix string) {
+		paths, err := filepath.Glob(filepath.Join(dir, "*"+suffix))
+		if err != nil {
+			return
+		}
+		for _, p := range paths {
+			id := strings.TrimSuffix(filepath.Base(p), suffix)
+			if id == "" || known[id] || ValidSessionID(id) != nil {
+				continue
+			}
+			if os.Remove(p) == nil {
+				removed++
+			}
+		}
+	}
+	sweep(InboxDir(), ".ndjson")
+	sweep(CursorsDir(), ".json")
+	sweep(LocksDir(), ".lock")
+	sweep(LocksDir(), ".entry.lock")
+	return removed
 }
 
 // ResolveTarget finds a session by exact id, self-declared name, id prefix, or

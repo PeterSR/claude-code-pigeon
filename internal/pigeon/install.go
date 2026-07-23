@@ -159,9 +159,18 @@ func writeJSON(path string, v any) error {
 	return os.WriteFile(path, append(b, '\n'), 0o644)
 }
 
+// shellQuote quotes a path for the shell Claude Code runs a monitor command
+// with. The command is built from an absolute binary path, so this is defence
+// against odd install locations rather than hostile input -- but "odd" covers
+// a great many characters, so allow only plainly safe ones through unquoted.
 func shellQuote(s string) string {
+	if s == "" {
+		return `""`
+	}
 	for _, r := range s {
-		if r == ' ' || r == '\'' || r == '"' || r == '$' || r == '`' || r == '\\' {
+		safe := r == '/' || r == '.' || r == '-' || r == '_' ||
+			(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		if !safe {
 			return `"` + escapeDouble(s) + `"`
 		}
 	}

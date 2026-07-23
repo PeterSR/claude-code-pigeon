@@ -261,12 +261,13 @@ func heartbeat(sid string, done <-chan struct{}) {
 		case <-done:
 			return
 		case <-t.C:
-			e, err := ReadEntry(sid)
-			if err != nil {
-				continue
-			}
-			e.HeartbeatAt = nowRFC3339()
-			_ = WriteEntry(e)
+			// Through MutateEntry, not ReadEntry+WriteEntry: this ticks every
+			// 15s against a file the CLI and MCP also write, and an unlocked
+			// read-modify-write here is exactly how the entry gets shredded.
+			_ = MutateEntry(sid, func(e *Entry) error {
+				e.HeartbeatAt = nowRFC3339()
+				return nil
+			})
 		}
 	}
 }

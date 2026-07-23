@@ -3,6 +3,7 @@ package pigeon
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -165,6 +166,17 @@ func RunMCP(in io.Reader, out io.Writer, version string) error {
 		if err := dec.Decode(&req); err != nil {
 			if err == io.EOF {
 				return nil
+			}
+			// A single malformed message must not take the server down: the
+			// session would lose every pigeon tool for the rest of its life.
+			var se *json.SyntaxError
+			var ute *json.UnmarshalTypeError
+			if errors.As(err, &se) || errors.As(err, &ute) {
+				_ = enc.Encode(rpcResponse{
+					JSONRPC: "2.0",
+					Error:   &rpcError{Code: -32700, Message: "parse error"},
+				})
+				continue
 			}
 			return err
 		}

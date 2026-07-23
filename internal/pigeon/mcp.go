@@ -2,8 +2,8 @@ package pigeon
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -17,6 +17,11 @@ import (
 // has to know or state its own address for replies to work.
 
 const protocolVersion = "2025-06-18"
+
+// maxRPCLine bounds one request. Requests carry a message body, which is
+// already far smaller than this; the cap is here so a peer cannot make the
+// scanner buffer without limit.
+const maxRPCLine = 1 << 20
 
 type rpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -214,27 +219,38 @@ func tools() []toolDef {
 
 // RunMCP serves MCP on stdio until the stream closes.
 func RunMCP(in io.Reader, out io.Writer, version string) error {
-	dec := json.NewDecoder(bufio.NewReader(in))
+	// One message per line, unmarshalled per line rather than streamed.
+	//
+	// A json.Decoder cannot skip a malformed message: it does not resync after
+	// a syntax error, so the offending bytes stay buffered and the next Decode
+	// fails on exactly the same input. Answering "parse error" and continuing,
+	// which is what this loop used to do, therefore spins on the first bad
+	// byte forever -- never serving another request, never exiting, and either
+	// burning a core or blocking once the pipe to Claude Code fills. That is
+	// strictly worse than returning the error, which at least ends cleanly.
+	//
+	// MCP stdio framing is newline-delimited, so reading a line at a time
+	// gives the recovery the one property it was missing: the bad input is
+	// consumed, and the next request is a fresh line.
+	sc := bufio.NewScanner(in)
+	sc.Buffer(make([]byte, 0, 64*1024), maxRPCLine)
 	enc := json.NewEncoder(out)
 
-	for {
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+
 		var req rpcRequest
-		if err := dec.Decode(&req); err != nil {
-			if err == io.EOF {
-				return nil
-			}
+		if err := json.Unmarshal(line, &req); err != nil {
 			// A single malformed message must not take the server down: the
 			// session would lose every pigeon tool for the rest of its life.
-			var se *json.SyntaxError
-			var ute *json.UnmarshalTypeError
-			if errors.As(err, &se) || errors.As(err, &ute) {
-				_ = enc.Encode(rpcResponse{
-					JSONRPC: "2.0",
-					Error:   &rpcError{Code: -32700, Message: "parse error"},
-				})
-				continue
-			}
-			return err
+			_ = enc.Encode(rpcResponse{
+				JSONRPC: "2.0",
+				Error:   &rpcError{Code: -32700, Message: "parse error"},
+			})
+			continue
 		}
 
 		result, rerr := dispatch(req, version)
@@ -253,6 +269,12 @@ func RunMCP(in io.Reader, out io.Writer, version string) error {
 			return err
 		}
 	}
+	// A line past the buffer cap is not something to recover from silently:
+	// the caller is framing wrongly, and pretending the stream ended hides it.
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("read request: %w", err)
+	}
+	return nil
 }
 
 func dispatch(req rpcRequest, version string) (any, *rpcError) {

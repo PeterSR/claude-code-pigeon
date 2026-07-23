@@ -421,8 +421,21 @@ func (n Namespace) reconcileOrphans() int {
 	}
 	sweep(n.InboxDir(), ".ndjson")
 	sweep(n.CursorsDir(), ".json")
-	sweep(n.LocksDir(), ".lock")
-	sweep(n.LocksDir(), ".entry.lock")
+	// Locks are deliberately NOT swept, and adding them back would be a bug.
+	// Unlinking a lock file is how two processes end up holding "the same"
+	// lock on different inodes, which is the failure sys_unix.go avoids by
+	// never unlinking one.
+	//
+	// The sweep did include them, and it was worse than useless: it trimmed
+	// the suffix and treated the rest as a session id, so "<sid>.entry.lock"
+	// became "<sid>.entry" and "topic-deploys.lock" became "topic-deploys".
+	// Neither is a registered session, so both were deleted, for live sessions
+	// and active topics alike. A publisher holding a topic lock had it removed
+	// underneath it; the compaction later in the same `pigeon prune` then took
+	// a fresh inode instead of blocking, and the line the publisher had
+	// already reported as sent went to the replaced file and was lost.
+	//
+	// An abandoned lock file is a zero-byte inode. Leaving it costs nothing.
 	return removed
 }
 

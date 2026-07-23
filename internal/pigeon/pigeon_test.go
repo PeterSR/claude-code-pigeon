@@ -1141,13 +1141,25 @@ func TestPruneRemovesOrphanedStateFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if n := ReconcileOrphans(); n < 4 {
-		t.Errorf("swept %d orphaned files, want at least 4", n)
+	if n := ReconcileOrphans(); n < 2 {
+		t.Errorf("swept %d orphaned files, want the spool and the cursor", n)
 	}
 	if _, err := os.Stat(SpoolPath(orphan)); !os.IsNotExist(err) {
 		t.Error("orphaned spool survived")
 	}
+	if _, err := os.Stat(cursorPath(orphan)); !os.IsNotExist(err) {
+		t.Error("orphaned cursor survived")
+	}
 	if _, err := os.Stat(SpoolPath(keep.SessionID)); err != nil {
 		t.Error("a live session's spool was swept away")
+	}
+	// Locks are never swept, orphaned or not. This test used to demand four
+	// files gone, which is how it certified a sweep that unlinked live
+	// sessions' entry locks and every topic lock: it only ever asserted what
+	// the sweep removed, never what it had to leave alone.
+	for _, p := range []string{LockPath(orphan), filepath.Join(LocksDir(), orphan+".entry.lock")} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("the sweep unlinked a lock file (%s): %v", filepath.Base(p), err)
+		}
 	}
 }

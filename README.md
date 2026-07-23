@@ -383,7 +383,8 @@ process is gone.
 
 ### Diagnosing it: `pigeon doctor`
 
-Delivery is a chain — session id, state directory, plugin, monitor binary, registration —
+Delivery is a chain of links -- session id, state directory, plugin, monitor binary,
+registration --
 and when a link breaks the symptom is always the same: messages stop arriving and nothing
 says why. `doctor` checks each link separately and names the one that broke.
 
@@ -428,7 +429,7 @@ It renders only when this session **cannot** receive:
 ```
 
 Those are the only states where a count is real, and the only ones nothing else in the UI
-reports. If you already have a statusline, append pigeon's output to it — the command
+reports. If you already have a statusline, append pigeon's output to it: the command
 prints one line or nothing, so concatenating is safe:
 
 ```bash
@@ -459,7 +460,7 @@ session as a `<task_notification>`, which wakes it if idle.
 
 **This behaviour is shipped but undocumented.** That monitors are started at all, that
 `CLAUDE_CODE_SESSION_ID` is injected into them, and that their stdout becomes a
-notification are all observed, not promised — verified end to end against Claude Code
+notification are all observed, not promised. They were verified end to end against Claude Code
 2.1.217, and requiring 2.1.105 or newer for the session id. A future release could change
 any of it, and the failure would be silent. That is what `pigeon doctor` is for: it checks
 each assumption separately and warns when your Claude Code is newer than the version this

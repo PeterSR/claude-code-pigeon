@@ -89,19 +89,35 @@ func CurrentSender() Sender {
 	ns := CurrentNamespace()
 	sid := CurrentSessionID()
 	if sid == "" {
-		return Sender{Kind: "shell", Name: ShellIdentity(), Cwd: CurrentCwd(), Namespace: ns.String()}
+		// A shell has no entry to consult, so ask the project directly. Running
+		// `pigeon send` from a private checkout is the same disclosure as a
+		// session in it doing so, and the sender is the only one who can tell.
+		cwd := CurrentCwd()
+		if cfg, _, err := LoadProjectConfig(cwd); err == nil && cfg != nil && cfg.Private {
+			cwd = ""
+		}
+		return Sender{Kind: "shell", Name: ShellIdentity(), Cwd: cwd, Namespace: ns.String()}
 	}
-	s := Sender{Kind: "session", SessionID: sid, Cwd: CurrentCwd(), Namespace: ns.String()}
-	if e, err := ns.ReadEntry(sid); err == nil {
+	// The cwd starts empty and is filled in only once the entry says it may be.
+	// Setting it up front and blanking it for a private session inside the
+	// success branch looks equivalent and is not: this process resolves its
+	// namespace from its own environment and working directory, which need not
+	// be the ones the monitor armed with, so the lookup can miss and leave the
+	// directory in place -- exactly what `private` exists to prevent, published
+	// to every recipient. Missing the entry must fail closed.
+	s := Sender{Kind: "session", SessionID: sid, Namespace: ns.String()}
+	// locateSession falls back to every namespace, for the same reason the
+	// statusline needs it: this process may not resolve the one the monitor
+	// registered in.
+	_, e, err := locateSession(sid)
+	if err == nil {
 		s.Name = e.Name
-		switch {
-		case e.Private:
-			// Render shows the sender's directory to every recipient, which is
-			// exactly what a private project asked not to happen. The cwd we
-			// started in is no more publishable than the registered one.
-			s.Cwd = ""
-		case e.Cwd != "":
-			s.Cwd = e.Cwd
+		if !e.Private {
+			if e.Cwd != "" {
+				s.Cwd = e.Cwd
+			} else {
+				s.Cwd = CurrentCwd()
+			}
 		}
 	}
 	return s
@@ -173,6 +189,18 @@ func newMessageID() string {
 // newlines or angle brackets can forge a trailing directive or spoof another
 // peer. inter-session has two open issues of exactly this shape (#6, #7), so
 // we neutralise the structural characters rather than trusting senders.
+//
+// Square brackets are structural HERE, which angle brackets never were: every
+// hint this format carries is `[reply: ...]`, `[full text: ...]`, `[ns: ...]`.
+// A body that may write a bare `[` can therefore forge a payload pointer at
+// any path it likes, a reply address it does not own, or a whole second
+// notification from a peer that never sent one -- all through an ordinary
+// `pigeon send`, with no access to the state directory at all. Only the
+// renderer may emit a bare bracket.
+//
+// The control-character rule covers the formatting categories too, because
+// unicode.IsControl only reports Latin-1 C0/C1: a bidi override or a zero
+// width joiner is not "control" by that test and would reach the line intact.
 func Sanitize(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -183,7 +211,11 @@ func Sanitize(s string) string {
 			b.WriteRune('‹') // ‹
 		case r == '>':
 			b.WriteRune('›') // ›
-		case unicode.IsControl(r):
+		case r == '[':
+			b.WriteRune('⟦') // ⟦
+		case r == ']':
+			b.WriteRune('⟧') // ⟧
+		case unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Co, unicode.Cs):
 			// drop
 		default:
 			b.WriteRune(r)

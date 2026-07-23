@@ -1,6 +1,7 @@
 package pigeon
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -102,15 +103,11 @@ func (n Namespace) entryPath(sessionID string) string {
 	return filepath.Join(n.SessionsDir(), sessionID+".json")
 }
 
-func entryPath(sessionID string) string { return CurrentNamespace().entryPath(sessionID) }
-
 // LockPath is the file a live monitor flocks for its whole lifetime. Holding
 // it is the ground truth for "someone is listening".
 func (n Namespace) LockPath(sessionID string) string {
 	return filepath.Join(n.LocksDir(), sessionID+".lock")
 }
-
-func LockPath(sessionID string) string { return CurrentNamespace().LockPath(sessionID) }
 
 func ReadEntry(sessionID string) (*Entry, error) {
 	return CurrentNamespace().ReadEntry(sessionID)
@@ -141,7 +138,6 @@ func (n Namespace) ReadEntry(sessionID string) (*Entry, error) {
 // enforced here rather than at registration because every later write lands
 // here too -- a heartbeat, a subscribe, a `pigeon describe` -- and any one of
 // them would otherwise put back what the project asked to keep off the bus.
-func WriteEntry(e *Entry) error { return CurrentNamespace().WriteEntry(e) }
 
 func (n Namespace) WriteEntry(e *Entry) error {
 	if err := ValidSessionID(e.SessionID); err != nil {
@@ -204,10 +200,6 @@ func (n Namespace) RemoveEntry(sessionID string) {
 // the lock, nobody is listening.
 func (n Namespace) monitorListening(sessionID string) bool {
 	return !lockIsFree(n.LockPath(sessionID))
-}
-
-func monitorListening(sessionID string) bool {
-	return CurrentNamespace().monitorListening(sessionID)
 }
 
 func (e *Entry) status(n Namespace) Status {
@@ -374,12 +366,84 @@ func ListNamespaces() ([]NamespaceInfo, error) {
 
 // removeSessionFiles clears everything a dead session leaves behind. Missing
 // any of these means `pigeon prune` slowly litters the state directory.
+//
+// Locks are the deliberate exception: unlinking one lets a second process lock
+// a different inode while both believe they hold it. A dead session's lock is
+// an empty file nobody holds, and leaving it costs a few bytes.
 func (n Namespace) removeSessionFiles(sessionID, entryFile string) {
 	_ = os.Remove(entryFile)
 	_ = os.Remove(n.SpoolPath(sessionID))
-	_ = os.Remove(n.LockPath(sessionID))
-	_ = os.Remove(filepath.Join(n.LocksDir(), sessionID+".entry.lock"))
 	_ = os.Remove(n.cursorPath(sessionID))
+}
+
+// reclaimPayloads removes payload files no surviving log still points at.
+//
+// A message whose body overflows the notification budget spills to a file and
+// carries a pointer instead, so the file has to outlive the message in the log.
+// Nothing deleted them: not removeSessionFiles, not reconcileOrphans, not the
+// topic retention pass. `pigeon uninstall --purge` was the only thing that ever
+// did, which for a long-running machine is not a retention policy.
+//
+// The reference set is built by scanning what remains, which is exact rather
+// than an age heuristic: a payload for a message still sitting unread on a deaf
+// session's spool must survive however old it is, and one whose message was
+// compacted away is garbage the moment it goes.
+func (n Namespace) reclaimPayloads() (removed int, bytes int64) {
+	return reclaimPayloadsIn(n.PayloadsDir(), n.referencedPayloads())
+}
+
+// referencedPayloads collects every payload path still named by a message in
+// this namespace's spools or topic logs.
+func (n Namespace) referencedPayloads() map[string]bool {
+	refs := map[string]bool{}
+	for _, glob := range []string{
+		filepath.Join(n.InboxDir(), "*.ndjson"),
+		filepath.Join(n.TopicsDir(), "*.ndjson"),
+	} {
+		paths, _ := filepath.Glob(glob)
+		for _, p := range paths {
+			collectPayloadRefs(p, refs)
+		}
+	}
+	return refs
+}
+
+func collectPayloadRefs(logPath string, into map[string]bool) {
+	f, err := os.Open(logPath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		m, err := ParseMessage(strings.TrimSpace(sc.Text()))
+		if err != nil || m.Payload == "" {
+			continue
+		}
+		into[m.Payload] = true
+	}
+}
+
+func reclaimPayloadsIn(dir string, referenced map[string]bool) (removed int, bytes int64) {
+	paths, err := filepath.Glob(filepath.Join(dir, "*.txt"))
+	if err != nil {
+		return 0, 0
+	}
+	for _, p := range paths {
+		if referenced[p] {
+			continue
+		}
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if os.Remove(p) == nil {
+			removed++
+			bytes += fi.Size()
+		}
+	}
+	return removed, bytes
 }
 
 // reconcileOrphans clears state belonging to sessions with no registry entry.
@@ -547,7 +611,14 @@ func (n Namespace) lockSession(sessionID string) (func(), error) {
 	if err := ValidSessionID(sessionID); err != nil {
 		return nil, err
 	}
-	if err := n.EnsureDirs(); err != nil {
+	// The session has to already be here. Calling EnsureDirs instead would
+	// build a whole namespace tree before discovering there is nobody in it, so
+	// `subscribe --namespace defualt` -- a typo -- left "defualt" in every
+	// later `pigeon namespaces` as if it were a real place.
+	if _, err := os.Stat(n.entryPath(sessionID)); err != nil {
+		return nil, fmt.Errorf("session %s is not registered in namespace %q", Short(sessionID), n)
+	}
+	if err := os.MkdirAll(n.LocksDir(), 0o700); err != nil {
 		return nil, err
 	}
 	c, err := blockingExclusive(filepath.Join(n.LocksDir(), sessionID+".entry.lock"))

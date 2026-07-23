@@ -681,14 +681,42 @@ func TestFollowSourceRecoversFromTruncation(t *testing.T) {
 // --- rate limiting --------------------------------------------------------
 
 func TestRateLimiterSuppressesFloods(t *testing.T) {
+	withHome(t)
 	var sb strings.Builder
-	emit := newRateLimiter(&sb, "/tmp/spool")
+	emit, _ := newRateLimiter(&sb, DefaultNamespace(), "/tmp/spool", time.Minute)
 	for i := 0; i < maxPerMinute+25; i++ {
-		emit("line")
+		emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "line"})
 	}
 	got := strings.Count(sb.String(), "\n")
 	if got != maxPerMinute {
 		t.Errorf("emitted %d lines, want the cap of %d", got, maxPerMinute)
+	}
+}
+
+// A suppressed message is still in its log, so the notice has to name the log
+// it is actually in. Naming the direct spool for a suppressed topic message
+// points the recipient at a file it was never written to, which is the one
+// recovery hint they get.
+func TestRateLimiterNamesTheLogASuppressedMessageIsIn(t *testing.T) {
+	withHome(t)
+	ns := DefaultNamespace()
+	var sb strings.Builder
+	emit, flush := newRateLimiter(&sb, ns, ns.SpoolPath("aaaa1111"), time.Minute)
+
+	// Fill the window with direct messages, then suppress a topic message.
+	for i := 0; i < maxPerMinute; i++ {
+		emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "direct"})
+	}
+	emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Topic: "deploys", Text: "topic"})
+
+	flush()
+
+	out := sb.String()
+	if !strings.Contains(out, ns.TopicPath("deploys")) {
+		t.Errorf("the suppression notice does not name the topic log:\n%s", out)
+	}
+	if strings.Contains(out, ns.SpoolPath("aaaa1111")) {
+		t.Errorf("the notice named the direct spool for a topic message:\n%s", out)
 	}
 }
 
@@ -903,12 +931,21 @@ func TestPruneClearsEverySessionFile(t *testing.T) {
 	for _, p := range []string{
 		entryPath("dead-9999"),
 		SpoolPath("dead-9999"),
-		LockPath("dead-9999"),
-		filepath.Join(LocksDir(), "dead-9999.entry.lock"),
 		cursorPath("dead-9999"),
 	} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("prune left %s behind", filepath.Base(p))
+		}
+	}
+	// Locks stay, deliberately. Unlinking one lets a second process lock a
+	// different inode while both believe they hold it, and a dead session's
+	// lock is an empty file nobody holds.
+	for _, p := range []string{
+		LockPath("dead-9999"),
+		filepath.Join(LocksDir(), "dead-9999.entry.lock"),
+	} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("prune unlinked %s", filepath.Base(p))
 		}
 	}
 }

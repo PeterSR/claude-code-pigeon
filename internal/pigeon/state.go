@@ -153,12 +153,6 @@ func (n Namespace) CursorsDir() string  { return filepath.Join(n.Root(), "cursor
 // The package-level forms address the caller's own namespace, which is what
 // almost every caller means. Each resolves the namespace once and hands it
 // down; nothing below this layer resolves it again.
-func SessionsDir() string { return CurrentNamespace().SessionsDir() }
-func InboxDir() string    { return CurrentNamespace().InboxDir() }
-func PayloadsDir() string { return CurrentNamespace().PayloadsDir() }
-func LocksDir() string    { return CurrentNamespace().LocksDir() }
-func TopicsDir() string   { return CurrentNamespace().TopicsDir() }
-func CursorsDir() string  { return CurrentNamespace().CursorsDir() }
 
 // ensureHome creates the state root and migrates an old layout into it, and
 // stops there.
@@ -331,7 +325,25 @@ func stderrLogf(format string, a ...any) {
 // died halfway through, both end up in the same place.
 func migrateFlatLayout(logf func(string, ...any)) error {
 	home := Home()
+	// The marker records that this home has been converted, and it is what
+	// keeps the usual case to a single stat. Without it the test was "are any
+	// old directories present", which a process still running the old binary
+	// makes true again simply by recreating them -- so every later command
+	// re-took the migration lock, re-walked six directories, and re-logged
+	// that it had declined to move each one. The steady state was six lines of
+	// stderr on every single invocation, forever, describing a real problem in
+	// a tone that read like a note.
+	marker := filepath.Join(NamespacesDir(), ".migrated")
+	if _, err := os.Stat(marker); err == nil {
+		reportStrandedState(home, logf)
+		return nil
+	}
 	if len(flatDirsPresent(home)) == 0 {
+		// Nothing to convert, which is the answer for every fresh install.
+		// Record it, so this is one stat from here on rather than seven.
+		if err := os.MkdirAll(NamespacesDir(), 0o700); err == nil {
+			_ = os.WriteFile(marker, []byte(nowRFC3339()+"\n"), 0o600)
+		}
 		return nil
 	}
 	lock, err := blockingExclusive(filepath.Join(home, "migrate.lock"))
@@ -354,9 +366,9 @@ func migrateFlatLayout(logf func(string, ...any)) error {
 		target := filepath.Join(dst, d)
 		if _, err := os.Stat(target); err == nil {
 			// A half-finished earlier run already placed this one. Leave both
-			// alone rather than merging two directories of live state.
-			logf("migration: %s already exists; leaving %s where it is",
-				target, filepath.Join(home, d))
+			// alone rather than merging two directories of live state; the
+			// stranded copy is reported once, below, not once per directory
+			// on every command from here on.
 			continue
 		}
 		if err := os.Rename(filepath.Join(home, d), target); err != nil {
@@ -368,7 +380,42 @@ func migrateFlatLayout(logf func(string, ...any)) error {
 		logf("moved %s into %s: state is now per-namespace and this one is %q",
 			strings.Join(moved, ", "), dst, DefaultNamespaceName)
 	}
+	// Written last, so a run that dies partway is retried rather than recorded
+	// as complete.
+	if err := os.WriteFile(marker, []byte(nowRFC3339()+"\n"), 0o600); err != nil {
+		return fmt.Errorf("record migration: %w", err)
+	}
+	reportStrandedState(home, logf)
 	return nil
+}
+
+// reportStrandedState warns when old-layout directories exist after the
+// migration has already run.
+//
+// That means a process still using the old paths recreated them, and its
+// sessions are registered somewhere nothing reads: they cannot receive, and
+// they are invisible to every other session. Nothing reconciles this, and
+// nothing can -- merging two directories of live state is not something to
+// attempt underneath a running monitor. So it is reported as the problem it
+// is, with the one action that fixes it, rather than as a note about a rename
+// that did not happen.
+func reportStrandedState(home string, logf func(string, ...any)) {
+	stranded := flatDirsPresent(home)
+	if len(stranded) == 0 {
+		return
+	}
+	sessions := 0
+	if paths, err := filepath.Glob(filepath.Join(home, "sessions", "*.json")); err == nil {
+		sessions = len(paths)
+	}
+	logf("WARNING: %s still holds pre-namespace state (%s).",
+		home, strings.Join(stranded, ", "))
+	if sessions > 0 {
+		logf("WARNING: %d session(s) are registered there. They cannot receive mail and no", sessions)
+		logf("WARNING: other session can see them. Restart them to re-register.")
+	} else {
+		logf("WARNING: a process on the old layout recreated these. Restart it, then remove them.")
+	}
 }
 
 // flatDirsPresent lists the old-layout directories still sitting under Home().

@@ -244,6 +244,15 @@ func truncate(s string, n int) string {
 	if len(r) <= n {
 		return s
 	}
+	// A budget with no room for the ellipsis, let alone a character before it.
+	// r[:n-1] on a zero budget indexes backwards and panics, which turns a
+	// tight notification line into a dead monitor.
+	if n <= 1 {
+		if n <= 0 {
+			return ""
+		}
+		return "…"
+	}
 	return string(r[:n-1]) + "…"
 }
 
@@ -311,7 +320,6 @@ func (n Namespace) Send(to *Entry, text string, from Sender, replyTo string) (*M
 // The receiver is a namespace because two of the decisions here depend on
 // where the message landed: which payload directories may be pointed at, and
 // whether the sender is close enough that a bare reply address would reach it.
-func Render(m *Message) string { return CurrentNamespace().Render(m) }
 
 func (n Namespace) Render(m *Message) string {
 	// Everything here arrives from a peer, including the fields that look like
@@ -355,9 +363,15 @@ func (n Namespace) Render(m *Message) string {
 	}
 	head := b.String()
 
-	// Build the trailing hints first: they are small, fixed, and the payload
-	// pointer must never be the thing that gets cut.
-	var tail strings.Builder
+	// Build the trailing hints first, because the payload pointer must never be
+	// the thing that gets cut: it is the only route to a message whose body did
+	// not fit, so losing it strands the message entirely.
+	//
+	// The old arithmetic clamped the body's allowance *up* when head and tail
+	// were large, which pushed the line past the budget and left a final
+	// truncate to trim the end -- the tail, the pointer. Nothing is trimmed
+	// now. Hints are dropped whole, cheapest first, until the line fits.
+	var reply, topic, payload string
 	if addr := m.From.Addr(); addr != "" {
 		qualifier := ""
 		if foreign {
@@ -365,35 +379,67 @@ func (n Namespace) Render(m *Message) string {
 			// session that happens to answer to the same name here.
 			qualifier = "-n " + sender + " "
 		}
-		tail.WriteString(" [reply: pigeon send " + qualifier + truncate(Sanitize(addr), maxName) + "]")
+		reply = " [reply: pigeon send " + qualifier + truncate(Sanitize(addr), maxName) + "]"
 	} else {
 		// Saying nothing is not enough: a recipient reads "from
 		// shell:user@host", assumes it is an address, and wastes a call
 		// discovering it is not. Say so outright.
-		tail.WriteString(" [no reply address: sent from a shell, not a session]")
+		reply = " [no reply address: sent from a shell, not a session]"
 	}
 	if m.Topic != "" {
-		tail.WriteString(" [topic: pigeon publish " + truncate(Sanitize(m.Topic), maxTopic) + "]")
+		topic = " [topic: pigeon publish " + truncate(Sanitize(m.Topic), maxTopic) + "]"
 	}
 	// Only ever point at a payload directory this session already knows: its
 	// own, or the shared one a global topic spills to. A hand-written spool line
 	// could otherwise name any path and have it read back as trustworthy.
 	if p := m.Payload; p != "" && filepath.Base(p) != "" {
 		if d := filepath.Dir(p); d == n.PayloadsDir() || d == SharedPayloadsDir() {
-			tail.WriteString(" [full text: " + p + "]")
+			payload = " [full text: " + p + "]"
 		}
 	}
 
-	room := RenderBudget - len([]rune(head)) - len([]rune(tail.String())) - 4
-	if room < 16 {
-		room = 16
+	// A body that is spilled to a file is recoverable from the pointer, so it
+	// can be squeezed to nothing. One that is not spilled is all the recipient
+	// will ever get, so keep a readable minimum and give up a hint instead.
+	minBody := 24
+	if payload != "" {
+		minBody = 0
+	}
+	room := 0
+	for {
+		room = RenderBudget - len([]rune(head)) - len([]rune(reply+topic+payload)) - 4
+		if room >= minBody {
+			break
+		}
+		// Sacrifice in order of what the recipient can reconstruct without it:
+		// the topic is already named in the header, and a reply address can be
+		// found with `pigeon ls`. The pointer cannot be guessed at all.
+		switch {
+		case topic != "":
+			topic = ""
+		case reply != "":
+			reply = ""
+		default:
+			// Only the pointer is left. Keep it and let the body go.
+			room = 0
+		}
+		if topic == "" && reply == "" {
+			break
+		}
 	}
 	if room > BodyBudget {
 		room = BodyBudget
 	}
-	line := head + " :: " + truncate(Sanitize(m.Text), room) + tail.String()
-	// Belt and braces: whatever the pieces did, the line itself is bounded.
-	return truncate(line, RenderBudget)
+	if room < 0 {
+		room = 0
+	}
+
+	tail := reply + topic + payload
+	body := truncate(Sanitize(m.Text), room)
+	if body == "" {
+		return head + tail
+	}
+	return head + " :: " + body + tail
 }
 
 // ParseMessage reads one spool line.

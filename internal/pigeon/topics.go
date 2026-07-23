@@ -129,13 +129,9 @@ func (n Namespace) TopicPath(topic string) string {
 	return ref.path(n)
 }
 
-func TopicPath(topic string) string { return CurrentNamespace().TopicPath(topic) }
-
 func (n Namespace) cursorPath(sessionID string) string {
 	return filepath.Join(n.CursorsDir(), sessionID+".json")
 }
-
-func cursorPath(sessionID string) string { return CurrentNamespace().cursorPath(sessionID) }
 
 // Publish appends a message to a topic log. Every subscriber's monitor picks
 // it up independently; there is no fan-out at write time, which keeps
@@ -322,10 +318,6 @@ func (n Namespace) readCursors(sessionID string) map[string]int64 {
 	return m
 }
 
-func readCursors(sessionID string) map[string]int64 {
-	return CurrentNamespace().readCursors(sessionID)
-}
-
 func (n Namespace) writeCursors(sessionID string, m map[string]int64) error {
 	if err := n.EnsureDirs(); err != nil {
 		return err
@@ -369,10 +361,6 @@ func (n Namespace) mutateCursors(sessionID string, fn func(map[string]int64)) er
 	m := n.readCursors(sessionID)
 	fn(m)
 	return n.writeCursors(sessionID, m)
-}
-
-func mutateCursors(sessionID string, fn func(map[string]int64)) error {
-	return CurrentNamespace().mutateCursors(sessionID, fn)
 }
 
 // seedCursor starts a new subscription at the end of the log, so joining a
@@ -510,6 +498,7 @@ const minCompactBytes = 64 * 1024
 type PruneResult struct {
 	TopicsRemoved   int
 	TopicsCompacted int
+	PayloadsRemoved int
 	BytesReclaimed  int64
 }
 
@@ -518,6 +507,7 @@ type PruneResult struct {
 func (r *PruneResult) Add(o PruneResult) {
 	r.TopicsRemoved += o.TopicsRemoved
 	r.TopicsCompacted += o.TopicsCompacted
+	r.PayloadsRemoved += o.PayloadsRemoved
 	r.BytesReclaimed += o.BytesReclaimed
 }
 
@@ -541,9 +531,16 @@ func (n Namespace) PruneTopics() (PruneResult, error) {
 	if err != nil {
 		return res, err
 	}
-	return pruneTopicDir(n.TopicsDir(), false, func(ref TopicRef) []*Entry {
+	res, err = pruneTopicDir(n.TopicsDir(), false, func(ref TopicRef) []*Entry {
 		return subscribersOf(sessions, ref)
 	}, func(e *Entry) Namespace { return n }, n)
+	if err != nil {
+		return res, err
+	}
+	num, bytes := n.reclaimPayloads()
+	res.PayloadsRemoved += num
+	res.BytesReclaimed += bytes
+	return res, nil
 }
 
 // PruneSharedTopics reclaims space in the global topic logs.
@@ -558,9 +555,23 @@ func PruneSharedTopics() (PruneResult, error) {
 		return res, err
 	}
 	everyone := allSessions()
-	return pruneTopicDir(SharedTopicsDir(), true, func(ref TopicRef) []*Entry {
+	res, err := pruneTopicDir(SharedTopicsDir(), true, func(ref TopicRef) []*Entry {
 		return subscribersOf(everyone, ref)
 	}, func(e *Entry) Namespace { return e.NS() }, CurrentNamespace())
+	if err != nil {
+		return res, err
+	}
+	// A shared payload is referenced from a shared topic log, so the reference
+	// set is machine-wide like the pass that produced it.
+	refs := map[string]bool{}
+	paths, _ := filepath.Glob(filepath.Join(SharedTopicsDir(), "*.ndjson"))
+	for _, p := range paths {
+		collectPayloadRefs(p, refs)
+	}
+	num, bytes := reclaimPayloadsIn(SharedPayloadsDir(), refs)
+	res.PayloadsRemoved += num
+	res.BytesReclaimed += bytes
+	return res, nil
 }
 
 func subscribersOf(entries []*Entry, ref TopicRef) []*Entry {

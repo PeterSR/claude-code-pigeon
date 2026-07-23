@@ -151,7 +151,8 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	// for this session should survive until a monitor actually reads it.
 	defer ns.RemoveEntry(sid)
 
-	emit := newRateLimiter(stdout, spool)
+	emit, flushSuppressed := newRateLimiter(stdout, ns, spool, time.Minute)
+	defer flushSuppressed()
 	for {
 		select {
 		case <-sigc:
@@ -162,7 +163,7 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 			if m.From.SessionID != "" && m.From.SessionID == sid {
 				continue
 			}
-			emit(ns.Render(m))
+			emit(m)
 		}
 	}
 }
@@ -276,23 +277,8 @@ func register(ns Namespace, sid string, logf func(string, ...any)) error {
 	if subs == nil {
 		subs = defaultSubscriptions()
 	}
-	// Seed a cursor only for a topic we have never followed, so a new
-	// subscription starts at the end of its log rather than replaying history
-	// as a burst of notifications. Re-seeding an existing one would throw away
-	// the session's read position on every monitor restart, silently skipping
-	// whatever was published while it was down.
-	existing := ns.readCursors(sid)
-	for _, t := range subs {
-		if _, seen := existing[t]; seen {
-			continue
-		}
-		if ref, err := ParseTopicRef(t); err == nil {
-			_ = ns.seedCursor(sid, ref)
-		}
-	}
-
 	now := nowRFC3339()
-	return ns.WriteEntry(&Entry{
+	if err := ns.WriteEntry(&Entry{
 		SessionID:     sid,
 		Namespace:     ns.String(),
 		Name:          name,
@@ -307,7 +293,30 @@ func register(ns Namespace, sid string, logf func(string, ...any)) error {
 		CCVersion:     os.Getenv(EnvVersion),
 		Driven:        os.Getenv(EnvChild) == "1",
 		Private:       cfg != nil && cfg.Private,
-	})
+	}); err != nil {
+		return err
+	}
+
+	// Cursors are seeded after the entry exists, because taking a session's
+	// lock requires the session to be registered -- that is what stops a
+	// mistyped namespace from being conjured into existence by a read. The
+	// order is otherwise immaterial: a follower that starts before its cursor
+	// is seeded begins at the end of the log, which is where seeding would
+	// have put it.
+	//
+	// Only topics never followed before are seeded. Re-seeding an existing one
+	// would discard the session's read position on every monitor restart,
+	// silently skipping whatever was published while it was down.
+	existing := ns.readCursors(sid)
+	for _, t := range subs {
+		if _, seen := existing[t]; seen {
+			continue
+		}
+		if ref, err := ParseTopicRef(t); err == nil {
+			_ = ns.seedCursor(sid, ref)
+		}
+	}
+	return nil
 }
 
 // defaultSubscriptions is what a session comes up listening to before any
@@ -532,26 +541,58 @@ func followSource(path string, offset int64, out chan<- *Message, stop <-chan st
 
 // newRateLimiter returns an emit function that caps output per minute and
 // reports suppression instead of silently dropping.
-func newRateLimiter(w io.Writer, spool string) func(string) {
+//
+// Claude Code stops a monitor that produces too many events, so exceeding the
+// cap is not an option and something has to give. What gives is the
+// notification, never the message: a suppressed message is still in its log,
+// and the notice says which log, so it can be read. It will not be re-notified,
+// because the follower has already passed it.
+//
+// The notice is per source. It used to name the direct spool for everything,
+// so a suppressed topic message pointed the recipient at a file it had never
+// been in -- the one recovery hint they get, aimed somewhere useless.
+func newRateLimiter(w io.Writer, ns Namespace, spool string, window time.Duration) (emit func(*Message), flush func()) {
 	windowStart := time.Now()
-	count, suppressed := 0, 0
-	return func(line string) {
-		if time.Since(windowStart) >= time.Minute {
-			if suppressed > 0 {
-				fmt.Fprintf(w, "[pigeon] %d further message(s) suppressed by rate limit; full log: %s\n",
-					suppressed, spool)
-				suppressed = 0
-			}
+	count := 0
+	suppressed := map[string]int{}
+
+	flush = func() {
+		for _, src := range sortedKeys(suppressed) {
+			fmt.Fprintf(w, "[pigeon] %d further message(s) suppressed by rate limit; they are in %s\n",
+				suppressed[src], src)
+		}
+		clear(suppressed)
+	}
+
+	emit = func(m *Message) {
+		if time.Since(windowStart) >= window {
+			flush()
 			windowStart = time.Now()
 			count = 0
 		}
 		if count >= maxPerMinute {
-			suppressed++
+			src := spool
+			if m.Topic != "" {
+				if p := ns.TopicPath(m.Topic); p != "" {
+					src = p
+				}
+			}
+			suppressed[src]++
 			return
 		}
 		count++
-		fmt.Fprintln(w, line)
+		fmt.Fprintln(w, ns.Render(m))
 	}
+	return emit, flush
+}
+
+func sortedKeys(m map[string]int) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // block parks forever. Exiting would make Claude Code show the monitor as

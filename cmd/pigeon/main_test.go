@@ -448,7 +448,7 @@ func TestPrivateSessionSaysWhyItsFieldsAreBlank(t *testing.T) {
 	withHome(t)
 	e := asSession(t, "aaaa1111-0000-0000-0000-000000000000", "client")
 	e.Private = true
-	if err := pigeon.WriteEntry(e); err != nil {
+	if err := pigeon.DefaultNamespace().WriteEntry(e); err != nil {
 		t.Fatalf("WriteEntry: %v", err)
 	}
 

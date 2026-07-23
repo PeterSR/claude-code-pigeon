@@ -425,9 +425,13 @@ func cmdTopics(args []string, w, stderr io.Writer) error {
 		return err
 	}
 
+	// Only mark rows when the listing is this session's own namespace. Reading
+	// our subscriptions and applying them to another namespace's topic names
+	// starred logs this session does not read and is not subscribed to, purely
+	// because the names matched.
 	mine := map[string]bool{}
-	if sid := pigeon.CurrentSessionID(); sid != "" {
-		if e, err := pigeon.ReadEntry(sid); err == nil {
+	if sid := pigeon.CurrentSessionID(); sid != "" && ns.Is(pigeon.CurrentNamespace()) {
+		if e, err := ns.ReadEntry(sid); err == nil {
 			for _, t := range e.Subscriptions {
 				mine[t] = true
 			}
@@ -783,8 +787,9 @@ func cmdPrune(args []string, w, stderr io.Writer) error {
 
 	fmt.Fprintf(w, "pruned %d dead session(s)\n", dead)
 	fmt.Fprintf(w, "removed %d orphaned state file(s)\n", orphans)
-	fmt.Fprintf(w, "removed %d unsubscribed topic log(s), compacted %d, reclaimed %s\n",
-		res.TopicsRemoved, res.TopicsCompacted, humanBytes(res.BytesReclaimed))
+	fmt.Fprintf(w, "removed %d unsubscribed topic log(s), compacted %d, "+
+		"reclaimed %d payload file(s), freed %s\n",
+		res.TopicsRemoved, res.TopicsCompacted, res.PayloadsRemoved, humanBytes(res.BytesReclaimed))
 	if *allNS {
 		fmt.Fprintf(w, "swept %d namespace(s)\n", len(spaces))
 	}

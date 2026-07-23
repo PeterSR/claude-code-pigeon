@@ -419,3 +419,52 @@ func recordOffset(t *testing.T, path string, n int) int64 {
 	}
 	return at
 }
+
+// --- the payload pointer must survive a tight budget ----------------------
+
+// The comment above the assembly says the pointer must never be the thing that
+// gets cut, and the arithmetic did exactly that: when head plus tail exceeded
+// the budget, the body's allowance was clamped upward and a final truncate
+// trimmed the end of the line, which is where the pointer lives. A message
+// whose body is in a file and whose pointer is cut is unreachable.
+func TestRenderKeepsThePayloadPointerWhenSpaceIsTight(t *testing.T) {
+	deep := filepath.Join(t.TempDir(), strings.Repeat("d", 60), strings.Repeat("e", 60))
+	t.Setenv(EnvHome, deep)
+	ns := mustNS(t, strings.Repeat("n", 60))
+	if err := ns.EnsureDirs(); err != nil {
+		t.Fatalf("EnsureDirs: %v", err)
+	}
+
+	payload := filepath.Join(ns.PayloadsDir(), "m_deadbeefcafe.txt")
+	m := &Message{
+		From:    Sender{Kind: "session", SessionID: "aaaa1111", Name: strings.Repeat("s", 32), Cwd: "/tmp/" + strings.Repeat("w", 40), Namespace: "elsewhere"},
+		Topic:   strings.Repeat("t", 60),
+		Text:    strings.Repeat("body ", 200),
+		Payload: payload,
+	}
+
+	got := ns.Render(m)
+	if n := len([]rune(got)); n > RenderBudget {
+		t.Errorf("line is %d runes, over the %d budget:\n%s", n, RenderBudget, got)
+	}
+	if !strings.Contains(got, payload) {
+		t.Errorf("the payload pointer was cut, stranding the message:\n%s", got)
+	}
+}
+
+// The ordinary case must be unaffected: everything fits, so nothing is given up.
+func TestRenderKeepsEveryHintWhenThereIsRoom(t *testing.T) {
+	withHome(t)
+	ns := DefaultNamespace()
+	m := &Message{
+		From:  Sender{Kind: "session", SessionID: "aaaa1111", Name: "alpha"},
+		Topic: "deploys",
+		Text:  "short",
+	}
+	got := ns.Render(m)
+	for _, want := range []string{"[reply: pigeon send alpha]", "[topic: pigeon publish deploys]", ":: short"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q:\n%s", want, got)
+		}
+	}
+}

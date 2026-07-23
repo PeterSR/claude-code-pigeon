@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +62,13 @@ func requireRenameOverOpenFile(t *testing.T) {
 // still addressable -- that is the point of distinguishing deaf from dead.
 func liveEntry(t *testing.T, id, name, cwd string) *Entry {
 	t.Helper()
+	return liveEntryIn(t, DefaultNamespace(), id, name, cwd)
+}
+
+// liveEntryIn is liveEntry in a named namespace, for tests about what one
+// namespace can and cannot see of another.
+func liveEntryIn(t *testing.T, ns Namespace, id, name, cwd string) *Entry {
+	t.Helper()
 	pid := os.Getpid()
 	e := &Entry{
 		SessionID: id,
@@ -70,10 +78,29 @@ func liveEntry(t *testing.T, id, name, cwd string) *Entry {
 		ProcStart: ProcStart(pid),
 		StartedAt: nowRFC3339(),
 	}
-	if err := WriteEntry(e); err != nil {
+	if err := ns.WriteEntry(e); err != nil {
 		t.Fatalf("WriteEntry: %v", err)
 	}
 	return e
+}
+
+// mustNS parses a namespace a test wrote itself, where a rejection is a bug in
+// the test rather than a case worth handling.
+func mustNS(t *testing.T, name string) Namespace {
+	t.Helper()
+	ns, err := ParseNamespace(name)
+	if err != nil {
+		t.Fatalf("ParseNamespace(%q): %v", name, err)
+	}
+	return ns
+}
+
+// defaultSubs is what a session comes up subscribed to, plus whatever a config
+// added, in the order the entry stores them.
+func defaultSubs(extra ...string) string {
+	subs := append(defaultSubscriptions(), extra...)
+	sort.Strings(subs)
+	return strings.Join(subs, ",")
 }
 
 // --- sanitising -----------------------------------------------------------
@@ -1114,7 +1141,7 @@ func TestPruneRemovesOrphanedStateFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if n := reconcileOrphans(); n < 4 {
+	if n := ReconcileOrphans(); n < 4 {
 		t.Errorf("swept %d orphaned files, want at least 4", n)
 	}
 	if _, err := os.Stat(SpoolPath(orphan)); !os.IsNotExist(err) {

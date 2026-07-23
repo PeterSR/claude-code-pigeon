@@ -36,6 +36,11 @@ type Sender struct {
 	SessionID string `json:"sessionId,omitempty"`
 	Name      string `json:"name,omitempty"`
 	Cwd       string `json:"cwd,omitempty"`
+	// Namespace is where the sender's own address resolves. Carried because a
+	// message can arrive from outside the recipient's namespace -- over a
+	// global topic, or from a cross-namespace send -- and a reply typed without
+	// it would go nowhere, or to a different session answering to the same name.
+	Namespace string `json:"namespace,omitempty"`
 }
 
 // Addr is what the recipient types to reply, or "" when there is nobody to
@@ -81,12 +86,13 @@ type Message struct {
 // so this is correct without configuration; outside one it degrades to a
 // shell identity.
 func CurrentSender() Sender {
+	ns := CurrentNamespace()
 	sid := CurrentSessionID()
 	if sid == "" {
-		return Sender{Kind: "shell", Name: ShellIdentity(), Cwd: CurrentCwd()}
+		return Sender{Kind: "shell", Name: ShellIdentity(), Cwd: CurrentCwd(), Namespace: ns.String()}
 	}
-	s := Sender{Kind: "session", SessionID: sid, Cwd: CurrentCwd()}
-	if e, err := ReadEntry(sid); err == nil {
+	s := Sender{Kind: "session", SessionID: sid, Cwd: CurrentCwd(), Namespace: ns.String()}
+	if e, err := ns.ReadEntry(sid); err == nil {
 		s.Name = e.Name
 		switch {
 		case e.Private:
@@ -103,9 +109,11 @@ func CurrentSender() Sender {
 
 func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
 
-func SpoolPath(sessionID string) string {
-	return filepath.Join(InboxDir(), sessionID+".ndjson")
+func (n Namespace) SpoolPath(sessionID string) string {
+	return filepath.Join(n.InboxDir(), sessionID+".ndjson")
 }
+
+func SpoolPath(sessionID string) string { return CurrentNamespace().SpoolPath(sessionID) }
 
 // Pending counts messages on a session's spool that no monitor has read.
 //
@@ -114,18 +122,20 @@ func SpoolPath(sessionID string) string {
 // report. It goes non-zero exactly when the session is deaf, which is the one
 // case worth surfacing -- mail is accumulating for a session id that only
 // `claude --resume` will ever bring back.
-func Pending(sessionID string) int {
+func Pending(sessionID string) int { return CurrentNamespace().Pending(sessionID) }
+
+func (n Namespace) Pending(sessionID string) int {
 	if ValidSessionID(sessionID) != nil {
 		return 0
 	}
-	path := SpoolPath(sessionID)
+	path := n.SpoolPath(sessionID)
 	f, err := os.Open(path)
 	if err != nil {
 		return 0
 	}
 	defer f.Close()
 
-	off := readCursors(sessionID)[inboxCursorKey]
+	off := n.readCursors(sessionID)[inboxCursorKey]
 	// A cursor past the end means the spool was truncated or replaced under
 	// us. Counting from zero over-reports, but reporting nothing pending for a
 	// deaf session is the worse failure of the two.
@@ -138,15 +148,15 @@ func Pending(sessionID string) int {
 		}
 	}
 
-	n := 0
+	num := 0
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {
 		if strings.TrimSpace(sc.Text()) != "" {
-			n++
+			num++
 		}
 	}
-	return n
+	return num
 }
 
 func newMessageID() string {
@@ -190,9 +200,15 @@ func truncate(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-// Send appends one message to the target's spool and returns it.
+// Send appends one message to the target's spool and returns it. The namespace
+// is the recipient's, not the sender's: a cross-namespace send has to land in
+// the inbox the recipient's monitor is actually following.
 func Send(to *Entry, text string, from Sender, replyTo string) (*Message, error) {
-	if err := EnsureDirs(); err != nil {
+	return CurrentNamespace().Send(to, text, from, replyTo)
+}
+
+func (n Namespace) Send(to *Entry, text string, from Sender, replyTo string) (*Message, error) {
+	if err := n.EnsureDirs(); err != nil {
 		return nil, err
 	}
 	body := Sanitize(text)
@@ -209,9 +225,11 @@ func Send(to *Entry, text string, from Sender, replyTo string) (*Message, error)
 		ReplyTo: replyTo,
 	}
 
-	// Overflow goes to a file the recipient can Read on demand.
+	// Overflow goes to a file the recipient can Read on demand, in the
+	// recipient's own payload directory: Render will not follow a pointer into
+	// anywhere else.
 	if len([]rune(body)) > BodyBudget {
-		p := filepath.Join(PayloadsDir(), msg.ID+".txt")
+		p := filepath.Join(n.PayloadsDir(), msg.ID+".txt")
 		if err := os.WriteFile(p, []byte(text), 0o600); err == nil {
 			msg.Payload = p
 		}
@@ -225,7 +243,7 @@ func Send(to *Entry, text string, from Sender, replyTo string) (*Message, error)
 
 	// A single O_APPEND write below PIPE_BUF is atomic, so concurrent senders
 	// never interleave partial lines. No lock needed on the spool itself.
-	f, err := os.OpenFile(SpoolPath(to.SessionID), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	f, err := os.OpenFile(n.SpoolPath(to.SessionID), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open spool: %w", err)
 	}
@@ -242,26 +260,51 @@ func Send(to *Entry, text string, from Sender, replyTo string) (*Message, error)
 // Phrased as a report about an event, never as an instruction. Waking a
 // session with imperative text makes the model echo "Human:" blocks or
 // fabricate user turns outright (anthropics/claude-code#60360).
-func Render(m *Message) string {
+//
+// The receiver is a namespace because two of the decisions here depend on
+// where the message landed: which payload directories may be pointed at, and
+// whether the sender is close enough that a bare reply address would reach it.
+func Render(m *Message) string { return CurrentNamespace().Render(m) }
+
+func (n Namespace) Render(m *Message) string {
 	// Everything here arrives from a peer, including the fields that look like
-	// metadata: a sender controls its own cwd, name and topic, and a spool line
-	// could have been written by hand. Sanitise and bound each one rather than
-	// trusting that it was checked on the way in.
+	// metadata: a sender controls its own cwd, name, namespace and topic, and a
+	// spool line could have been written by hand. Sanitise and bound each one
+	// rather than trusting that it was checked on the way in.
 	const (
 		maxName  = 40
 		maxWhere = 32
-		maxTopic = 32
+		maxTopic = 33 // one more than a topic name, for the "@" of a global one
+		maxNS    = 32
 	)
 
+	// The "@" is presentation here rather than a path decision, so a hostile
+	// spool line can misdescribe its own topic and nothing else.
+	global := strings.HasPrefix(m.Topic, GlobalPrefix)
+	// A message from another namespace reached this session over a global topic
+	// or a deliberate cross-namespace send. Either way its address does not
+	// resolve here, which is the one thing the recipient has to be told.
+	foreign := m.From.Namespace != "" && m.From.Namespace != n.String()
+	sender := truncate(Sanitize(m.From.Namespace), maxNS)
+
 	var b strings.Builder
-	if m.Topic != "" {
-		b.WriteString("[pigeon #" + truncate(Sanitize(m.Topic), maxTopic) + "] from ")
-	} else {
+	switch {
+	case m.Topic == "":
 		b.WriteString("[pigeon] message from ")
+	case global:
+		b.WriteString("[pigeon " + truncate(Sanitize(m.Topic), maxTopic) + "] from ")
+	default:
+		b.WriteString("[pigeon #" + truncate(Sanitize(m.Topic), maxTopic) + "] from ")
 	}
 	b.WriteString(truncate(Sanitize(m.From.Display()), maxName))
 	if where := filepath.Base(m.From.Cwd); where != "" && where != "." && where != "/" {
 		b.WriteString(" (" + truncate(Sanitize(where), maxWhere) + ")")
+	}
+	// Named only where a message can have come from outside this namespace: a
+	// global topic, or a direct message that crossed. On a namespaced topic it
+	// is a constant, and a constant in every notification is noise.
+	if sender != "" && (global || foreign) {
+		b.WriteString(" [ns: " + sender + "]")
 	}
 	head := b.String()
 
@@ -269,7 +312,13 @@ func Render(m *Message) string {
 	// pointer must never be the thing that gets cut.
 	var tail strings.Builder
 	if addr := m.From.Addr(); addr != "" {
-		tail.WriteString(" [reply: pigeon send " + truncate(Sanitize(addr), maxName) + "]")
+		qualifier := ""
+		if foreign {
+			// Without this the reply either finds nobody or finds a different
+			// session that happens to answer to the same name here.
+			qualifier = "-n " + sender + " "
+		}
+		tail.WriteString(" [reply: pigeon send " + qualifier + truncate(Sanitize(addr), maxName) + "]")
 	} else {
 		// Saying nothing is not enough: a recipient reads "from
 		// shell:user@host", assumes it is an address, and wastes a call
@@ -279,10 +328,13 @@ func Render(m *Message) string {
 	if m.Topic != "" {
 		tail.WriteString(" [topic: pigeon publish " + truncate(Sanitize(m.Topic), maxTopic) + "]")
 	}
-	// Only ever point at our own payload directory. A hand-written spool line
+	// Only ever point at a payload directory this session already knows: its
+	// own, or the shared one a global topic spills to. A hand-written spool line
 	// could otherwise name any path and have it read back as trustworthy.
-	if p := m.Payload; p != "" && filepath.Dir(p) == PayloadsDir() && filepath.Base(p) != "" {
-		tail.WriteString(" [full text: " + p + "]")
+	if p := m.Payload; p != "" && filepath.Base(p) != "" {
+		if d := filepath.Dir(p); d == n.PayloadsDir() || d == SharedPayloadsDir() {
+			tail.WriteString(" [full text: " + p + "]")
+		}
 	}
 
 	room := RenderBudget - len([]rune(head)) - len([]rune(tail.String())) - 4

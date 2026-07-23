@@ -36,7 +36,13 @@ const heartbeatGrace = 3 * heartbeatInterval
 
 // Entry is one registered session.
 type Entry struct {
-	SessionID     string   `json:"sessionId"`
+	SessionID string `json:"sessionId"`
+	// Namespace is the group this session belongs to. It is published so a
+	// consumer of `pigeon ls --json` or list_sessions does not have to infer
+	// it, and it is always filled in from the directory the entry was read
+	// from rather than from the file, so a planted entry cannot claim to live
+	// somewhere it does not.
+	Namespace     string   `json:"namespace,omitempty"`
 	Name          string   `json:"name,omitempty"`        // self-declared, usable as an address
 	Description   string   `json:"description,omitempty"` // self-declared, free text
 	PID           int      `json:"pid,omitempty"`
@@ -75,6 +81,15 @@ func (e *Entry) Addr() string {
 	return Short(e.SessionID)
 }
 
+// NS is the namespace this entry was read from.
+func (e *Entry) NS() Namespace {
+	ns, err := ParseNamespace(e.Namespace)
+	if err != nil {
+		return DefaultNamespace()
+	}
+	return ns
+}
+
 // Short truncates a session UUID to a git-style prefix.
 func Short(id string) string {
 	if len(id) > 8 {
@@ -83,21 +98,29 @@ func Short(id string) string {
 	return id
 }
 
-func entryPath(sessionID string) string {
-	return filepath.Join(SessionsDir(), sessionID+".json")
+func (n Namespace) entryPath(sessionID string) string {
+	return filepath.Join(n.SessionsDir(), sessionID+".json")
 }
+
+func entryPath(sessionID string) string { return CurrentNamespace().entryPath(sessionID) }
 
 // LockPath is the file a live monitor flocks for its whole lifetime. Holding
 // it is the ground truth for "someone is listening".
-func LockPath(sessionID string) string {
-	return filepath.Join(LocksDir(), sessionID+".lock")
+func (n Namespace) LockPath(sessionID string) string {
+	return filepath.Join(n.LocksDir(), sessionID+".lock")
 }
 
+func LockPath(sessionID string) string { return CurrentNamespace().LockPath(sessionID) }
+
 func ReadEntry(sessionID string) (*Entry, error) {
+	return CurrentNamespace().ReadEntry(sessionID)
+}
+
+func (n Namespace) ReadEntry(sessionID string) (*Entry, error) {
 	if err := ValidSessionID(sessionID); err != nil {
 		return nil, err
 	}
-	b, err := os.ReadFile(entryPath(sessionID))
+	b, err := os.ReadFile(n.entryPath(sessionID))
 	if err != nil {
 		return nil, err
 	}
@@ -105,7 +128,10 @@ func ReadEntry(sessionID string) (*Entry, error) {
 	if err := json.Unmarshal(b, &e); err != nil {
 		return nil, err
 	}
-	e.Status = e.status()
+	// The directory is the truth about which namespace this session is in; the
+	// field is a convenience for whoever reads the JSON afterwards.
+	e.Namespace = n.String()
+	e.Status = e.status(n)
 	return &e, nil
 }
 
@@ -115,14 +141,20 @@ func ReadEntry(sessionID string) (*Entry, error) {
 // enforced here rather than at registration because every later write lands
 // here too -- a heartbeat, a subscribe, a `pigeon describe` -- and any one of
 // them would otherwise put back what the project asked to keep off the bus.
-func WriteEntry(e *Entry) error {
+func WriteEntry(e *Entry) error { return CurrentNamespace().WriteEntry(e) }
+
+func (n Namespace) WriteEntry(e *Entry) error {
 	if err := ValidSessionID(e.SessionID); err != nil {
 		return err
 	}
-	if err := EnsureDirs(); err != nil {
+	if err := n.EnsureDirs(); err != nil {
 		return err
 	}
 	rec := *e
+	// Stamped from the directory being written, never from the caller's copy: a
+	// mismatch between the two would make a session appear to be somewhere it
+	// cannot receive mail.
+	rec.Namespace = n.String()
 	if rec.Private {
 		rec.Cwd, rec.Description = "", ""
 	}
@@ -134,7 +166,7 @@ func WriteEntry(e *Entry) error {
 	// interleave into the same file and rename a half-and-half document into
 	// place, which ReadEntry then rejects -- silently removing the session
 	// from every peer's listing while its monitor sits there looking live.
-	tmp, err := os.CreateTemp(SessionsDir(), "entry-*.tmp")
+	tmp, err := os.CreateTemp(n.SessionsDir(), "entry-*.tmp")
 	if err != nil {
 		return err
 	}
@@ -152,14 +184,16 @@ func WriteEntry(e *Entry) error {
 		_ = os.Remove(name)
 		return err
 	}
-	return os.Rename(name, entryPath(e.SessionID))
+	return os.Rename(name, n.entryPath(e.SessionID))
 }
 
-func RemoveEntry(sessionID string) {
+func RemoveEntry(sessionID string) { CurrentNamespace().RemoveEntry(sessionID) }
+
+func (n Namespace) RemoveEntry(sessionID string) {
 	if ValidSessionID(sessionID) != nil {
 		return
 	}
-	_ = os.Remove(entryPath(sessionID))
+	_ = os.Remove(n.entryPath(sessionID))
 }
 
 // monitorListening reports whether a monitor currently holds the session lock.
@@ -168,15 +202,19 @@ func RemoveEntry(sessionID string) {
 // flock for its entire lifetime, and the kernel drops it the instant that
 // process exits -- crash, SIGKILL or clean shutdown alike. So if we can take
 // the lock, nobody is listening.
-func monitorListening(sessionID string) bool {
-	return !lockIsFree(LockPath(sessionID))
+func (n Namespace) monitorListening(sessionID string) bool {
+	return !lockIsFree(n.LockPath(sessionID))
 }
 
-func (e *Entry) status() Status {
+func monitorListening(sessionID string) bool {
+	return CurrentNamespace().monitorListening(sessionID)
+}
+
+func (e *Entry) status(n Namespace) Status {
 	if !ProcessAlive(e.PID, e.ProcStart) {
 		return StatusDead
 	}
-	if !monitorListening(e.SessionID) {
+	if !n.monitorListening(e.SessionID) {
 		return StatusDeaf
 	}
 	// Lock held but heartbeat stale means a wedged monitor: still counts as
@@ -211,10 +249,14 @@ func ProcessAlive(pid int, wantStart string) bool {
 // ListSessions returns registered sessions with Status filled in. Dead entries
 // are hidden unless includeDead, and removed from disk when prune is set.
 func ListSessions(includeDead, prune bool) ([]*Entry, error) {
-	if err := EnsureDirs(); err != nil {
+	return CurrentNamespace().ListSessions(includeDead, prune)
+}
+
+func (n Namespace) ListSessions(includeDead, prune bool) ([]*Entry, error) {
+	if err := ensureHome(); err != nil {
 		return nil, err
 	}
-	paths, err := filepath.Glob(filepath.Join(SessionsDir(), "*.json"))
+	paths, err := filepath.Glob(filepath.Join(n.SessionsDir(), "*.json"))
 	if err != nil {
 		return nil, err
 	}
@@ -234,10 +276,11 @@ func ListSessions(includeDead, prune bool) ([]*Entry, error) {
 			filepath.Base(p) != e.SessionID+".json" {
 			continue
 		}
-		e.Status = e.status()
+		e.Namespace = n.String()
+		e.Status = e.status(n)
 		if e.Status == StatusDead {
 			if prune {
-				removeSessionFiles(e.SessionID, p)
+				n.removeSessionFiles(e.SessionID, p)
 			}
 			if !includeDead {
 				continue
@@ -249,14 +292,94 @@ func ListSessions(includeDead, prune bool) ([]*Entry, error) {
 	return out, nil
 }
 
+// ListAllSessions returns every registered session on the machine, namespace by
+// namespace. Ordinary listing is per namespace on purpose; this is what
+// `--all-namespaces` asks for.
+func ListAllSessions(includeDead, prune bool) ([]*Entry, error) {
+	spaces, err := ListNamespaces()
+	if err != nil {
+		return nil, err
+	}
+	var out []*Entry
+	for _, info := range spaces {
+		ns, err := ParseNamespace(info.Name)
+		if err != nil {
+			continue
+		}
+		got, err := ns.ListSessions(includeDead, prune)
+		if err != nil {
+			continue
+		}
+		out = append(out, got...)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Namespace != out[j].Namespace {
+			return out[i].Namespace < out[j].Namespace
+		}
+		return out[i].StartedAt < out[j].StartedAt
+	})
+	return out, nil
+}
+
+// NamespaceInfo is one row of `pigeon namespaces`.
+type NamespaceInfo struct {
+	Name    string `json:"name"`
+	Live    int    `json:"live"`
+	Deaf    int    `json:"deaf"`
+	Current bool   `json:"current,omitempty"`
+}
+
+// ListNamespaces reports every namespace that exists on disk, plus the caller's
+// own and the default one, so a fresh install still answers the question.
+func ListNamespaces() ([]NamespaceInfo, error) {
+	if err := ensureHome(); err != nil {
+		return nil, err
+	}
+	current := CurrentNamespace()
+	seen := map[string]bool{DefaultNamespaceName: true, current.String(): true}
+
+	if ents, err := os.ReadDir(NamespacesDir()); err == nil {
+		for _, ent := range ents {
+			// A directory whose name is not a valid namespace was not put there
+			// by pigeon, and listing it would suggest it can be addressed.
+			if ent.IsDir() && ValidNamespace(ent.Name()) == nil {
+				seen[ent.Name()] = true
+			}
+		}
+	}
+
+	out := make([]NamespaceInfo, 0, len(seen))
+	for name := range seen {
+		ns, err := ParseNamespace(name)
+		if err != nil {
+			continue
+		}
+		info := NamespaceInfo{Name: name, Current: ns.Is(current)}
+		entries, err := ns.ListSessions(false, false)
+		if err == nil {
+			for _, e := range entries {
+				switch e.Status {
+				case StatusLive:
+					info.Live++
+				case StatusDeaf:
+					info.Deaf++
+				}
+			}
+		}
+		out = append(out, info)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
 // removeSessionFiles clears everything a dead session leaves behind. Missing
 // any of these means `pigeon prune` slowly litters the state directory.
-func removeSessionFiles(sessionID, entryFile string) {
+func (n Namespace) removeSessionFiles(sessionID, entryFile string) {
 	_ = os.Remove(entryFile)
-	_ = os.Remove(SpoolPath(sessionID))
-	_ = os.Remove(LockPath(sessionID))
-	_ = os.Remove(filepath.Join(LocksDir(), sessionID+".entry.lock"))
-	_ = os.Remove(cursorPath(sessionID))
+	_ = os.Remove(n.SpoolPath(sessionID))
+	_ = os.Remove(n.LockPath(sessionID))
+	_ = os.Remove(filepath.Join(n.LocksDir(), sessionID+".entry.lock"))
+	_ = os.Remove(n.cursorPath(sessionID))
 }
 
 // reconcileOrphans clears state belonging to sessions with no registry entry.
@@ -264,12 +387,16 @@ func removeSessionFiles(sessionID, entryFile string) {
 // A monitor deregisters on the way out, which removes the entry that prune
 // searches by -- so every other file that session owned became unreachable and
 // accumulated. Sweep the state directories directly instead.
-// ReconcileOrphans is the exported entry point for the sweep.
-func ReconcileOrphans() int { return reconcileOrphans() }
+// ReconcileOrphans is the exported entry point for the sweep. It covers one
+// namespace; a session whose project config changed namespace leaves its old
+// entry behind, and only sweeping every namespace clears that.
+func ReconcileOrphans() int { return CurrentNamespace().ReconcileOrphans() }
 
-func reconcileOrphans() int {
+func (n Namespace) ReconcileOrphans() int { return n.reconcileOrphans() }
+
+func (n Namespace) reconcileOrphans() int {
 	known := map[string]bool{}
-	entries, err := filepath.Glob(filepath.Join(SessionsDir(), "*.json"))
+	entries, err := filepath.Glob(filepath.Join(n.SessionsDir(), "*.json"))
 	if err == nil {
 		for _, p := range entries {
 			known[strings.TrimSuffix(filepath.Base(p), ".json")] = true
@@ -292,27 +419,35 @@ func reconcileOrphans() int {
 			}
 		}
 	}
-	sweep(InboxDir(), ".ndjson")
-	sweep(CursorsDir(), ".json")
-	sweep(LocksDir(), ".lock")
-	sweep(LocksDir(), ".entry.lock")
+	sweep(n.InboxDir(), ".ndjson")
+	sweep(n.CursorsDir(), ".json")
+	sweep(n.LocksDir(), ".lock")
+	sweep(n.LocksDir(), ".entry.lock")
 	return removed
 }
 
 // ResolveTarget finds a session by exact id, self-declared name, id prefix, or
 // cwd basename -- in that order. Dead sessions are never resolved; deaf ones
 // are, so the caller can warn rather than silently fail.
+//
+// It searches one namespace, which is what makes namespaces isolation rather
+// than decoration: a name that is taken next door is not taken here, and a
+// token that matches nothing here is not quietly answered by a stranger.
 func ResolveTarget(token string) (*Entry, error) {
+	return CurrentNamespace().ResolveTarget(token)
+}
+
+func (n Namespace) ResolveTarget(token string) (*Entry, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
 		return nil, fmt.Errorf("empty target")
 	}
-	all, err := ListSessions(false, false)
+	all, err := n.ListSessions(false, false)
 	if err != nil {
 		return nil, err
 	}
 	if len(all) == 0 {
-		return nil, fmt.Errorf("no live pigeon sessions registered")
+		return nil, fmt.Errorf("no live pigeon sessions registered in namespace %q", n)
 	}
 
 	var byName, byPrefix, byCwd []*Entry
@@ -347,7 +482,7 @@ func ResolveTarget(token string) (*Entry, error) {
 	if strings.HasPrefix(strings.ToLower(token), "shell:") {
 		return nil, fmt.Errorf("%q is a shell, not a session: it has no inbox and cannot be replied to", token)
 	}
-	return nil, fmt.Errorf("no live session matching %q", token)
+	return nil, fmt.Errorf("no live session matching %q in namespace %q", token, n)
 }
 
 // nameRe constrains self-declared names. A name is rendered into other
@@ -370,20 +505,24 @@ func ValidName(name string) error {
 // The lock is separate from the monitor's liveness lock: taking that one would
 // make the session look deaf for the duration.
 func MutateEntry(sessionID string, fn func(*Entry) error) error {
-	unlock, err := lockSession(sessionID)
+	return CurrentNamespace().MutateEntry(sessionID, fn)
+}
+
+func (n Namespace) MutateEntry(sessionID string, fn func(*Entry) error) error {
+	unlock, err := n.lockSession(sessionID)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
-	e, err := ReadEntry(sessionID)
+	e, err := n.ReadEntry(sessionID)
 	if err != nil {
-		return fmt.Errorf("session not registered")
+		return fmt.Errorf("session not registered in namespace %q", n)
 	}
 	if err := fn(e); err != nil {
 		return err
 	}
-	return WriteEntry(e)
+	return n.WriteEntry(e)
 }
 
 // lockSession takes the per-session mutation lock, held for the duration of a
@@ -391,14 +530,14 @@ func MutateEntry(sessionID string, fn func(*Entry) error) error {
 //
 // This is deliberately not the monitor's liveness lock: taking that one would
 // make the session look deaf for as long as we held it.
-func lockSession(sessionID string) (func(), error) {
+func (n Namespace) lockSession(sessionID string) (func(), error) {
 	if err := ValidSessionID(sessionID); err != nil {
 		return nil, err
 	}
-	if err := EnsureDirs(); err != nil {
+	if err := n.EnsureDirs(); err != nil {
 		return nil, err
 	}
-	c, err := blockingExclusive(filepath.Join(LocksDir(), sessionID+".entry.lock"))
+	c, err := blockingExclusive(filepath.Join(n.LocksDir(), sessionID+".entry.lock"))
 	if err != nil {
 		return nil, err
 	}
@@ -406,8 +545,16 @@ func lockSession(sessionID string) (func(), error) {
 }
 
 // NameTaken reports whether another live session already claims a name.
+//
+// Only within this namespace: a name is an address, and two sessions in
+// separate namespaces answering to "api" cannot misroute anything, because
+// nothing addresses across a boundary without saying so.
 func NameTaken(name, exceptSessionID string) bool {
-	all, err := ListSessions(false, false)
+	return CurrentNamespace().NameTaken(name, exceptSessionID)
+}
+
+func (n Namespace) NameTaken(name, exceptSessionID string) bool {
+	all, err := n.ListSessions(false, false)
 	if err != nil {
 		return false
 	}

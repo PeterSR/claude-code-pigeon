@@ -49,6 +49,11 @@ const (
 // with no actions renders to itself, so a plain "api" is still a plain "api"
 // and nobody has to escape anything.
 type ProjectConfig struct {
+	// Namespace puts sessions started in this checkout in their own group,
+	// isolated from every other one. It is not a template: the namespace has to
+	// be decided before there is a session to render anything against, since it
+	// is the directory that session's entry, spool and cursors are written to.
+	Namespace string `json:"namespace,omitempty"`
 	// Name is the address this session takes, if no other live session
 	// already holds it.
 	Name string `json:"name,omitempty"`
@@ -77,7 +82,7 @@ func (c *ProjectConfig) IsEnabled() bool {
 // rather than as one that will visibly do nothing.
 func (c *ProjectConfig) empty() bool {
 	return c.Name == "" && c.Description == "" && c.OnNameTaken == "" &&
-		len(c.Topics) == 0 && c.Enabled == nil && !c.Private
+		len(c.Topics) == 0 && c.Enabled == nil && !c.Private && c.Namespace == ""
 }
 
 // Resolved is what a config actually gives one session, once its templates
@@ -97,21 +102,21 @@ type Resolved struct {
 // It is what both a starting monitor and `pigeon doctor` ask, so the value
 // doctor reports is the value a session would actually get rather than a
 // second implementation of the same rules.
-func (c *ProjectConfig) Resolve(sessionID, cwd string) Resolved {
+func (c *ProjectConfig) Resolve(ns Namespace, sessionID, cwd string) Resolved {
 	var res Resolved
 	if c == nil {
 		return res
 	}
 	res.Topics = c.Topics
 	res.Private = c.Private
-	ctx := NewTemplateContext(sessionID, cwd)
+	ctx := NewTemplateContext(ns, sessionID, cwd)
 
 	if c.Name != "" {
 		name, err := renderName(c.Name, ctx)
 		switch {
 		case err != nil:
 			res.Problems = append(res.Problems, fmt.Sprintf("name: %v; staying unnamed", err))
-		case !NameTaken(name, sessionID):
+		case !ns.NameTaken(name, sessionID):
 			res.Name = name
 		case c.OnNameTaken == "":
 			res.Problems = append(res.Problems,
@@ -126,7 +131,7 @@ func (c *ProjectConfig) Resolve(sessionID, cwd string) Resolved {
 			case err != nil:
 				res.Problems = append(res.Problems,
 					fmt.Sprintf("name %q is already taken and onNameTaken: %v; staying unnamed", name, err))
-			case NameTaken(alt, sessionID):
+			case ns.NameTaken(alt, sessionID):
 				res.Problems = append(res.Problems,
 					fmt.Sprintf("name %q is already taken and so is the fallback %q; staying unnamed", name, alt))
 			default:
@@ -207,6 +212,17 @@ func LoadProjectConfig(projectDir string) (cfg *ProjectConfig, problems []string
 
 	out := &ProjectConfig{}
 
+	// A namespace becomes a directory name, so a bad one is dropped rather than
+	// repaired: quietly falling back to "default" would put a checkout that
+	// asked to be isolated in with everyone else.
+	if ns := strings.TrimSpace(raw.Namespace); ns != "" {
+		if err := ValidNamespace(ns); err != nil {
+			problems = append(problems, fmt.Sprintf("namespace: %v", err))
+		} else {
+			out.Namespace = ns
+		}
+	}
+
 	// A name is an address and is rendered into other sessions' notifications,
 	// so it is rejected rather than sanitised. Quietly rewriting it would hand
 	// the session an address nobody expects it to answer to.
@@ -245,22 +261,28 @@ func LoadProjectConfig(projectDir string) (cfg *ProjectConfig, problems []string
 	out.Enabled = raw.Enabled
 	out.Private = raw.Private
 
-	seen := map[string]bool{PublicTopic: true}
+	// A leading "@" selects the machine-wide log, here as everywhere else a
+	// topic is accepted. Both public mailboxes are joined by every session
+	// anyway, so listing either is redundant rather than wrong.
+	seen := map[string]bool{PublicTopic: true, GlobalPublicTopic: true}
 	for _, t := range raw.Topics {
-		t = strings.TrimSpace(t)
-		if t == "" || seen[t] {
+		ref, err := ParseTopicRef(t)
+		if strings.TrimSpace(t) == "" {
 			continue
 		}
-		if err := ValidTopic(t); err != nil {
+		if err != nil {
 			problems = append(problems, fmt.Sprintf("topics: %v", err))
+			continue
+		}
+		if seen[ref.String()] {
 			continue
 		}
 		if len(out.Topics) >= maxConfigTopics {
 			problems = append(problems, fmt.Sprintf("topics: more than %d listed; the rest were ignored", maxConfigTopics))
 			break
 		}
-		seen[t] = true
-		out.Topics = append(out.Topics, t)
+		seen[ref.String()] = true
+		out.Topics = append(out.Topics, ref.String())
 	}
 	sort.Strings(out.Topics)
 

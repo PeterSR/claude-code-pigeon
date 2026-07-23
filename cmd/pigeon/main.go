@@ -46,6 +46,8 @@ const usage = `pigeon -- message passing between live Claude Code sessions
   pigeon subscribe <topic>       start receiving a topic in this session
   pigeon unsubscribe <topic>     stop receiving it
   pigeon topics                  list topics and subscriber counts
+  pigeon namespaces              list namespaces and their session counts
+  pigeon namespace [<name>]      show or set the namespace this shell uses
   pigeon whoami                  show this session's identity and address
   pigeon name [<name>]           declare this session's name (usable as address)
   pigeon describe [<text>]       declare what this session is working on
@@ -57,6 +59,11 @@ const usage = `pigeon -- message passing between live Claude Code sessions
   pigeon version
 
 Targets resolve as: exact session id, declared name, id prefix, cwd basename.
+
+Sessions are grouped into namespaces and only see their own. ls, send, publish,
+topics and prune take -n/--namespace <ns>; ls, topics and prune also take
+--all-namespaces. A topic written @name is machine-wide and reaches every
+namespace; a plain name resolves inside one.
 
 name and describe also take --template '{{.Dir}}-{{.Seq}}', rendered against
 this session. See the README for every field and function.`
@@ -87,13 +94,17 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "send":
 		err = cmdSend(rest, stdout, stderr)
 	case "publish", "pub":
-		err = cmdPublish(rest, stdout)
+		err = cmdPublish(rest, stdout, stderr)
 	case "subscribe", "sub":
 		err = cmdSubscribe(rest, stdout)
 	case "unsubscribe", "unsub":
 		err = cmdUnsubscribe(rest, stdout)
 	case "topics":
-		err = cmdTopics(stdout)
+		err = cmdTopics(rest, stdout, stderr)
+	case "namespaces":
+		err = cmdNamespaces(rest, stdout, stderr)
+	case "namespace", "ns":
+		err = cmdNamespace(rest, stdout, stderr)
 	case "whoami":
 		err = cmdWhoami(stdout)
 	case "name":
@@ -105,7 +116,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "statusline":
 		err = cmdStatusline(rest, stdin, stdout, stderr)
 	case "prune":
-		err = cmdPrune(stdout)
+		err = cmdPrune(rest, stdout, stderr)
 	case "monitor":
 		err = pigeon.RunMonitor(stdout, stderr)
 	case "mcp":
@@ -133,6 +144,50 @@ func flags(name string, stderr io.Writer) *flag.FlagSet {
 	return fs
 }
 
+// nsFlag adds -n and --namespace as two spellings of one value, so neither is
+// a second setting that could disagree with the other.
+func nsFlag(fs *flag.FlagSet, into *string) {
+	fs.StringVar(into, "n", "", "namespace to act in (default: this session's)")
+	fs.StringVar(into, "namespace", "", "same as -n")
+}
+
+// namespaceOf resolves a -n value, or this process's own namespace when the
+// flag was not given. A bad name is refused rather than replaced: silently
+// acting on "default" instead of the namespace someone typed is how a message
+// reaches the wrong people.
+func namespaceOf(name string) (pigeon.Namespace, error) {
+	if strings.TrimSpace(name) == "" {
+		return pigeon.CurrentNamespace(), nil
+	}
+	return pigeon.ParseNamespace(name)
+}
+
+// elsewhere counts the sessions this listing is deliberately not showing.
+// Isolation you have forgotten about looks exactly like an empty machine, so
+// the count is what makes the mechanism discoverable again.
+func elsewhere(ns pigeon.Namespace) (sessions, spaces int) {
+	all, err := pigeon.ListNamespaces()
+	if err != nil {
+		return 0, 0
+	}
+	for _, info := range all {
+		if info.Name == ns.String() {
+			continue
+		}
+		if n := info.Live + info.Deaf; n > 0 {
+			sessions += n
+			spaces++
+		}
+	}
+	return sessions, spaces
+}
+
+func printElsewhere(w io.Writer, ns pigeon.Namespace) {
+	if sessions, spaces := elsewhere(ns); sessions > 0 {
+		fmt.Fprintf(w, "\n%d session(s) in %d other namespace(s) (--all-namespaces)\n", sessions, spaces)
+	}
+}
+
 func cmdUninstall(args []string, w, stderr io.Writer) error {
 	fs := flags("uninstall", stderr)
 	purge := fs.Bool("purge", false, "also delete state and queued messages")
@@ -146,11 +201,26 @@ func cmdList(args []string, w, stderr io.Writer) error {
 	fs := flags("ls", stderr)
 	all := fs.Bool("all", false, "include sessions whose process has exited")
 	asJSON := fs.Bool("json", false, "machine-readable output")
+	allNS := fs.Bool("all-namespaces", false, "list every namespace, not only this one")
+	var nsName string
+	nsFlag(fs, &nsName)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if *allNS && strings.TrimSpace(nsName) != "" {
+		return fmt.Errorf("give either --all-namespaces or -n, not both")
+	}
+	ns, err := namespaceOf(nsName)
+	if err != nil {
+		return err
+	}
 
-	entries, err := pigeon.ListSessions(*all, false)
+	var entries []*pigeon.Entry
+	if *allNS {
+		entries, err = pigeon.ListAllSessions(*all, false)
+	} else {
+		entries, err = ns.ListSessions(*all, false)
+	}
 	if err != nil {
 		return err
 	}
@@ -168,22 +238,34 @@ func cmdList(args []string, w, stderr io.Writer) error {
 		return printJSON(w, out)
 	}
 	if len(entries) == 0 {
-		fmt.Fprintln(w, "no registered pigeon sessions")
+		fmt.Fprintf(w, "no registered pigeon sessions in namespace %s\n", ns)
 		fmt.Fprintln(w, "(a session registers when its monitor arms at startup;")
 		fmt.Fprintln(w, " run `pigeon install` then restart Claude Code)")
+		if !*allNS {
+			printElsewhere(w, ns)
+		}
 		return nil
 	}
 
 	me := pigeon.CurrentSessionID()
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "\tSESSION\tNAME\tSTATUS\tCWD\tDESCRIPTION")
+	if *allNS {
+		fmt.Fprintln(tw, "\tNAMESPACE\tSESSION\tNAME\tSTATUS\tCWD\tDESCRIPTION")
+	} else {
+		fmt.Fprintln(tw, "\tSESSION\tNAME\tSTATUS\tCWD\tDESCRIPTION")
+	}
 	for _, e := range entries {
 		mark := " "
 		if e.SessionID == me {
 			mark = "*"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			mark, pigeon.Short(e.SessionID), dash(e.Name), e.Status,
+		if *allNS {
+			fmt.Fprintf(tw, "%s\t%s\t", mark, e.Namespace)
+		} else {
+			fmt.Fprintf(tw, "%s\t", mark)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+			pigeon.Short(e.SessionID), dash(e.Name), e.Status,
 			abbrev(e.Cwd, 32), dash(truncate(e.Description, 40)))
 	}
 	if err := tw.Flush(); err != nil {
@@ -219,24 +301,41 @@ func cmdList(args []string, w, stderr io.Writer) error {
 			break
 		}
 	}
+	if !*allNS {
+		printElsewhere(w, ns)
+	}
 	return nil
 }
 
 func cmdSend(args []string, w, stderr io.Writer) error {
-	if len(args) < 2 {
-		return fmt.Errorf("usage: pigeon send <target> <text>")
+	fs := flags("send", stderr)
+	var nsName string
+	nsFlag(fs, &nsName)
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	target, text := args[0], strings.Join(args[1:], " ")
+	rest := fs.Args()
+	if len(rest) < 2 {
+		return fmt.Errorf("usage: pigeon send [-n <namespace>] <target> <text>")
+	}
+	target, text := rest[0], strings.Join(rest[1:], " ")
 
-	to, err := pigeon.ResolveTarget(target)
+	// Sending across a namespace is allowed rather than blocked: anyone who can
+	// write the state directory could append to that spool by hand, so refusing
+	// would buy inconvenience and no isolation.
+	ns, err := namespaceOf(nsName)
 	if err != nil {
 		return err
 	}
-	msg, err := pigeon.Send(to, text, pigeon.CurrentSender(), "")
+	to, err := ns.ResolveTarget(target)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "sent -> %s (%s)\n", pigeon.Short(to.SessionID), to.Display())
+	msg, err := ns.Send(to, text, pigeon.CurrentSender(), "")
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "sent -> %s (%s) in %s\n", pigeon.Short(to.SessionID), to.Display(), ns)
 	if msg.Payload != "" {
 		fmt.Fprintf(w, "body exceeded %d chars; full text at %s\n", pigeon.BodyBudget, msg.Payload)
 	}
@@ -250,27 +349,29 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 	return nil
 }
 
-func cmdPublish(args []string, w io.Writer) error {
-	if len(args) < 2 {
-		return fmt.Errorf("usage: pigeon publish <topic> <text>")
+func cmdPublish(args []string, w, stderr io.Writer) error {
+	fs := flags("publish", stderr)
+	var nsName string
+	nsFlag(fs, &nsName)
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	topic, text := args[0], strings.Join(args[1:], " ")
-	msg, err := pigeon.Publish(topic, text, pigeon.CurrentSender())
+	rest := fs.Args()
+	if len(rest) < 2 {
+		return fmt.Errorf("usage: pigeon publish [-n <namespace>] <topic> <text>")
+	}
+	topic, text := rest[0], strings.Join(rest[1:], " ")
+	ns, err := namespaceOf(nsName)
 	if err != nil {
 		return err
 	}
-	n := 0
-	if entries, e := pigeon.ListSessions(false, false); e == nil {
-		me := pigeon.CurrentSessionID()
-		for _, en := range entries {
-			for _, t := range en.Subscriptions {
-				if t == topic && en.SessionID != me {
-					n++
-				}
-			}
-		}
+	msg, err := ns.Publish(topic, text, pigeon.CurrentSender())
+	if err != nil {
+		return err
 	}
-	fmt.Fprintf(w, "published to #%s (%d subscriber(s) besides you)\n", topic, n)
+	num := ns.SubscriberCount(msg.Topic, pigeon.CurrentSessionID())
+	fmt.Fprintf(w, "published to %s (%d subscriber(s) besides you)\n",
+		pigeon.TopicLabel(msg.Topic), num)
 	if msg.Payload != "" {
 		fmt.Fprintf(w, "body exceeded %d chars; full text at %s\n", pigeon.BodyBudget, msg.Payload)
 	}
@@ -288,7 +389,8 @@ func cmdSubscribe(args []string, w io.Writer) error {
 	if err := pigeon.Subscribe(e.SessionID, args[0]); err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "subscribed to #%s (takes effect within a second, no restart)\n", args[0])
+	fmt.Fprintf(w, "subscribed to %s (takes effect within a second, no restart)\n",
+		pigeon.TopicLabel(args[0]))
 	return nil
 }
 
@@ -303,15 +405,26 @@ func cmdUnsubscribe(args []string, w io.Writer) error {
 	if err := pigeon.Unsubscribe(e.SessionID, args[0]); err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "unsubscribed from #%s\n", args[0])
+	fmt.Fprintf(w, "unsubscribed from %s\n", pigeon.TopicLabel(args[0]))
 	return nil
 }
 
-func cmdTopics(w io.Writer) error {
-	topics, err := pigeon.ListTopics()
+func cmdTopics(args []string, w, stderr io.Writer) error {
+	fs := flags("topics", stderr)
+	allNS := fs.Bool("all-namespaces", false, "list every namespace's topics, not only this one's")
+	var nsName string
+	nsFlag(fs, &nsName)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *allNS && strings.TrimSpace(nsName) != "" {
+		return fmt.Errorf("give either --all-namespaces or -n, not both")
+	}
+	ns, err := namespaceOf(nsName)
 	if err != nil {
 		return err
 	}
+
 	mine := map[string]bool{}
 	if sid := pigeon.CurrentSessionID(); sid != "" {
 		if e, err := pigeon.ReadEntry(sid); err == nil {
@@ -320,16 +433,132 @@ func cmdTopics(w io.Writer) error {
 			}
 		}
 	}
+
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "\tTOPIC\tSUBSCRIBERS")
-	for _, t := range topics {
+	// A row per topic, marked when this session subscribes. A global topic is
+	// listed once with no namespace of its own, because it does not have one.
+	row := func(space string, t pigeon.TopicInfo) {
 		mark := " "
 		if mine[t.Name] {
 			mark = "*"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%d\n", mark, t.Name, t.Subscribers)
+		if t.Global {
+			space = "-"
+		}
+		if *allNS {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%d\n", mark, space, t.Name, t.Subscribers)
+		} else {
+			fmt.Fprintf(tw, "%s\t%s\t%d\n", mark, t.Name, t.Subscribers)
+		}
+	}
+
+	if !*allNS {
+		fmt.Fprintln(tw, "\tTOPIC\tSUBSCRIBERS")
+		topics, err := ns.ListTopics()
+		if err != nil {
+			return err
+		}
+		for _, t := range topics {
+			row(ns.String(), t)
+		}
+		return tw.Flush()
+	}
+
+	fmt.Fprintln(tw, "\tNAMESPACE\tTOPIC\tSUBSCRIBERS")
+	spaces, err := pigeon.ListNamespaces()
+	if err != nil {
+		return err
+	}
+	seenGlobal := map[string]bool{}
+	for _, info := range spaces {
+		space, err := pigeon.ParseNamespace(info.Name)
+		if err != nil {
+			continue
+		}
+		topics, err := space.ListTopics()
+		if err != nil {
+			continue
+		}
+		for _, t := range topics {
+			if t.Global {
+				if seenGlobal[t.Name] {
+					continue
+				}
+				seenGlobal[t.Name] = true
+			}
+			row(info.Name, t)
+		}
 	}
 	return tw.Flush()
+}
+
+func cmdNamespaces(args []string, w, stderr io.Writer) error {
+	fs := flags("namespaces", stderr)
+	asJSON := fs.Bool("json", false, "machine-readable output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	spaces, err := pigeon.ListNamespaces()
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(w, spaces)
+	}
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "\tNAMESPACE\tLIVE\tDEAF")
+	for _, info := range spaces {
+		mark := " "
+		if info.Current {
+			mark = "*"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\n", mark, info.Name, info.Live, info.Deaf)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	fmt.Fprintln(w, "\n* the namespace this shell uses (pigeon namespace <name> to change it)")
+	return nil
+}
+
+// cmdNamespace is get-or-set, like `pigeon name`. Setting it records a
+// preference for shell invocations; it does not move a running session, whose
+// namespace was fixed when its monitor armed and whose lock and topics all live
+// in that namespace's directory.
+func cmdNamespace(args []string, w, stderr io.Writer) error {
+	fs := flags("namespace", stderr)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) == 0 {
+		ns, origin := pigeon.ResolveNamespace()
+		// The name alone on stdout so `$(pigeon namespace)` is usable; where it
+		// came from on stderr, because a namespace you did not expect is the
+		// only interesting thing this command can tell you.
+		fmt.Fprintln(w, ns)
+		fmt.Fprintf(stderr, "(from %s)\n", origin)
+		return nil
+	}
+	if len(rest) != 1 {
+		return fmt.Errorf("usage: pigeon namespace [<name>]")
+	}
+	ns, err := pigeon.ParseNamespace(rest[0])
+	if err != nil {
+		return err
+	}
+	if err := pigeon.SetCLINamespace(ns); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "namespace set to %q for shell invocations\n", ns)
+
+	// Setting a preference that something already outranks is a silent no-op
+	// otherwise, and the user would go on wondering why ls looks the same.
+	if effective, origin := pigeon.ResolveNamespace(); !effective.Is(ns) {
+		fmt.Fprintf(stderr, "note: %s still applies here, from %s\n", effective, origin)
+	}
+	fmt.Fprintln(w, "running sessions keep the namespace they armed with; restart one to move it")
+	return nil
 }
 
 func cmdWhoami(w io.Writer) error {
@@ -345,6 +574,7 @@ func cmdWhoami(w io.Writer) error {
 		return nil
 	}
 	fmt.Fprintf(w, "session:      %s\n", e.SessionID)
+	fmt.Fprintf(w, "namespace:    %s\n", e.Namespace)
 	fmt.Fprintf(w, "name:         %s\n", dash(e.Name))
 	fmt.Fprintf(w, "description:  %s\n", dash(e.Description))
 	fmt.Fprintf(w, "cwd:          %s\n", e.Cwd)
@@ -484,30 +714,80 @@ func statuslineStdin(stdin io.Reader) io.Reader {
 	return f
 }
 
-func cmdPrune(w io.Writer) error {
-	before, err := pigeon.ListSessions(true, false)
+func cmdPrune(args []string, w, stderr io.Writer) error {
+	fs := flags("prune", stderr)
+	allNS := fs.Bool("all-namespaces", false, "sweep every namespace, not only this one")
+	var nsName string
+	nsFlag(fs, &nsName)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *allNS && strings.TrimSpace(nsName) != "" {
+		return fmt.Errorf("give either --all-namespaces or -n, not both")
+	}
+	ns, err := namespaceOf(nsName)
 	if err != nil {
 		return err
 	}
-	if _, err := pigeon.ListSessions(true, true); err != nil {
-		return err
-	}
-	after, err := pigeon.ListSessions(true, false)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(w, "pruned %d dead session(s)\n", len(before)-len(after))
 
-	// Topic logs are append-only, so reclaim the prefix every live subscriber
-	// has already read, and drop logs nobody subscribes to.
-	orphans := pigeon.ReconcileOrphans()
-	res, err := pigeon.PruneTopics()
+	// A session whose project config changed namespace leaves its old entry
+	// behind, in a namespace nothing else looks at. --all-namespaces is what
+	// clears that.
+	spaces := []pigeon.Namespace{ns}
+	if *allNS {
+		all, err := pigeon.ListNamespaces()
+		if err != nil {
+			return err
+		}
+		spaces = spaces[:0]
+		for _, info := range all {
+			if got, err := pigeon.ParseNamespace(info.Name); err == nil {
+				spaces = append(spaces, got)
+			}
+		}
+	}
+
+	dead, orphans := 0, 0
+	var res pigeon.PruneResult
+	for _, space := range spaces {
+		before, err := space.ListSessions(true, false)
+		if err != nil {
+			return err
+		}
+		if _, err := space.ListSessions(true, true); err != nil {
+			return err
+		}
+		after, err := space.ListSessions(true, false)
+		if err != nil {
+			return err
+		}
+		dead += len(before) - len(after)
+		orphans += space.ReconcileOrphans()
+
+		// Topic logs are append-only, so reclaim the prefix every live subscriber
+		// has already read, and drop logs nobody subscribes to.
+		got, err := space.PruneTopics()
+		if err != nil {
+			return err
+		}
+		res.Add(got)
+	}
+	// The global logs are swept once, counting subscribers in every namespace:
+	// cutting a prefix that only a session next door has yet to read would drop
+	// that session's mail.
+	shared, err := pigeon.PruneSharedTopics()
 	if err != nil {
 		return err
 	}
+	res.Add(shared)
+
+	fmt.Fprintf(w, "pruned %d dead session(s)\n", dead)
 	fmt.Fprintf(w, "removed %d orphaned state file(s)\n", orphans)
 	fmt.Fprintf(w, "removed %d unsubscribed topic log(s), compacted %d, reclaimed %s\n",
 		res.TopicsRemoved, res.TopicsCompacted, humanBytes(res.BytesReclaimed))
+	if *allNS {
+		fmt.Fprintf(w, "swept %d namespace(s)\n", len(spaces))
+	}
 	return nil
 }
 

@@ -63,7 +63,7 @@ func TestToolsListIsComplete(t *testing.T) {
 
 	want := []string{
 		"list_sessions", "send_message", "publish", "subscribe",
-		"unsubscribe", "list_topics", "whoami", "set_identity",
+		"unsubscribe", "list_topics", "list_namespaces", "whoami", "set_identity",
 	}
 	got := map[string]bool{}
 	for _, d := range defs {
@@ -348,6 +348,96 @@ func TestPublishRequiresBothFields(t *testing.T) {
 	withHome(t)
 	if got := toolText(t, "publish", map[string]any{"topic": "deploys"}); !strings.Contains(got, "required") {
 		t.Errorf("got %q, want a validation message", got)
+	}
+}
+
+// --- namespaces --------------------------------------------------------------
+
+// The model sees one namespace at a time, so the listing has to say what it is
+// not showing; concluding the machine is empty when it is only isolated is the
+// mistake this text exists to prevent.
+func TestListSessionsIsPerNamespaceAndSaysSo(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvNamespace, "acme")
+	t.Setenv(EnvSessionID, "aaaa1111-2222")
+	liveEntryIn(t, mustNS(t, "acme"), "aaaa1111-2222", "alpha", "/home/p/api")
+	liveEntryIn(t, mustNS(t, "other"), "bbbb2222-3333", "beta", "/home/p/web")
+
+	got := toolText(t, "list_sessions", map[string]any{})
+	if strings.Contains(got, "beta") {
+		t.Errorf("list_sessions leaked a session from another namespace:\n%s", got)
+	}
+	if !strings.Contains(got, "ns=acme") {
+		t.Errorf("list_sessions does not report the namespace:\n%s", got)
+	}
+	if !strings.Contains(got, "1 further session(s) are in 1 other namespace(s)") {
+		t.Errorf("list_sessions does not say what it is hiding:\n%s", got)
+	}
+
+	// Naming one is how a session looks over the fence deliberately.
+	got = toolText(t, "list_sessions", map[string]any{"namespace": "other"})
+	if !strings.Contains(got, "beta") {
+		t.Errorf("an explicit namespace was not listed:\n%s", got)
+	}
+	// A namespace that cannot be a directory name is refused rather than
+	// replaced: acting on "default" instead would message the wrong people.
+	if got := toolText(t, "list_sessions", map[string]any{"namespace": "../escape"}); !strings.Contains(got, "invalid namespace") {
+		t.Errorf("got %q, want the bad namespace refused", got)
+	}
+}
+
+func TestSendMessageAcrossNamespaces(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvNamespace, "acme")
+	t.Setenv(EnvSessionID, "aaaa1111-2222")
+	liveEntryIn(t, mustNS(t, "acme"), "aaaa1111-2222", "alpha", "/home/p/api")
+	liveEntryIn(t, mustNS(t, "other"), "bbbb2222-3333", "beta", "/home/p/web")
+
+	if got := toolText(t, "send_message", map[string]any{"to": "beta", "text": "ping"}); !strings.Contains(got, "no live session") {
+		t.Errorf("got %q; a session next door must not resolve by name alone", got)
+	}
+	got := toolText(t, "send_message", map[string]any{"to": "beta", "text": "ping", "namespace": "other"})
+	if !strings.Contains(got, "Delivered to beta") || !strings.Contains(got, `namespace "other"`) {
+		t.Errorf("got %q, want a delivery into the named namespace", got)
+	}
+	if n := mustNS(t, "other").Pending("bbbb2222-3333"); n != 1 {
+		t.Errorf("recipient has %d message(s) waiting, want 1", n)
+	}
+}
+
+func TestPublishToAGlobalTopicViaMCP(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvNamespace, "acme")
+	t.Setenv(EnvSessionID, "aaaa1111-2222")
+	liveEntryIn(t, mustNS(t, "acme"), "aaaa1111-2222", "alpha", "/home/p/api")
+	other := mustNS(t, "other")
+	liveEntryIn(t, other, "bbbb2222-3333", "beta", "/home/p/web")
+	if err := other.Subscribe("bbbb2222-3333", "@ops"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	got := toolText(t, "publish", map[string]any{"topic": "@ops", "text": "all hands"})
+	if !strings.Contains(got, "Published to @ops") {
+		t.Errorf("got %q, want the global marker kept", got)
+	}
+	if !strings.Contains(got, "machine-wide") {
+		t.Errorf("got %q, want it to say the message crossed namespaces", got)
+	}
+	if !strings.Contains(got, "1 other live session(s)") {
+		t.Errorf("got %q, want the subscriber next door counted", got)
+	}
+}
+
+func TestListNamespacesViaMCP(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvNamespace, "acme")
+	liveEntryIn(t, mustNS(t, "other"), "bbbb2222-3333", "beta", "/home/p/web")
+
+	got := toolText(t, "list_namespaces", map[string]any{})
+	for _, want := range []string{"* acme", "other", "deaf=1", "fixed when it starts"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("list_namespaces is missing %q:\n%s", want, got)
+		}
 	}
 }
 

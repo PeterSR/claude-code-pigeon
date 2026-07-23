@@ -160,6 +160,37 @@ func TestStatuslinePlainDropsEmojiAndColour(t *testing.T) {
 	}
 }
 
+// The statusline is spawned per render, with an environment and a working
+// directory that need not match the ones the monitor armed with. Reporting a
+// healthy session as "not armed" because this process resolved a different
+// namespace is the false alarm the whole design exists to avoid.
+func TestStatuslineFindsASessionInAnotherNamespace(t *testing.T) {
+	withHome(t)
+	acme := mustNS(t, "acme")
+	liveEntryIn(t, acme, "bbbb2222", "beta", "/tmp/work")
+	t.Setenv(EnvSessionID, "bbbb2222")
+
+	// This process resolves "default", where the session is not.
+	if _, err := ReadEntry("bbbb2222"); err == nil {
+		t.Fatal("the session is registered in the default namespace; the test proves nothing")
+	}
+	got := statusline(t, "", StatuslineOptions{Plain: true})
+	if strings.Contains(got, "not armed") {
+		t.Errorf("got %q, want the session found in its own namespace", got)
+	}
+	if !strings.Contains(got, "deaf") {
+		t.Errorf("got %q, want its real state", got)
+	}
+
+	// A count only means anything once it is read from the right spool.
+	if _, err := acme.Send(&Entry{SessionID: "bbbb2222"}, "queued", Sender{Kind: "shell", Name: "sh"}, ""); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if got := statusline(t, "", StatuslineOptions{Plain: true}); !strings.Contains(got, "1 waiting") {
+		t.Errorf("got %q, want the waiting message counted", got)
+	}
+}
+
 // --- pending ---------------------------------------------------------------
 
 // Pending counts from the monitor's cursor, not from the top of the spool:

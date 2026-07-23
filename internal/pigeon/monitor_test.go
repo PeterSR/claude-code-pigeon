@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -192,10 +193,14 @@ func TestMonitorRegistersEntryAndHoldsTheLock(t *testing.T) {
 			t.Errorf("%s = %q, not RFC3339: %v", f.name, f.val, err)
 		}
 	}
-	// Everyone joins the public mailbox at registration, so a broadcast
-	// reaches the machine without anyone configuring anything.
-	if len(e.Subscriptions) != 1 || e.Subscriptions[0] != PublicTopic {
-		t.Errorf("Subscriptions = %v, want [%s]", e.Subscriptions, PublicTopic)
+	// Everyone joins both public mailboxes at registration: this namespace's,
+	// and the machine-wide one, so a broadcast reaches either without anyone
+	// configuring anything.
+	if got := strings.Join(e.Subscriptions, ","); got != defaultSubs() {
+		t.Errorf("Subscriptions = %v, want %s", e.Subscriptions, defaultSubs())
+	}
+	if e.Namespace != DefaultNamespaceName {
+		t.Errorf("Namespace = %q, want %q", e.Namespace, DefaultNamespaceName)
 	}
 	if e.Status != StatusLive {
 		t.Errorf("Status = %q, want %q while a monitor is running", e.Status, StatusLive)
@@ -385,6 +390,94 @@ func TestUnsubscribingWhileTheMonitorRunsStopsDelivery(t *testing.T) {
 	})
 	if m.stdout.has("second after unsubscribing") {
 		t.Errorf("monitor kept delivering a topic it had left:\n%s", m.stdout.String())
+	}
+}
+
+// --- namespaces ------------------------------------------------------------
+//
+// The library tests cover which directory each call reads. These cover the one
+// thing only a running monitor can show: what actually wakes a session.
+
+// peerFrom is a sender in a named namespace, as a real one always is.
+func peerFrom(ns string) Sender {
+	s := peer()
+	s.Namespace = ns
+	return s
+}
+
+// The deliberate hole in the isolation: a machine-wide broadcast has to reach
+// everybody, whatever namespace they armed in.
+func TestMonitorReceivesGlobalBroadcastsFromAnotherNamespace(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvNamespace, "acme")
+	const sid = "mon-global-1"
+	m := startMonitor(t, sid)
+
+	if _, err := DefaultNamespace().Publish(GlobalPublicTopic, "everyone please stand by",
+		peerFrom(DefaultNamespaceName)); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	eventually(t, 6*time.Second, "the machine-wide broadcast", func() bool {
+		return m.stdout.has("everyone please stand by")
+	})
+	// Arriving from outside the recipient's boundary is the one thing that
+	// changes how the line should be read, so it has to say so.
+	if !m.stdout.has("[ns: " + DefaultNamespaceName + "]") {
+		t.Errorf("the notification does not name the sender's namespace:\n%s", m.stdout.String())
+	}
+}
+
+// And the rule it is an exception to: a plain topic is one log per namespace,
+// so an identically named one next door must never wake this session.
+func TestMonitorIgnoresANamespacedTopicFromAnotherNamespace(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvNamespace, "acme")
+	const sid = "mon-nsleak-1"
+	m := startMonitor(t, sid)
+
+	acme := mustNS(t, "acme")
+	if err := acme.Subscribe(sid, "deploys"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	eventually(t, 6*time.Second, "the monitor to follow #deploys", func() bool {
+		return m.stderr.has(`following topic "deploys"`)
+	})
+
+	if _, err := DefaultNamespace().Publish("deploys", "not for you",
+		peerFrom(DefaultNamespaceName)); err != nil {
+		t.Fatalf("Publish (other namespace): %v", err)
+	}
+	// Barrier: a publish into this namespace's own #deploys proves the follower
+	// is running, so the missing line above is a real absence.
+	if _, err := acme.Publish("deploys", "this one is ours", peerFrom("acme")); err != nil {
+		t.Fatalf("Publish (own namespace): %v", err)
+	}
+	eventually(t, 6*time.Second, "the barrier message", func() bool {
+		return m.stdout.has("this one is ours")
+	})
+	if m.stdout.has("not for you") {
+		t.Errorf("a topic published in another namespace was delivered:\n%s", m.stdout.String())
+	}
+}
+
+// Sending across is allowed, so the recipient has to be able to reply. A bare
+// address would either miss or find a different session answering to the same
+// name here.
+func TestMonitorDeliversACrossNamespaceDirectMessage(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvNamespace, "acme")
+	const sid = "mon-crossns-1"
+	m := startMonitor(t, sid)
+
+	if _, err := mustNS(t, "acme").Send(mailbox(sid), "from next door",
+		peerFrom(DefaultNamespaceName), ""); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	eventually(t, 6*time.Second, "the cross-namespace message", func() bool {
+		return m.stdout.has("from next door")
+	})
+	if !m.stdout.has("pigeon send -n " + DefaultNamespaceName + " beta") {
+		t.Errorf("the reply hint does not name the sender's namespace:\n%s", m.stdout.String())
 	}
 }
 

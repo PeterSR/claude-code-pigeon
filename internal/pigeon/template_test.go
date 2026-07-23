@@ -48,7 +48,7 @@ func TestTemplateContextExposesEverySessionFact(t *testing.T) {
 	writeGit(t, dir, "ref: refs/heads/main\n")
 
 	const sid = "aaaa1111-2222-3333"
-	ctx := NewTemplateContext(sid, dir)
+	ctx := NewTemplateContext(DefaultNamespace(), sid, dir)
 	host, _ := os.Hostname()
 
 	cases := []struct {
@@ -82,7 +82,7 @@ func TestTemplateContextSurvivesAnEmptyCwd(t *testing.T) {
 	withHome(t)
 	// The CLI can run outside any project directory, and a template referring
 	// to .Dir must render to nothing rather than to filepath.Base's ".".
-	ctx := NewTemplateContext("aaaa1111", "")
+	ctx := NewTemplateContext(DefaultNamespace(), "aaaa1111", "")
 	if ctx.Dir != "" || ctx.Branch != "" {
 		t.Errorf("Dir/Branch = %q/%q, want both empty", ctx.Dir, ctx.Branch)
 	}
@@ -244,7 +244,7 @@ func TestSeqCountsLiveSessionsInTheSameCwd(t *testing.T) {
 // must fail rather than fill memory or a notification line.
 func TestRenderRejectsUnboundedOutput(t *testing.T) {
 	withHome(t)
-	ctx := NewTemplateContext("aaaa1111", "/home/p/api")
+	ctx := NewTemplateContext(DefaultNamespace(), "aaaa1111", "/home/p/api")
 	if _, err := renderTemplate(`{{printf "%9999s" "x"}}`, ctx); err == nil {
 		t.Fatal("a template producing more than the output bound was accepted")
 	}

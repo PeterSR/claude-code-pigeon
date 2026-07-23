@@ -12,8 +12,24 @@ import (
 )
 
 // PublicTopic is the mailbox every session joins by default, so a broadcast
-// reaches the whole machine without anyone configuring anything.
+// reaches the whole namespace without anyone configuring anything.
 const PublicTopic = "all"
+
+// GlobalPrefix marks a topic that lives outside every namespace, so `@ops` is
+// one log the whole machine shares while `ops` is one log per namespace.
+//
+// "@" rather than the obvious alternatives because a topic is typed at a shell:
+// `*` globs, `!` history-expands, and `~` gets tilde-expanded, so `pigeon
+// publish *ops` would fail in a way that has nothing to do with pigeon. "@" is
+// shell-safe and reads differently from the "#" a namespaced topic renders with.
+const GlobalPrefix = "@"
+
+// GlobalPublicTopic is the machine-wide mailbox. Every session subscribes to it
+// as well as to its own namespace's `all`: this is the one place isolation is
+// deliberately not absolute, because a broadcast meant for everyone on the
+// machine has to reach everyone on the machine. `pigeon unsubscribe @all`
+// opts out.
+const GlobalPublicTopic = GlobalPrefix + PublicTopic
 
 var topicRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
@@ -22,7 +38,8 @@ var topicRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 const inboxCursorKey = ":inbox"
 
 // ValidTopic keeps topic names safe as filenames and readable in a
-// notification line.
+// notification line. It validates the bare name; the global prefix is stripped
+// and checked separately by ParseTopicRef.
 func ValidTopic(t string) error {
 	if !topicRe.MatchString(t) {
 		return fmt.Errorf("invalid topic %q: use lowercase letters, digits, dot, dash or underscore (max 64)", t)
@@ -30,25 +47,108 @@ func ValidTopic(t string) error {
 	return nil
 }
 
-func TopicsDir() string  { return filepath.Join(Home(), "topics") }
-func CursorsDir() string { return filepath.Join(Home(), "cursors") }
-
-func TopicPath(topic string) string {
-	return filepath.Join(TopicsDir(), topic+".ndjson")
+// TopicRef is a topic name plus which tree its log lives in. Everywhere a topic
+// is accepted -- CLI, MCP, project config -- a leading "@" selects the global
+// one, and this is the single place that decision is made.
+type TopicRef struct {
+	Name   string
+	Global bool
 }
 
-func cursorPath(sessionID string) string {
-	return filepath.Join(CursorsDir(), sessionID+".json")
+// ParseTopicRef validates a topic as typed.
+func ParseTopicRef(s string) (TopicRef, error) {
+	s = strings.TrimSpace(s)
+	ref := TopicRef{Name: s}
+	if rest, ok := strings.CutPrefix(s, GlobalPrefix); ok {
+		ref = TopicRef{Name: rest, Global: true}
+	}
+	if err := ValidTopic(ref.Name); err != nil {
+		return TopicRef{}, err
+	}
+	return ref, nil
 }
+
+// String is the form a user types, the form stored in a subscription list, and
+// the key a cursor is filed under -- so `deploys` and `@deploys` keep separate
+// read positions, as two different logs must.
+func (r TopicRef) String() string {
+	if r.Global {
+		return GlobalPrefix + r.Name
+	}
+	return r.Name
+}
+
+// TopicLabel is how a topic is written in output: "#deploys" for one that
+// resolves inside a namespace, "@ops" for one the whole machine shares. It
+// takes the string rather than a TopicRef because every caller is echoing back
+// a value some earlier call already validated.
+func TopicLabel(topic string) string {
+	if strings.HasPrefix(topic, GlobalPrefix) {
+		return topic
+	}
+	return "#" + topic
+}
+
+func (r TopicRef) path(n Namespace) string {
+	if r.Global {
+		return filepath.Join(SharedTopicsDir(), r.Name+".ndjson")
+	}
+	return filepath.Join(n.TopicsDir(), r.Name+".ndjson")
+}
+
+// payloadsDir is where an overflowing message on this topic spills its body.
+// A global topic spills to the shared tree, because a recipient in another
+// namespace has to be able to read it -- and Render only follows a pointer
+// into a directory it already knows.
+func (r TopicRef) payloadsDir(n Namespace) string {
+	if r.Global {
+		return SharedPayloadsDir()
+	}
+	return n.PayloadsDir()
+}
+
+// lockPath guards the log while it is being rewritten, so an append cannot
+// land in the middle of a compaction. A global topic's lock lives in the shared
+// tree: two namespaces holding their own locks over one log is no lock at all.
+func (r TopicRef) lockPath(n Namespace) string {
+	if r.Global {
+		return filepath.Join(sharedLocksDir(), "topic-"+r.Name+".lock")
+	}
+	return filepath.Join(n.LocksDir(), "topic-"+r.Name+".lock")
+}
+
+// TopicPath is the log a topic reference names, or "" when the reference is not
+// a usable topic at all. Callers validate first; returning "" keeps a bad name
+// from steering a path join if one ever does not.
+func (n Namespace) TopicPath(topic string) string {
+	ref, err := ParseTopicRef(topic)
+	if err != nil {
+		return ""
+	}
+	return ref.path(n)
+}
+
+func TopicPath(topic string) string { return CurrentNamespace().TopicPath(topic) }
+
+func (n Namespace) cursorPath(sessionID string) string {
+	return filepath.Join(n.CursorsDir(), sessionID+".json")
+}
+
+func cursorPath(sessionID string) string { return CurrentNamespace().cursorPath(sessionID) }
 
 // Publish appends a message to a topic log. Every subscriber's monitor picks
 // it up independently; there is no fan-out at write time, which keeps
 // publishing O(1) regardless of how many sessions are listening.
 func Publish(topic, text string, from Sender) (*Message, error) {
-	if err := ValidTopic(topic); err != nil {
+	return CurrentNamespace().Publish(topic, text, from)
+}
+
+func (n Namespace) Publish(topic, text string, from Sender) (*Message, error) {
+	ref, err := ParseTopicRef(topic)
+	if err != nil {
 		return nil, err
 	}
-	if err := EnsureDirs(); err != nil {
+	if err := n.EnsureDirs(); err != nil {
 		return nil, err
 	}
 	body := Sanitize(text)
@@ -60,11 +160,11 @@ func Publish(topic, text string, from Sender) (*Message, error) {
 		ID:    newMessageID(),
 		TS:    nowRFC3339(),
 		From:  from,
-		Topic: topic,
+		Topic: ref.String(),
 		Text:  body,
 	}
 	if len([]rune(body)) > BodyBudget {
-		p := filepath.Join(PayloadsDir(), msg.ID+".txt")
+		p := filepath.Join(ref.payloadsDir(n), msg.ID+".txt")
 		if err := os.WriteFile(p, []byte(text), 0o600); err == nil {
 			msg.Payload = p
 		}
@@ -75,13 +175,13 @@ func Publish(topic, text string, from Sender) (*Message, error) {
 		return nil, err
 	}
 	// Hold the topic lock so an append cannot land mid-compaction.
-	unlock, err := blockingExclusive(topicLockPath(topic))
+	unlock, err := blockingExclusive(ref.lockPath(n))
 	if err != nil {
 		return nil, err
 	}
 	defer unlock.Close()
 
-	f, err := os.OpenFile(TopicPath(topic), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	f, err := os.OpenFile(ref.path(n), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open topic: %w", err)
 	}
@@ -95,31 +195,44 @@ func Publish(topic, text string, from Sender) (*Message, error) {
 // Subscribe adds a topic to a session's subscription list. The running monitor
 // notices within about a second and starts following it -- no restart.
 func Subscribe(sessionID, topic string) error {
-	if err := ValidTopic(topic); err != nil {
+	return CurrentNamespace().Subscribe(sessionID, topic)
+}
+
+func (n Namespace) Subscribe(sessionID, topic string) error {
+	ref, err := ParseTopicRef(topic)
+	if err != nil {
 		return err
 	}
 	// Start at the end so subscribing does not replay the topic's history
 	// into the session as a burst of notifications.
-	if err := seedCursor(sessionID, topic); err != nil {
+	if err := n.seedCursor(sessionID, ref); err != nil {
 		return err
 	}
-	return MutateEntry(sessionID, func(e *Entry) error {
+	return n.MutateEntry(sessionID, func(e *Entry) error {
 		for _, t := range e.Subscriptions {
-			if t == topic {
+			if t == ref.String() {
 				return nil
 			}
 		}
-		e.Subscriptions = append(e.Subscriptions, topic)
+		e.Subscriptions = append(e.Subscriptions, ref.String())
 		sort.Strings(e.Subscriptions)
 		return nil
 	})
 }
 
 func Unsubscribe(sessionID, topic string) error {
-	return MutateEntry(sessionID, func(e *Entry) error {
+	return CurrentNamespace().Unsubscribe(sessionID, topic)
+}
+
+func (n Namespace) Unsubscribe(sessionID, topic string) error {
+	// Unsubscribing is not validated the way subscribing is: whatever is in the
+	// list has to be removable, including something a hand-edited entry put
+	// there.
+	want := strings.TrimSpace(topic)
+	return n.MutateEntry(sessionID, func(e *Entry) error {
 		out := e.Subscriptions[:0]
 		for _, t := range e.Subscriptions {
-			if t != topic {
+			if t != want {
 				out = append(out, t)
 			}
 		}
@@ -133,9 +246,9 @@ func Unsubscribe(sessionID, topic string) error {
 // Each session keeps its own read offset per topic, so a shared append-only
 // log serves every subscriber without any of them consuming from the others.
 
-func readCursors(sessionID string) map[string]int64 {
+func (n Namespace) readCursors(sessionID string) map[string]int64 {
 	m := map[string]int64{}
-	b, err := os.ReadFile(cursorPath(sessionID))
+	b, err := os.ReadFile(n.cursorPath(sessionID))
 	if err != nil {
 		return m
 	}
@@ -143,8 +256,12 @@ func readCursors(sessionID string) map[string]int64 {
 	return m
 }
 
-func writeCursors(sessionID string, m map[string]int64) error {
-	if err := EnsureDirs(); err != nil {
+func readCursors(sessionID string) map[string]int64 {
+	return CurrentNamespace().readCursors(sessionID)
+}
+
+func (n Namespace) writeCursors(sessionID string, m map[string]int64) error {
+	if err := n.EnsureDirs(); err != nil {
 		return err
 	}
 	b, err := json.Marshal(m)
@@ -153,7 +270,7 @@ func writeCursors(sessionID string, m map[string]int64) error {
 	}
 	// A unique temp file: concurrent writers sharing one fixed ".tmp" name
 	// race, and the loser's rename fails because its file is already gone.
-	tmp, err := os.CreateTemp(CursorsDir(), "cursor-*.tmp")
+	tmp, err := os.CreateTemp(n.CursorsDir(), "cursor-*.tmp")
 	if err != nil {
 		return err
 	}
@@ -171,79 +288,147 @@ func writeCursors(sessionID string, m map[string]int64) error {
 		_ = os.Remove(name)
 		return err
 	}
-	return os.Rename(name, cursorPath(sessionID))
+	return os.Rename(name, n.cursorPath(sessionID))
 }
 
 // mutateCursors serialises read-modify-write on the cursor map, which is
 // otherwise last-writer-wins between the monitor's followers and any CLI or
 // MCP call that subscribes.
-func mutateCursors(sessionID string, fn func(map[string]int64)) error {
-	unlock, err := lockSession(sessionID)
+func (n Namespace) mutateCursors(sessionID string, fn func(map[string]int64)) error {
+	unlock, err := n.lockSession(sessionID)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	m := readCursors(sessionID)
+	m := n.readCursors(sessionID)
 	fn(m)
-	return writeCursors(sessionID, m)
+	return n.writeCursors(sessionID, m)
 }
 
-func seedCursor(sessionID, topic string) error {
-	return mutateCursors(sessionID, func(m map[string]int64) {
+func mutateCursors(sessionID string, fn func(map[string]int64)) error {
+	return CurrentNamespace().mutateCursors(sessionID, fn)
+}
+
+func (n Namespace) seedCursor(sessionID string, ref TopicRef) error {
+	return n.mutateCursors(sessionID, func(m map[string]int64) {
 		var size int64
-		if fi, err := os.Stat(TopicPath(topic)); err == nil {
+		if fi, err := os.Stat(ref.path(n)); err == nil {
 			size = fi.Size()
 		}
-		m[topic] = size
+		m[ref.String()] = size
 	})
 }
 
-// ListTopics reports every topic that exists on disk or that some live session
-// subscribes to, with its subscriber count.
-func ListTopics() ([]TopicInfo, error) {
-	if err := EnsureDirs(); err != nil {
+// ListTopics reports every topic reachable from this namespace -- its own logs
+// and the shared ones, plus anything a live session subscribes to -- with its
+// subscriber count.
+//
+// A global topic is counted across every namespace, because that is what
+// "@ops" means: the number a publisher wants is how many sessions will hear
+// them, not how many happen to be next to them.
+func ListTopics() ([]TopicInfo, error) { return CurrentNamespace().ListTopics() }
+
+func (n Namespace) ListTopics() ([]TopicInfo, error) {
+	if err := ensureHome(); err != nil {
 		return nil, err
 	}
-	counts := map[string]int{PublicTopic: 0}
+	counts := map[string]int{PublicTopic: 0, GlobalPublicTopic: 0}
 
-	paths, _ := filepath.Glob(filepath.Join(TopicsDir(), "*.ndjson"))
+	paths, _ := filepath.Glob(filepath.Join(n.TopicsDir(), "*.ndjson"))
 	for _, p := range paths {
 		t := strings.TrimSuffix(filepath.Base(p), ".ndjson")
 		if _, ok := counts[t]; !ok {
 			counts[t] = 0
 		}
 	}
-	entries, err := ListSessions(false, false)
+	shared, _ := filepath.Glob(filepath.Join(SharedTopicsDir(), "*.ndjson"))
+	for _, p := range shared {
+		t := GlobalPrefix + strings.TrimSuffix(filepath.Base(p), ".ndjson")
+		if _, ok := counts[t]; !ok {
+			counts[t] = 0
+		}
+	}
+
+	local, err := n.ListSessions(false, false)
 	if err != nil {
 		return nil, err
 	}
-	for _, e := range entries {
+	for _, e := range local {
 		for _, t := range e.Subscriptions {
-			counts[t]++
+			if !strings.HasPrefix(t, GlobalPrefix) {
+				counts[t]++
+			}
+		}
+	}
+	// Global topics are counted machine-wide, including this namespace.
+	for _, e := range allSessions() {
+		for _, t := range e.Subscriptions {
+			if strings.HasPrefix(t, GlobalPrefix) {
+				counts[t]++
+			}
 		}
 	}
 
 	out := make([]TopicInfo, 0, len(counts))
-	for t, n := range counts {
-		out = append(out, TopicInfo{Name: t, Subscribers: n})
+	for t, num := range counts {
+		out = append(out, TopicInfo{
+			Name:        t,
+			Subscribers: num,
+			Global:      strings.HasPrefix(t, GlobalPrefix),
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+// allSessions is every live session on the machine. Used only where a global
+// topic makes the whole machine the right denominator.
+func allSessions() []*Entry {
+	out, err := ListAllSessions(false, false)
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+// SubscriberCount reports how many live sessions besides exceptSessionID would
+// receive a publish to this topic.
+func (n Namespace) SubscriberCount(topic, exceptSessionID string) int {
+	ref, err := ParseTopicRef(topic)
+	if err != nil {
+		return 0
+	}
+	entries := []*Entry{}
+	if ref.Global {
+		entries = allSessions()
+	} else if got, err := n.ListSessions(false, false); err == nil {
+		entries = got
+	}
+	count := 0
+	for _, e := range entries {
+		if e.SessionID == exceptSessionID {
+			continue
+		}
+		for _, t := range e.Subscriptions {
+			if t == ref.String() {
+				count++
+				break
+			}
+		}
+	}
+	return count
 }
 
 // TopicInfo is one row of `pigeon topics`.
 type TopicInfo struct {
 	Name        string `json:"name"`
 	Subscribers int    `json:"subscribers"`
+	// Global marks a topic that lives outside every namespace, so a listing can
+	// say which rows are shared without re-parsing the name.
+	Global bool `json:"global,omitempty"`
 }
 
 // --- retention -------------------------------------------------------------
-
-// topicLockPath guards a topic log while it is being rewritten, so an append
-// cannot land in the middle of a compaction.
-func topicLockPath(topic string) string {
-	return filepath.Join(LocksDir(), "topic-"+topic+".lock")
-}
 
 // minCompactBytes is the smallest saving worth rewriting a file for. Below it
 // the churn -- and the offset shuffle every reader has to absorb -- costs more
@@ -257,7 +442,15 @@ type PruneResult struct {
 	BytesReclaimed  int64
 }
 
-// PruneTopics reclaims space in topic logs.
+// Add folds one pass into another, so a caller sweeping several namespaces
+// reports one total.
+func (r *PruneResult) Add(o PruneResult) {
+	r.TopicsRemoved += o.TopicsRemoved
+	r.TopicsCompacted += o.TopicsCompacted
+	r.BytesReclaimed += o.BytesReclaimed
+}
+
+// PruneTopics reclaims space in this namespace's topic logs.
 //
 // A topic log is append-only and every subscriber reads it at its own offset,
 // so the prefix that every live subscriber has already passed is dead weight.
@@ -266,37 +459,73 @@ type PruneResult struct {
 //
 // Call it after dead sessions have been pruned: a dead session's stale cursor
 // would otherwise pin the whole history.
-func PruneTopics() (PruneResult, error) {
+func PruneTopics() (PruneResult, error) { return CurrentNamespace().PruneTopics() }
+
+func (n Namespace) PruneTopics() (PruneResult, error) {
 	var res PruneResult
-	if err := EnsureDirs(); err != nil {
+	if err := ensureHome(); err != nil {
 		return res, err
 	}
-	paths, err := filepath.Glob(filepath.Join(TopicsDir(), "*.ndjson"))
+	sessions, err := n.ListSessions(false, false)
 	if err != nil {
 		return res, err
 	}
-	sessions, err := ListSessions(false, false)
+	return pruneTopicDir(n.TopicsDir(), false, func(ref TopicRef) []*Entry {
+		return subscribersOf(sessions, ref)
+	}, func(e *Entry) Namespace { return n }, n)
+}
+
+// PruneSharedTopics reclaims space in the global topic logs.
+//
+// It is deliberately not a per-namespace pass: a shared log's subscribers are
+// spread across every namespace, and cutting a prefix one of them has not read
+// yet would silently drop that session's mail. Counting machine-wide is the
+// only version of this that is safe, so it is the only one there is.
+func PruneSharedTopics() (PruneResult, error) {
+	var res PruneResult
+	if err := ensureHome(); err != nil {
+		return res, err
+	}
+	everyone := allSessions()
+	return pruneTopicDir(SharedTopicsDir(), true, func(ref TopicRef) []*Entry {
+		return subscribersOf(everyone, ref)
+	}, func(e *Entry) Namespace { return e.NS() }, CurrentNamespace())
+}
+
+func subscribersOf(entries []*Entry, ref TopicRef) []*Entry {
+	var subs []*Entry
+	for _, e := range entries {
+		for _, t := range e.Subscriptions {
+			if t == ref.String() {
+				subs = append(subs, e)
+				break
+			}
+		}
+	}
+	return subs
+}
+
+// pruneTopicDir is the retention pass over one directory of logs. It is shared
+// between namespaced and global topics because the rule is identical; only who
+// counts as a subscriber, and whose cursor file to rewind, differ.
+func pruneTopicDir(dir string, global bool, subscribers func(TopicRef) []*Entry,
+	cursorNS func(*Entry) Namespace, lockNS Namespace) (PruneResult, error) {
+
+	var res PruneResult
+	paths, err := filepath.Glob(filepath.Join(dir, "*.ndjson"))
 	if err != nil {
 		return res, err
 	}
 
 	for _, p := range paths {
-		topic := strings.TrimSuffix(filepath.Base(p), ".ndjson")
-		if ValidTopic(topic) != nil {
+		name := strings.TrimSuffix(filepath.Base(p), ".ndjson")
+		if ValidTopic(name) != nil {
 			continue
 		}
+		ref := TopicRef{Name: name, Global: global}
+		subs := subscribers(ref)
 
-		var subs []*Entry
-		for _, e := range sessions {
-			for _, t := range e.Subscriptions {
-				if t == topic {
-					subs = append(subs, e)
-					break
-				}
-			}
-		}
-
-		unlock, err := blockingExclusive(topicLockPath(topic))
+		unlock, err := blockingExclusive(ref.lockPath(lockNS))
 		if err != nil {
 			continue
 		}
@@ -319,7 +548,7 @@ func PruneTopics() (PruneResult, error) {
 
 		cut := fi.Size()
 		for _, e := range subs {
-			if off := readCursors(e.SessionID)[topic]; off < cut {
+			if off := cursorNS(e).readCursors(e.SessionID)[ref.String()]; off < cut {
 				cut = off
 			}
 		}
@@ -335,9 +564,9 @@ func PruneTopics() (PruneResult, error) {
 		// Rewind every subscriber so their offsets still point at the same
 		// messages. A follower notices the file shrank and reloads from here.
 		for _, e := range subs {
-			_ = mutateCursors(e.SessionID, func(m map[string]int64) {
-				if off, ok := m[topic]; ok {
-					m[topic] = off - cut
+			_ = cursorNS(e).mutateCursors(e.SessionID, func(m map[string]int64) {
+				if off, ok := m[ref.String()]; ok {
+					m[ref.String()] = off - cut
 				}
 			})
 		}

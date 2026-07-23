@@ -66,7 +66,7 @@ to hold a conversation.
 publish(topic: "deploys", text: "staging is on v2.1.4, migrations applied")
 ```
 
-Every session joins `all` by default, so `all` is a broadcast to the machine —
+Every session joins `all` by default, so `all` is a broadcast to your namespace;
 use it sparingly. Create a narrower topic when a subset of sessions cares:
 
 ```
@@ -75,6 +75,21 @@ subscribe(topic: "deploys")
 
 Subscribing takes effect within about a second and only delivers messages
 published from then on; history is not replayed.
+
+## Namespaces
+
+Sessions are grouped into namespaces and see only their own, so `list_sessions`
+is not a list of everything running and a name that means nothing here may exist
+elsewhere. `list_namespaces` names the others; every tool that addresses a
+session takes an optional `namespace` to reach into one deliberately.
+
+A topic written with a leading `@` is machine-wide instead: `@all` reaches every
+session on the box whatever namespace it is in, and is the one thing that
+crosses by default. Prefer a namespaced topic unless the message genuinely
+concerns everybody.
+
+A session cannot change namespace; it is fixed when the session starts. If the
+user wants a session somewhere else, that is a restart, not a command.
 
 ## Receiving
 

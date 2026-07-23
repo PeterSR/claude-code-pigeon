@@ -2,7 +2,9 @@
 package pigeon
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -40,6 +42,10 @@ const (
 	// (claude-p, pupptyeer, CI) keep them out of the bus.
 	EnvOptOut = "PIGEON"
 	EnvHome   = "PIGEON_HOME"
+	// EnvNamespace outranks every other source, because a launcher states how
+	// it started a session and a committed file only states where it was
+	// cloned.
+	EnvNamespace = "PIGEON_NAMESPACE"
 )
 
 // Home is the state directory. Everything pigeon knows lives here.
@@ -54,21 +60,326 @@ func Home() string {
 	return filepath.Join(h, ".claude", "pigeon")
 }
 
-func SessionsDir() string { return filepath.Join(Home(), "sessions") }
-func InboxDir() string    { return filepath.Join(Home(), "inbox") }
-func PayloadsDir() string { return filepath.Join(Home(), "payloads") }
-func LocksDir() string    { return filepath.Join(Home(), "locks") }
+// --- namespaces --------------------------------------------------------------
+//
+// A namespace is an isolated group of sessions, and the isolation is
+// structural: each one owns a complete state tree, so a session in "acme"
+// cannot see "default"'s registry because that is not the directory it reads.
+//
+// The alternative -- a field on the entry plus a filter -- would put the
+// isolation rule in ListSessions, ResolveTarget, NameTaken, ListTopics, the
+// publish subscriber count, prune, reconcileOrphans, doctor's peers check and
+// the MCP tools. Miss one of those and it leaks another namespace's sessions,
+// which is the same class of failure as guessing a session id: it delivers
+// somebody else's mail.
+
+// DefaultNamespaceName is where every session lands when nobody says
+// otherwise, so anyone who never thinks about namespaces never has to.
+const DefaultNamespaceName = "default"
+
+// namespaceRe holds a namespace to the same charset a topic uses, and for the
+// same reason: it becomes a directory name, so it may not express a traversal
+// or a separator.
+var namespaceRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+
+// ValidNamespace rejects anything unsafe to interpolate into a file path.
+func ValidNamespace(ns string) error {
+	if !namespaceRe.MatchString(ns) || strings.Contains(ns, "..") {
+		return fmt.Errorf("invalid namespace %q: use lowercase letters, digits, dot, dash or underscore (max 64)", ns)
+	}
+	return nil
+}
+
+// Namespace is a validated namespace name.
+//
+// It is a struct rather than a string so that nothing outside this package can
+// build one that was never checked: every path in the state tree is joined
+// from it, and ParseNamespace is the only door in. The zero value is the
+// default namespace, so a caller that never mentions namespaces gets the one
+// everybody else is in rather than a directory called "".
+type Namespace struct{ name string }
+
+// ParseNamespace validates a namespace typed at the CLI, declared in a project
+// config, or handed over by an MCP caller.
+func ParseNamespace(s string) (Namespace, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return Namespace{}, fmt.Errorf("empty namespace")
+	}
+	if err := ValidNamespace(s); err != nil {
+		return Namespace{}, err
+	}
+	return Namespace{name: s}, nil
+}
+
+// DefaultNamespace is the namespace of a session that declares none.
+func DefaultNamespace() Namespace { return Namespace{name: DefaultNamespaceName} }
+
+func (n Namespace) String() string {
+	if n.name == "" {
+		return DefaultNamespaceName
+	}
+	return n.name
+}
+
+// Is reports whether two namespaces are the same one, comparing the normalised
+// name so the zero value and an explicit "default" are not two answers.
+func (n Namespace) Is(other Namespace) bool { return n.String() == other.String() }
+
+// NamespacesDir holds one complete state tree per namespace.
+func NamespacesDir() string { return filepath.Join(Home(), "namespaces") }
+
+// SharedDir holds what deliberately crosses namespaces: the logs of global
+// topics and the payload files their overflowing messages spill to. Nothing
+// here is namespaced, which is the point, and nothing else lives here.
+func SharedDir() string         { return filepath.Join(Home(), "shared") }
+func SharedTopicsDir() string   { return filepath.Join(SharedDir(), "topics") }
+func SharedPayloadsDir() string { return filepath.Join(SharedDir(), "payloads") }
+
+// sharedLocksDir guards the global topic logs. The lock has to be outside every
+// namespace too: two namespaces compacting one shared log under their own locks
+// would rewrite it from under each other.
+func sharedLocksDir() string { return filepath.Join(SharedDir(), "locks") }
+
+// Root is everything this namespace can see.
+func (n Namespace) Root() string        { return filepath.Join(NamespacesDir(), n.String()) }
+func (n Namespace) SessionsDir() string { return filepath.Join(n.Root(), "sessions") }
+func (n Namespace) InboxDir() string    { return filepath.Join(n.Root(), "inbox") }
+func (n Namespace) PayloadsDir() string { return filepath.Join(n.Root(), "payloads") }
+func (n Namespace) LocksDir() string    { return filepath.Join(n.Root(), "locks") }
+func (n Namespace) TopicsDir() string   { return filepath.Join(n.Root(), "topics") }
+func (n Namespace) CursorsDir() string  { return filepath.Join(n.Root(), "cursors") }
+
+// The package-level forms address the caller's own namespace, which is what
+// almost every caller means. Each resolves the namespace once and hands it
+// down; nothing below this layer resolves it again.
+func SessionsDir() string { return CurrentNamespace().SessionsDir() }
+func InboxDir() string    { return CurrentNamespace().InboxDir() }
+func PayloadsDir() string { return CurrentNamespace().PayloadsDir() }
+func LocksDir() string    { return CurrentNamespace().LocksDir() }
+func TopicsDir() string   { return CurrentNamespace().TopicsDir() }
+func CursorsDir() string  { return CurrentNamespace().CursorsDir() }
+
+// ensureHome creates the state root and migrates an old layout into it, and
+// stops there.
+//
+// Reads go through this rather than EnsureDirs so that listing a namespace does
+// not create it: `pigeon ls -n acmee` is a typo, and a typo that leaves a
+// permanent empty namespace behind would show up in every later listing as
+// something real.
+func ensureHome() error {
+	if err := os.MkdirAll(Home(), 0o700); err != nil {
+		return fmt.Errorf("create %s: %w", Home(), err)
+	}
+	_ = os.Chmod(Home(), 0o700)
+	// Before anything creates a directory in the new shape, since the old shape
+	// is recognised by its absence.
+	return migrateFlatLayout(stderrLogf)
+}
 
 // EnsureDirs creates the state tree with owner-only permissions. The spool is
 // an injection surface into a live agent, so it is deliberately not shared.
-func EnsureDirs() error {
-	for _, d := range []string{Home(), SessionsDir(), InboxDir(), PayloadsDir(), LocksDir(), TopicsDir(), CursorsDir()} {
+func EnsureDirs() error { return CurrentNamespace().EnsureDirs() }
+
+func (n Namespace) EnsureDirs() error {
+	if err := ensureHome(); err != nil {
+		return err
+	}
+	for _, d := range []string{
+		NamespacesDir(), n.Root(),
+		n.SessionsDir(), n.InboxDir(), n.PayloadsDir(), n.LocksDir(), n.TopicsDir(), n.CursorsDir(),
+		SharedDir(), SharedTopicsDir(), SharedPayloadsDir(), sharedLocksDir(),
+	} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return fmt.Errorf("create %s: %w", d, err)
 		}
 		_ = os.Chmod(d, 0o700)
 	}
 	return nil
+}
+
+// ResolveNamespace reports this process's namespace and where it came from.
+//
+// Highest first: the environment, because a launcher knows how it started a
+// session; then the project config, because a checkout knows what it is; then
+// the CLI default set by `pigeon namespace`, which is a standing preference
+// rather than a statement about this session; then "default".
+//
+// The origin is not decoration. A session that quietly landed somewhere it
+// cannot see its peers is the whole failure mode of this feature, and doctor
+// and `pigeon namespace` both report the answer this returns.
+func ResolveNamespace() (ns Namespace, origin string) {
+	if raw := strings.TrimSpace(os.Getenv(EnvNamespace)); raw != "" {
+		if ns, err := ParseNamespace(raw); err == nil {
+			return ns, EnvNamespace
+		}
+		// A value that cannot be a directory name must not steer one. Falling
+		// back is safe; doing it silently would not be.
+		return DefaultNamespace(), EnvNamespace + " is not a usable namespace, so it was ignored"
+	}
+	cwd := CurrentCwd()
+	if cfg, _, err := LoadProjectConfig(cwd); err == nil && cfg != nil && cfg.Namespace != "" {
+		// LoadProjectConfig validated it, so this cannot fail.
+		if ns, err := ParseNamespace(cfg.Namespace); err == nil {
+			return ns, ProjectConfigPath(cwd)
+		}
+	}
+	if raw := readCLIConfig().Namespace; raw != "" {
+		if ns, err := ParseNamespace(raw); err == nil {
+			return ns, CLIConfigPath()
+		}
+	}
+	return DefaultNamespace(), "the built-in default"
+}
+
+// CurrentNamespace is the namespace this process reads and writes.
+func CurrentNamespace() Namespace {
+	ns, _ := ResolveNamespace()
+	return ns
+}
+
+// --- the CLI's own default ---------------------------------------------------
+
+// CLIConfigPath records the namespace shell invocations should use, the way
+// `kubectl config set-context` records a namespace. It is deliberately not a
+// live move: a running session keeps the namespace its monitor armed with.
+func CLIConfigPath() string { return filepath.Join(Home(), "cli.json") }
+
+// maxCLIConfigBytes bounds the read. This file is written by pigeon and holds
+// one field; anything larger is not it.
+const maxCLIConfigBytes = 8 << 10
+
+type cliConfig struct {
+	Namespace string `json:"namespace,omitempty"`
+}
+
+// readCLIConfig degrades to "nothing set" for a missing or unreadable file. A
+// corrupt preference must not cost a session its mail.
+func readCLIConfig() cliConfig {
+	var c cliConfig
+	f, err := os.Open(CLIConfigPath())
+	if err != nil {
+		return c
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxCLIConfigBytes))
+	if err != nil {
+		return c
+	}
+	_ = json.Unmarshal(b, &c)
+	if ValidNamespace(c.Namespace) != nil {
+		c.Namespace = ""
+	}
+	return c
+}
+
+// SetCLINamespace persists the namespace shell invocations default to.
+func SetCLINamespace(ns Namespace) error {
+	if err := os.MkdirAll(Home(), 0o700); err != nil {
+		return fmt.Errorf("create %s: %w", Home(), err)
+	}
+	b, err := json.MarshalIndent(cliConfig{Namespace: ns.String()}, "", "  ")
+	if err != nil {
+		return err
+	}
+	// Written by rename like every other state file, so a reader never sees a
+	// half-written preference.
+	tmp, err := os.CreateTemp(Home(), "cli-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if _, err := tmp.Write(append(b, '\n')); err != nil {
+		tmp.Close()
+		_ = os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	if err := os.Chmod(name, 0o600); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	return os.Rename(name, CLIConfigPath())
+}
+
+// --- migration ---------------------------------------------------------------
+
+// flatLayoutDirs are the six state directories that used to sit directly under
+// Home(), before namespaces put a tree under each one.
+var flatLayoutDirs = []string{"sessions", "inbox", "payloads", "locks", "topics", "cursors"}
+
+// stderrLogf is where a one-time on-disk change announces itself. There is no
+// logger to hand in EnsureDirs, and moving a live session's spool without
+// saying so is exactly the kind of silence this is meant to avoid.
+func stderrLogf(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, "[pigeon] "+format+"\n", a...)
+}
+
+// migrateFlatLayout moves a pre-namespace state tree into namespaces/default.
+//
+// Somebody has live sessions when this ships, and their spools, cursors and
+// liveness locks are all addressed by path. A session that silently vanished
+// from `pigeon ls` on upgrade -- or worse, one whose queued mail was left in a
+// directory nothing reads any more -- would be a poor introduction to a feature
+// whose whole promise is that mail arrives.
+//
+// It runs under a lock and moves each directory only when the destination does
+// not already exist, so two processes racing on the same upgrade, or a run that
+// died halfway through, both end up in the same place.
+func migrateFlatLayout(logf func(string, ...any)) error {
+	home := Home()
+	if len(flatDirsPresent(home)) == 0 {
+		return nil
+	}
+	lock, err := blockingExclusive(filepath.Join(home, "migrate.lock"))
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+
+	// Re-check under the lock: another process may have done it while we waited.
+	present := flatDirsPresent(home)
+	if len(present) == 0 {
+		return nil
+	}
+	dst := filepath.Join(NamespacesDir(), DefaultNamespaceName)
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		return fmt.Errorf("create %s: %w", dst, err)
+	}
+	moved := make([]string, 0, len(present))
+	for _, d := range present {
+		target := filepath.Join(dst, d)
+		if _, err := os.Stat(target); err == nil {
+			// A half-finished earlier run already placed this one. Leave both
+			// alone rather than merging two directories of live state.
+			logf("migration: %s already exists; leaving %s where it is",
+				target, filepath.Join(home, d))
+			continue
+		}
+		if err := os.Rename(filepath.Join(home, d), target); err != nil {
+			return fmt.Errorf("move %s into %s: %w", d, dst, err)
+		}
+		moved = append(moved, d)
+	}
+	if len(moved) > 0 {
+		logf("moved %s into %s: state is now per-namespace and this one is %q",
+			strings.Join(moved, ", "), dst, DefaultNamespaceName)
+	}
+	return nil
+}
+
+// flatDirsPresent lists the old-layout directories still sitting under Home().
+func flatDirsPresent(home string) []string {
+	var out []string
+	for _, d := range flatLayoutDirs {
+		if fi, err := os.Stat(filepath.Join(home, d)); err == nil && fi.IsDir() {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // CurrentSessionID returns this session's UUID, or "" when not running inside

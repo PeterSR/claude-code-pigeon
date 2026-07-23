@@ -72,6 +72,8 @@ pigeon publish <topic> <text>   publish to everyone subscribed
 pigeon subscribe <topic>        join a topic (takes effect in ~1s, no restart)
 pigeon unsubscribe <topic>
 pigeon topics                   topics and subscriber counts
+pigeon namespaces               namespaces and their session counts
+pigeon namespace [<name>]       show or set the namespace this shell uses
 pigeon name [<name>]            declare a name, usable as an address
 pigeon describe [<text>]        declare what this session is working on
 pigeon whoami                   this session's identity and address
@@ -80,7 +82,9 @@ pigeon statusline [--plain]     one-line alarm for a Claude Code statusline
 pigeon prune                    forget sessions whose process is gone
 ```
 
-Targets resolve as **exact session id → declared name → id prefix → cwd basename**.
+Targets resolve as **exact session id → declared name → id prefix → cwd basename**,
+within one [namespace](#namespaces). `ls`, `send`, `publish`, `topics` and `prune` take
+`-n`/`--namespace <ns>`; `ls`, `topics` and `prune` also take `--all-namespaces`.
 
 Sender identity is attached automatically. A session never has to know its own address for
 replies to work; a message from a plain shell is stamped `shell:user@host` and carries no
@@ -104,8 +108,14 @@ A project can declare what sessions started in it should look like, in
 ```
 
 A session opened in that checkout comes up already named `api`, already described, and
-already listening to `#deploys` and `#ci` alongside the default `#all`. Commit the file
-and everyone working on the repo gets the same wiring without configuring anything.
+already listening to `#deploys` and `#ci` alongside the default `#all` and `@all`. Commit
+the file and everyone working on the repo gets the same wiring without configuring
+anything.
+
+A `"namespace": "acme"` field puts sessions started here in their own group, isolated from
+every other one. Unlike the fields below it is not a template: the namespace decides which
+directory a session's entry, spool and cursors are written to, so it has to be known
+before there is a session to render anything against. See [Namespaces](#namespaces).
 
 Two rules make it predictable:
 
@@ -210,17 +220,23 @@ happened.
 
 ### Topics
 
-Every session joins `all` by default, so `pigeon publish all "…"` broadcasts to the
-machine. Topics are append-only logs and each subscriber keeps its own cursor, so
-publishing is O(1) regardless of how many sessions listen, and nobody consumes anyone
-else's messages. Subscribing starts from now — history is not replayed into your context.
+Every session joins `all` by default, so `pigeon publish all "…"` broadcasts to your
+namespace, and `@all` for the whole machine. Topics are append-only logs and each
+subscriber keeps its own cursor, so publishing is O(1) regardless of how many sessions
+listen, and nobody consumes anyone else's messages. Subscribing starts from now --
+history is not replayed into your context.
+
+A plain name is one log per namespace; a name written `@ops` is one log the whole machine
+shares. See [Namespaces](#namespaces).
 
 ### From MCP
 
 The plugin exposes `list_sessions`, `send_message`, `publish`, `subscribe`,
-`unsubscribe`, `list_topics`, `whoami` and `set_identity`, so a session can do all of this
-itself. `set_identity` takes `nameTemplate` and `descriptionTemplate` alongside the literal
-fields, with the same context and functions as the project config.
+`unsubscribe`, `list_topics`, `list_namespaces`, `whoami` and `set_identity`, so a session
+can do all of this itself. `set_identity` takes `nameTemplate` and `descriptionTemplate`
+alongside the literal fields, with the same context and functions as the project config.
+`list_sessions`, `send_message`, `publish`, `subscribe` and `unsubscribe` take an optional
+`namespace`; leaving it out means this session's own.
 
 ### An example skill
 
@@ -228,6 +244,121 @@ fields, with the same context and functions as the project config.
 how to treat what arrives. It is **not** installed by `pigeon install` — skills change
 model behaviour, so opting in should be deliberate. Copy it to `~/.claude/skills/` if
 you want it. See [skills/README.md](skills/README.md).
+
+## Namespaces
+
+A namespace is an isolated group of sessions. Everyone who never thinks about them is in
+`default` together, which is the whole of the previous behaviour.
+
+```console
+$ pigeon namespaces
+   NAMESPACE  LIVE  DEAF
+ * default    2     0
+   acme       1     1
+
+$ pigeon ls
+   SESSION   NAME   STATUS  CWD               DESCRIPTION
+ * aaaa1111  alpha  live    ~/dev/api-server  refactoring the parser
+   bbbb2222  beta   live    ~/dev/frontend    -
+
+2 session(s) in 1 other namespace(s) (--all-namespaces)
+```
+
+### The isolation is structural, not a filter
+
+Each namespace owns a complete state tree:
+
+```
+~/.claude/pigeon/
+  namespaces/
+    default/  sessions/ inbox/ topics/ cursors/ locks/ payloads/
+    acme/     sessions/ inbox/ topics/ cursors/ locks/ payloads/
+  shared/
+    topics/ payloads/ locks/
+```
+
+A session in `acme` cannot see `default`'s registry because that is not the directory it
+reads. The alternative -- a field on each entry plus a filter -- would put the rule in
+`ListSessions`, target resolution, name uniqueness, topic listing, the publish subscriber
+count, prune, doctor and every MCP tool. Miss one and it leaks somebody else's sessions.
+Per-namespace name uniqueness then falls out for free: two people can both call a session
+`api` without either losing its address.
+
+The last line of `pigeon ls` counts what is deliberately out of sight, and appears only
+when there is something to count. Isolation you have forgotten about looks exactly like
+an empty machine, which is the one way this feature can waste your afternoon.
+
+### Two kinds of topic
+
+| Written | Log | Reaches |
+|---|---|---|
+| `deploys` | `namespaces/<ns>/topics/deploys.ndjson` | subscribers in your namespace |
+| `@deploys` | `shared/topics/deploys.ndjson` | subscribers in every namespace |
+
+The `@` works everywhere a topic is accepted: `pigeon publish @ops`, `pigeon subscribe
+@ops`, `"topics": ["@ops"]` in a project config, and the MCP tools. `*` globs and `!`
+history-expands in a shell, and `~` gets tilde-expanded, so those would fail in ways that
+have nothing to do with pigeon; `@` is shell-safe and reads differently from the `#` a
+namespaced topic renders with.
+
+**Every session subscribes to `@all` as well as `all`, and that is deliberate.** It is the
+one place the isolation is not absolute: a broadcast meant for everyone on the machine has
+to reach everyone on the machine. If you would rather not hear it, `pigeon unsubscribe
+@all`.
+
+A notification names the sender's namespace exactly when the message could have come from
+outside yours, because that is when it changes how you should read it and where a reply
+has to go:
+
+```
+[pigeon #deploys] from alpha (api) :: v2.1 rolled out [reply: pigeon send alpha]
+[pigeon @ops] from alpha (api) [ns: acme] :: all hands [reply: pigeon send -n acme alpha]
+```
+
+Anywhere else the namespace is a constant, and a constant in every notification is noise.
+
+### Where a namespace comes from
+
+Highest first:
+
+1. `PIGEON_NAMESPACE` in the environment
+2. `"namespace": "acme"` in the project's `.claude/pigeon.json`
+3. `pigeon namespace <name>`, recorded in `~/.claude/pigeon/cli.json`
+4. `default`
+
+A launcher knows how it started a session, which beats a file that arrived with a clone;
+a checkout knows what it is, which beats a standing preference you set weeks ago. Names
+are validated like topic names, because a namespace becomes a directory.
+
+`pigeon namespace` with no argument prints the current one on stdout and where it came
+from on stderr, so `$(pigeon namespace)` stays usable and a surprise is still explained.
+
+### A session's namespace is fixed when its monitor arms
+
+For the same reason monitors cannot be rebound mid-session: from the moment it arms, the
+monitor holds a lock in that namespace's directory and follows that namespace's topics.
+Changing where a session lives means restarting it.
+
+`pigeon namespace acme` is `kubectl config set-context`, not a live move. It changes where
+*shell* invocations look and where the *next* session started here will register. It does
+not move anything that is already running, and it says so.
+
+One consequence worth knowing: if a project config changes namespace, a restarted session
+leaves its old entry behind in a namespace nothing else looks at. `pigeon prune
+--all-namespaces` clears it.
+
+### Sending across on purpose
+
+`pigeon send -n acme beta "…"` works. Blocking it would buy inconvenience rather than
+isolation: anyone who can write your state directory could append to that spool by hand
+anyway. See [SECURITY.md](SECURITY.md). The message lands in the recipient's tree, and the
+reply hint it renders carries `-n` so the answer comes back to the right place.
+
+### Upgrading
+
+The on-disk layout changed. The first pigeon command after the upgrade moves the six state
+directories into `namespaces/default/`, once, under a lock, and says so on stderr. Live
+sessions keep their queued mail, their cursors and their addresses.
 
 ## Knowing when a session has stopped listening
 
@@ -259,6 +390,7 @@ says why. `doctor` checks each link separately and names the one that broke.
 ```console
 $ pigeon doctor
 ok    session         9f3c1a20
+ok    namespace       acme (from /home/you/dev/api-server/.claude/pigeon.json)
 ok    state dir       /home/you/.claude/pigeon
 ok    plugin          /home/you/.claude/skills/pigeon
 warn  monitor binary  plugin runs /usr/local/bin/pigeon, but this is /home/you/go/bin/pigeon
@@ -338,16 +470,21 @@ per subscribed topic. It identifies itself from `CLAUDE_CODE_SESSION_ID`, which 
 injects into the processes it spawns. If that variable is missing it **fails loudly** rather
 than guessing from the process tree — a wrong guess would deliver another session's mail.
 
-State lives in `~/.claude/pigeon` (`PIGEON_HOME` to relocate), owner-only:
+State lives in `~/.claude/pigeon` (`PIGEON_HOME` to relocate), owner-only. Each
+[namespace](#namespaces) gets its own copy of the tree, under `namespaces/<ns>/`:
 
 ```
 sessions/<id>.json     registry entry
 inbox/<id>.ndjson      direct messages
-topics/<topic>.ndjson  shared topic log
+topics/<topic>.ndjson  topic log for this namespace
 cursors/<id>.json      per-session read offsets
 locks/<id>.lock        liveness
 payloads/<msg>.txt     bodies too long to inline
 ```
+
+Alongside it, `shared/` holds the logs and payloads of the machine-wide `@` topics, plus
+their locks: two namespaces compacting one shared log under their own locks would rewrite
+it from under each other.
 
 Notifications are clipped at about 512 characters by Claude Code, so messages over ~300
 are written to `payloads/` and the recipient gets a path instead.
@@ -365,6 +502,9 @@ are written to `payloads/` and the recipient gets a path instead.
 - One machine. No network transport.
 - 30 notifications per minute per session; beyond that pigeon reports suppression rather
   than being stopped by Claude Code.
+- Namespaces are organisation, not a security boundary. They keep unrelated work out of
+  each other's listings and broadcasts; they do not stop anything that can write the state
+  directory from reaching across, and `-n` exists precisely so you can.
 - Unauthenticated: anyone who can write your `~/.claude/pigeon` can inject text into your
   sessions. See [SECURITY.md](SECURITY.md).
 

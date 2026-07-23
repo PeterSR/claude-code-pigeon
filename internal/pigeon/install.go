@@ -121,11 +121,13 @@ func Install(version string, w io.Writer) error {
 		return err
 	}
 
+	ns, origin := ResolveNamespace()
 	fmt.Fprintf(w, "installed pigeon plugin\n")
 	fmt.Fprintf(w, "  plugin:  %s\n", dir)
 	fmt.Fprintf(w, "  binary:  %s\n", exe)
 	fmt.Fprintf(w, "  state:   %s\n", Home())
-	fmt.Fprintf(w, "  mcp:     pigeon (8 tools)\n")
+	fmt.Fprintf(w, "  ns:      %s (from %s)\n", ns, origin)
+	fmt.Fprintf(w, "  mcp:     pigeon (%d tools)\n", len(tools()))
 	fmt.Fprintf(w, "\nloads as pigeon@skills-dir on the NEXT session start.\n")
 	fmt.Fprintf(w, "monitors cannot be rebound mid-session, so restart Claude Code.\n")
 	return nil

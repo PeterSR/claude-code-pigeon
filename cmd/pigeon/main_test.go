@@ -70,7 +70,14 @@ func asSession(t *testing.T, id, name string) *pigeon.Entry {
 
 func register(t *testing.T, id, name string) *pigeon.Entry {
 	t.Helper()
-	if err := pigeon.EnsureDirs(); err != nil {
+	return registerIn(t, pigeon.CurrentNamespace(), id, name)
+}
+
+// registerIn puts a session in a named namespace, for the tests about what one
+// namespace shows of another.
+func registerIn(t *testing.T, ns pigeon.Namespace, id, name string) *pigeon.Entry {
+	t.Helper()
+	if err := ns.EnsureDirs(); err != nil {
 		t.Fatalf("EnsureDirs: %v", err)
 	}
 	pid := os.Getpid()
@@ -81,10 +88,21 @@ func register(t *testing.T, id, name string) *pigeon.Entry {
 		PID:       pid,
 		ProcStart: pigeon.ProcStart(pid),
 	}
-	if err := pigeon.WriteEntry(e); err != nil {
+	if err := ns.WriteEntry(e); err != nil {
 		t.Fatalf("WriteEntry: %v", err)
 	}
 	return e
+}
+
+// mustNS parses a namespace a test wrote itself, where a rejection is a bug in
+// the test rather than a case worth handling.
+func mustNS(t *testing.T, name string) pigeon.Namespace {
+	t.Helper()
+	ns, err := pigeon.ParseNamespace(name)
+	if err != nil {
+		t.Fatalf("ParseNamespace(%q): %v", name, err)
+	}
+	return ns
 }
 
 func wantContains(t *testing.T, r result, where, substr string) {
@@ -228,7 +246,7 @@ func TestSendUnknownTargetFails(t *testing.T) {
 }
 
 func TestSendQueuesOnTheSpoolAndWarnsWhenDeaf(t *testing.T) {
-	home := withHome(t)
+	withHome(t)
 	register(t, "bbbb2222-0000-0000-0000-000000000000", "beta")
 
 	r := invoke(t, "send", "beta", "the build is green")
@@ -240,7 +258,7 @@ func TestSendQueuesOnTheSpoolAndWarnsWhenDeaf(t *testing.T) {
 	// only `claude --resume` will ever deliver.
 	wantContains(t, r, "stderr", "no listening monitor")
 
-	spool, err := os.ReadFile(filepath.Join(home, "inbox", "bbbb2222-0000-0000-0000-000000000000.ndjson"))
+	spool, err := os.ReadFile(pigeon.SpoolPath("bbbb2222-0000-0000-0000-000000000000"))
 	if err != nil {
 		t.Fatalf("read spool: %v", err)
 	}
@@ -636,6 +654,270 @@ func TestPruneReportsWhatItReclaimed(t *testing.T) {
 	wantContains(t, r, "stdout", "pruned")
 	wantContains(t, r, "stdout", "orphaned state file(s)")
 	wantContains(t, r, "stdout", "reclaimed")
+}
+
+// --- namespaces ------------------------------------------------------------
+
+// Isolation you have forgotten about looks exactly like an empty machine. The
+// footer is what makes the mechanism discoverable again, and it appears only
+// when there is in fact something hidden.
+func TestListFooterCountsWhatIsHidden(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+
+	if r := invoke(t, "ls"); strings.Contains(r.stdout, "other namespace") {
+		t.Errorf("a footer appeared with nothing hidden:\n%s", r)
+	}
+
+	acme, other := mustNS(t, "acme"), mustNS(t, "other")
+	registerIn(t, acme, "bbbb2222-0000-0000-0000-000000000000", "beta")
+	registerIn(t, other, "cccc3333-0000-0000-0000-000000000000", "gamma")
+	registerIn(t, other, "dddd4444-0000-0000-0000-000000000000", "delta")
+
+	r := invoke(t, "ls")
+	wantContains(t, r, "stdout", "3 session(s) in 2 other namespace(s) (--all-namespaces)")
+	if strings.Contains(r.stdout, "beta") {
+		t.Errorf("ls listed a session from another namespace:\n%s", r)
+	}
+
+	// An empty namespace is the case where the footer matters most: without it
+	// the answer reads as "nobody is running".
+	r = invoke(t, "ls", "-n", "empty-one")
+	wantContains(t, r, "stdout", "no registered pigeon sessions in namespace empty-one")
+	wantContains(t, r, "stdout", "other namespace(s)")
+}
+
+func TestListAllNamespacesAddsAColumn(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+	registerIn(t, mustNS(t, "acme"), "bbbb2222-0000-0000-0000-000000000000", "beta")
+
+	r := invoke(t, "ls", "--all-namespaces")
+	for _, want := range []string{"NAMESPACE", "acme", "default", "alpha", "beta"} {
+		wantContains(t, r, "stdout", want)
+	}
+	// The footer is about what a namespaced listing hides, and this one hides
+	// nothing.
+	if strings.Contains(r.stdout, "--all-namespaces)") {
+		t.Errorf("the footer appeared in an all-namespaces listing:\n%s", r)
+	}
+	if r := invoke(t, "ls", "--all-namespaces", "-n", "acme"); r.code != 1 {
+		t.Errorf("two conflicting scopes were accepted: %s", r)
+	}
+}
+
+func TestListJSONCarriesTheNamespace(t *testing.T) {
+	withHome(t)
+	registerIn(t, mustNS(t, "acme"), "bbbb2222-0000-0000-0000-000000000000", "beta")
+
+	r := invoke(t, "ls", "--json", "-n", "acme")
+	var got []map[string]any
+	if err := json.Unmarshal([]byte(r.stdout), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, r.stdout)
+	}
+	if len(got) != 1 || got[0]["namespace"] != "acme" {
+		t.Errorf("namespace missing from --json, so consumers must infer it: %v", got)
+	}
+}
+
+// Sending across is allowed: anyone who can write the state directory could
+// append to that spool by hand, so refusing would buy inconvenience and no
+// isolation.
+func TestCrossNamespaceSendNeedsTheFlag(t *testing.T) {
+	withHome(t)
+	acme := mustNS(t, "acme")
+	registerIn(t, acme, "bbbb2222-0000-0000-0000-000000000000", "beta")
+
+	if r := invoke(t, "send", "beta", "hello"); r.code != 1 {
+		t.Errorf("a session in another namespace resolved without -n: %s", r)
+	}
+	r := invoke(t, "send", "-n", "acme", "beta", "hello there")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", "sent -> bbbb2222 (beta) in acme")
+
+	spool, err := os.ReadFile(acme.SpoolPath("bbbb2222-0000-0000-0000-000000000000"))
+	if err != nil {
+		t.Fatalf("read spool: %v", err)
+	}
+	if !strings.Contains(string(spool), "hello there") {
+		t.Errorf("message did not reach the recipient's namespace: %s", spool)
+	}
+	// --namespace is the same flag, not a second setting that could disagree.
+	if r := invoke(t, "send", "--namespace", "acme", "beta", "again"); r.code != 0 {
+		t.Errorf("--namespace was not accepted: %s", r)
+	}
+	if r := invoke(t, "send", "-n", "../escape", "beta", "x"); r.code != 1 {
+		t.Errorf("a traversing namespace was accepted: %s", r)
+	}
+}
+
+func TestPublishToAGlobalTopic(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+	other := mustNS(t, "other")
+	beta := registerIn(t, other, "bbbb2222-0000-0000-0000-000000000000", "beta")
+	if err := other.Subscribe(beta.SessionID, "@ops"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// The subscriber is in another namespace, which is the whole point of "@".
+	r := invoke(t, "publish", "@ops", "all hands")
+	wantContains(t, r, "stdout", "published to @ops (1 subscriber(s) besides you)")
+
+	r = invoke(t, "topics")
+	wantContains(t, r, "stdout", "@ops")
+	wantContains(t, r, "stdout", "@all")
+}
+
+func TestTopicsAcrossNamespaces(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+	if r := invoke(t, "subscribe", "deploys"); r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	other := mustNS(t, "other")
+	beta := registerIn(t, other, "bbbb2222-0000-0000-0000-000000000000", "beta")
+	if err := other.Subscribe(beta.SessionID, "secrets"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if _, err := other.Publish("@ops", "all hands", pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	// A namespaced listing shows this namespace's topics plus the shared ones,
+	// which is exactly the set you can publish to from here.
+	r := invoke(t, "topics")
+	wantContains(t, r, "stdout", "deploys")
+	wantContains(t, r, "stdout", "@ops")
+	if strings.Contains(r.stdout, "secrets") {
+		t.Errorf("a topic from another namespace was listed:\n%s", r)
+	}
+
+	r = invoke(t, "topics", "--all-namespaces")
+	for _, want := range []string{"NAMESPACE", "deploys", "secrets", "other"} {
+		wantContains(t, r, "stdout", want)
+	}
+	// A global topic belongs to no namespace, and is listed once rather than
+	// once per namespace.
+	if n := strings.Count(r.stdout, "@ops"); n != 1 {
+		t.Errorf("@ops appears %d times, want once:\n%s", n, r)
+	}
+	if r := invoke(t, "topics", "--all-namespaces", "-n", "other"); r.code != 1 {
+		t.Errorf("two conflicting scopes were accepted: %s", r)
+	}
+}
+
+// A namespace that cannot be a directory name is refused everywhere it is
+// accepted, rather than replaced: acting on "default" instead of what somebody
+// typed is how a message reaches the wrong people.
+func TestBadNamespaceIsRefusedEverywhere(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+	for _, args := range [][]string{
+		{"ls", "-n", "../escape"},
+		{"topics", "-n", "Caps"},
+		{"prune", "-n", "with space"},
+		{"publish", "-n", "../escape", "deploys", "hi"},
+		{"prune", "--all-namespaces", "-n", "acme"},
+		{"namespace", "a", "b"},
+		{"namespaces", "--nonsense"},
+	} {
+		if r := invoke(t, args...); r.code != 1 {
+			t.Errorf("%v was accepted: %s", args, r)
+		}
+	}
+}
+
+func TestNamespacesCommandListsAndMarksTheCurrentOne(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+	registerIn(t, mustNS(t, "acme"), "bbbb2222-0000-0000-0000-000000000000", "beta")
+
+	r := invoke(t, "namespaces")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	for _, want := range []string{"NAMESPACE", "acme", "*  default"} {
+		wantContains(t, r, "stdout", want)
+	}
+
+	r = invoke(t, "namespaces", "--json")
+	var got []map[string]any
+	if err := json.Unmarshal([]byte(r.stdout), &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, r.stdout)
+	}
+	if len(got) != 2 {
+		t.Errorf("got %d namespaces, want acme and default: %v", len(got), got)
+	}
+}
+
+// Get-or-set, like `pigeon name`. Setting it records a preference for shell
+// invocations and must say plainly that it does not move a running session.
+func TestNamespaceCommandGetsAndSets(t *testing.T) {
+	withHome(t)
+	t.Setenv(pigeon.EnvNamespace, "")
+	t.Setenv(pigeon.EnvProjectDir, t.TempDir())
+
+	r := invoke(t, "namespace")
+	if strings.TrimSpace(r.stdout) != "default" {
+		t.Errorf("stdout = %q, want just the name so $(pigeon namespace) is usable", r.stdout)
+	}
+	wantContains(t, r, "stderr", "from ")
+
+	if r := invoke(t, "namespace", "acme"); r.code != 0 {
+		t.Fatalf("%s", r)
+	} else {
+		wantContains(t, r, "stdout", `namespace set to "acme"`)
+		wantContains(t, r, "stdout", "running sessions keep the namespace they armed with")
+	}
+	if r := invoke(t, "namespace"); strings.TrimSpace(r.stdout) != "acme" {
+		t.Errorf("the preference did not persist: %s", r)
+	}
+	if r := invoke(t, "namespace", "../escape"); r.code != 1 {
+		t.Errorf("a traversing namespace was accepted: %s", r)
+	}
+}
+
+// Setting a preference something already outranks is a silent no-op otherwise,
+// and you would go on wondering why ls looks the same.
+func TestNamespaceCommandSaysWhenItIsOverridden(t *testing.T) {
+	withHome(t)
+	t.Setenv(pigeon.EnvNamespace, "fromenv")
+
+	r := invoke(t, "namespace", "acme")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stderr", "fromenv still applies here")
+}
+
+func TestPruneSweepsEveryNamespace(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+	// A session whose project config changed namespace leaves a dead entry in
+	// the old one, where nothing else will ever look at it.
+	stale := mustNS(t, "old-namespace")
+	if err := stale.WriteEntry(&pigeon.Entry{SessionID: "bbbb2222-0000-0000-0000-000000000000"}); err != nil {
+		t.Fatalf("WriteEntry: %v", err)
+	}
+
+	if r := invoke(t, "prune"); r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	if _, err := stale.ReadEntry("bbbb2222-0000-0000-0000-000000000000"); err != nil {
+		t.Fatalf("a prune of one namespace reached into another: %v", err)
+	}
+
+	r := invoke(t, "prune", "--all-namespaces")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", "swept")
+	if _, err := stale.ReadEntry("bbbb2222-0000-0000-0000-000000000000"); err == nil {
+		t.Error("--all-namespaces left the stale entry behind")
+	}
 }
 
 // --- formatting helpers ----------------------------------------------------

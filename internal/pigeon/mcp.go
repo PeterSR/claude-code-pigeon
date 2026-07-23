@@ -45,16 +45,31 @@ type toolDef struct {
 
 func obj(m map[string]any) map[string]any { return m }
 
+// namespaceArg is the optional input shared by every tool that can address
+// another namespace. Sessions are isolated per namespace, so leaving it out
+// means "mine", which is what a session almost always wants.
+func namespaceArg(what string) map[string]any {
+	return obj(map[string]any{
+		"type": "string",
+		"description": "Namespace to " + what + ". Sessions in different namespaces cannot " +
+			"see each other. Omit for this session's own namespace, which is nearly " +
+			"always what you want; use list_namespaces to see the others.",
+	})
+}
+
 func tools() []toolDef {
 	return []toolDef{
 		{
 			Name: "list_sessions",
 			Description: "List live Claude Code sessions reachable via pigeon, with their " +
-				"name, description, working directory and status. Status 'deaf' means the " +
-				"session is running but not listening, so messages to it will not arrive.",
+				"name, description, working directory, namespace and status. Status 'deaf' " +
+				"means the session is running but not listening, so messages to it will not " +
+				"arrive. Only this session's namespace is listed unless one is named.",
 			InputSchema: obj(map[string]any{
-				"type":       "object",
-				"properties": obj(map[string]any{}),
+				"type": "object",
+				"properties": obj(map[string]any{
+					"namespace": namespaceArg("list"),
+				}),
 			}),
 		},
 		{
@@ -62,7 +77,8 @@ func tools() []toolDef {
 			Description: "Send a message to another Claude Code session. The recipient is " +
 				"woken even if idle. Your own identity is attached automatically so they can " +
 				"reply. Keep it under ~300 characters; longer text is written to a file and " +
-				"the recipient gets a path instead.",
+				"the recipient gets a path instead. The target is resolved inside one " +
+				"namespace, so a name that means nothing here may still exist elsewhere.",
 			InputSchema: obj(map[string]any{
 				"type": "object",
 				"properties": obj(map[string]any{
@@ -75,6 +91,7 @@ func tools() []toolDef {
 						"type":        "string",
 						"description": "Message body.",
 					}),
+					"namespace": namespaceArg("resolve the target in"),
 				}),
 				"required": []string{"to", "text"},
 			}),
@@ -82,16 +99,20 @@ func tools() []toolDef {
 		{
 			Name: "publish",
 			Description: "Publish a message to a topic. Every session subscribed to that " +
-				"topic is woken, even if idle. Every session subscribes to 'all' by default, " +
-				"so publishing to 'all' broadcasts to the whole machine.",
+				"topic is woken, even if idle. A plain topic name resolves inside one " +
+				"namespace; a name starting with '@' is machine-wide and reaches every " +
+				"namespace. Every session subscribes to 'all' and '@all' by default, so " +
+				"'all' broadcasts to this namespace and '@all' to the whole machine.",
 			InputSchema: obj(map[string]any{
 				"type": "object",
 				"properties": obj(map[string]any{
 					"topic": obj(map[string]any{
-						"type":        "string",
-						"description": "Topic name: lowercase letters, digits, dot, dash or underscore.",
+						"type": "string",
+						"description": "Topic name: lowercase letters, digits, dot, dash or " +
+							"underscore. Prefix with '@' for the machine-wide topic of that name.",
 					}),
-					"text": obj(map[string]any{"type": "string", "description": "Message body."}),
+					"text":      obj(map[string]any{"type": "string", "description": "Message body."}),
+					"namespace": namespaceArg("publish into"),
 				}),
 				"required": []string{"topic", "text"},
 			}),
@@ -100,35 +121,52 @@ func tools() []toolDef {
 			Name: "subscribe",
 			Description: "Start receiving a topic in this session. Takes effect within about " +
 				"a second, without restarting. Only messages published from now on arrive; " +
-				"history is not replayed.",
+				"history is not replayed. Prefix the name with '@' for the machine-wide topic.",
 			InputSchema: obj(map[string]any{
 				"type": "object",
 				"properties": obj(map[string]any{
-					"topic": obj(map[string]any{"type": "string", "description": "Topic to join."}),
+					"topic": obj(map[string]any{
+						"type":        "string",
+						"description": "Topic to join. '@name' joins the machine-wide one.",
+					}),
+					"namespace": namespaceArg("find this session's registration in"),
 				}),
 				"required": []string{"topic"},
 			}),
 		},
 		{
 			Name:        "unsubscribe",
-			Description: "Stop receiving a topic in this session.",
+			Description: "Stop receiving a topic in this session. '@all' opts out of machine-wide broadcasts.",
 			InputSchema: obj(map[string]any{
 				"type": "object",
 				"properties": obj(map[string]any{
-					"topic": obj(map[string]any{"type": "string", "description": "Topic to leave."}),
+					"topic": obj(map[string]any{
+						"type":        "string",
+						"description": "Topic to leave. '@name' leaves the machine-wide one.",
+					}),
+					"namespace": namespaceArg("find this session's registration in"),
 				}),
 				"required": []string{"topic"},
 			}),
 		},
 		{
-			Name:        "list_topics",
-			Description: "List known topics and how many live sessions subscribe to each.",
+			Name: "list_topics",
+			Description: "List the topics reachable from this session -- its namespace's own, " +
+				"plus the machine-wide '@' ones -- and how many live sessions subscribe to each.",
+			InputSchema: obj(map[string]any{"type": "object", "properties": obj(map[string]any{})}),
+		},
+		{
+			Name: "list_namespaces",
+			Description: "List every namespace on this machine with how many of its sessions " +
+				"are live and how many are deaf. Namespaces are isolated: a session only sees, " +
+				"resolves and broadcasts to its own, apart from '@' topics, which are " +
+				"machine-wide. A session's namespace is fixed when it starts.",
 			InputSchema: obj(map[string]any{"type": "object", "properties": obj(map[string]any{})}),
 		},
 		{
 			Name: "whoami",
-			Description: "Show this session's pigeon identity: session id, declared name, " +
-				"description, and the address other sessions use to reach it.",
+			Description: "Show this session's pigeon identity: session id, namespace, declared " +
+				"name, description, and the address other sessions use to reach it.",
 			InputSchema: obj(map[string]any{
 				"type":       "object",
 				"properties": obj(map[string]any{}),
@@ -261,32 +299,68 @@ func toolResult(text string, isErr bool) any {
 	})
 }
 
+// mcpNamespace resolves an optional namespace argument. An empty one is the
+// caller's own, which is what a session means unless it says otherwise; a bad
+// one is refused rather than quietly replaced, because the difference between
+// two namespaces is who reads the message.
+func mcpNamespace(arg string) (Namespace, error) {
+	if strings.TrimSpace(arg) == "" {
+		return CurrentNamespace(), nil
+	}
+	return ParseNamespace(arg)
+}
+
 func callTool(name string, raw json.RawMessage) (string, error) {
 	switch name {
 	case "list_sessions":
-		return mcpList()
+		var a struct {
+			Namespace string `json:"namespace"`
+		}
+		_ = json.Unmarshal(raw, &a)
+		ns, err := mcpNamespace(a.Namespace)
+		if err != nil {
+			return "", err
+		}
+		return mcpList(ns)
 	case "send_message":
 		var a struct {
-			To   string `json:"to"`
-			Text string `json:"text"`
+			To        string `json:"to"`
+			Text      string `json:"text"`
+			Namespace string `json:"namespace"`
 		}
 		_ = json.Unmarshal(raw, &a)
-		return mcpSend(a.To, a.Text)
+		ns, err := mcpNamespace(a.Namespace)
+		if err != nil {
+			return "", err
+		}
+		return mcpSend(ns, a.To, a.Text)
 	case "publish":
 		var a struct {
-			Topic string `json:"topic"`
-			Text  string `json:"text"`
+			Topic     string `json:"topic"`
+			Text      string `json:"text"`
+			Namespace string `json:"namespace"`
 		}
 		_ = json.Unmarshal(raw, &a)
-		return mcpPublish(a.Topic, a.Text)
+		ns, err := mcpNamespace(a.Namespace)
+		if err != nil {
+			return "", err
+		}
+		return mcpPublish(ns, a.Topic, a.Text)
 	case "subscribe", "unsubscribe":
 		var a struct {
-			Topic string `json:"topic"`
+			Topic     string `json:"topic"`
+			Namespace string `json:"namespace"`
 		}
 		_ = json.Unmarshal(raw, &a)
-		return mcpSubscription(name, a.Topic)
+		ns, err := mcpNamespace(a.Namespace)
+		if err != nil {
+			return "", err
+		}
+		return mcpSubscription(ns, name, a.Topic)
 	case "list_topics":
 		return mcpTopics()
+	case "list_namespaces":
+		return mcpNamespaces()
 	case "whoami":
 		return mcpWhoami()
 	case "set_identity":
@@ -302,13 +376,14 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 	return "", fmt.Errorf("unknown tool %q", name)
 }
 
-func mcpList() (string, error) {
-	entries, err := ListSessions(false, false)
+func mcpList(ns Namespace) (string, error) {
+	entries, err := ns.ListSessions(false, false)
 	if err != nil {
 		return "", err
 	}
 	if len(entries) == 0 {
-		return "No other Claude Code sessions are registered with pigeon.", nil
+		return fmt.Sprintf("No other Claude Code sessions are registered with pigeon in namespace %q.%s",
+			ns, elsewhereNote(ns)), nil
 	}
 	me := CurrentSessionID()
 	var b strings.Builder
@@ -318,8 +393,8 @@ func mcpList() (string, error) {
 		} else {
 			b.WriteString("  ")
 		}
-		fmt.Fprintf(&b, "%s  addr=%s  status=%s  cwd=%s",
-			Short(e.SessionID), e.Addr(), e.Status, e.Cwd)
+		fmt.Fprintf(&b, "%s  addr=%s  status=%s  ns=%s  cwd=%s",
+			Short(e.SessionID), e.Addr(), e.Status, e.Namespace, e.Cwd)
 		if e.Description != "" {
 			fmt.Fprintf(&b, "\n      %s", Sanitize(e.Description))
 		}
@@ -342,23 +417,35 @@ func mcpList() (string, error) {
 		fmt.Fprintf(&b, "\nThis session (%s) is not in the list: it has no listening monitor, "+
 			"so other sessions cannot reach it.", Short(me))
 	}
+	b.WriteString(elsewhereNote(ns))
 	return b.String(), nil
 }
 
-func mcpSend(to, text string) (string, error) {
+// elsewhereNote says what the listing deliberately left out. Without it a
+// session concludes the machine is empty when it is only alone.
+func elsewhereNote(ns Namespace) string {
+	sessions, spaces := peersElsewhere(ns)
+	if sessions == 0 {
+		return ""
+	}
+	return fmt.Sprintf("\n%d further session(s) are in %d other namespace(s) and cannot see this one; "+
+		"list_namespaces names them.", sessions, spaces)
+}
+
+func mcpSend(ns Namespace, to, text string) (string, error) {
 	if strings.TrimSpace(to) == "" || strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("both 'to' and 'text' are required")
 	}
-	target, err := ResolveTarget(to)
+	target, err := ns.ResolveTarget(to)
 	if err != nil {
 		return "", err
 	}
-	msg, err := Send(target, text, CurrentSender(), "")
+	msg, err := ns.Send(target, text, CurrentSender(), "")
 	if err != nil {
 		return "", err
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Delivered to %s (%s).", target.Display(), Short(target.SessionID))
+	fmt.Fprintf(&b, "Delivered to %s (%s) in namespace %q.", target.Display(), Short(target.SessionID), ns)
 	if msg.Payload != "" {
 		fmt.Fprintf(&b, " Body exceeded %d chars, so the full text was written to %s and the recipient received a pointer.",
 			BodyBudget, msg.Payload)
@@ -369,27 +456,21 @@ func mcpSend(to, text string) (string, error) {
 	return b.String(), nil
 }
 
-func mcpPublish(topic, text string) (string, error) {
+func mcpPublish(ns Namespace, topic, text string) (string, error) {
 	if strings.TrimSpace(topic) == "" || strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("both 'topic' and 'text' are required")
 	}
-	msg, err := Publish(topic, text, CurrentSender())
+	msg, err := ns.Publish(topic, text, CurrentSender())
 	if err != nil {
 		return "", err
 	}
-	me := CurrentSessionID()
-	n := 0
-	if entries, e := ListSessions(false, false); e == nil {
-		for _, en := range entries {
-			for _, t := range en.Subscriptions {
-				if t == topic && en.SessionID != me {
-					n++
-				}
-			}
-		}
+	num := ns.SubscriberCount(topic, CurrentSessionID())
+	out := fmt.Sprintf("Published to %s. %d other live session(s) subscribe to it.",
+		TopicLabel(msg.Topic), num)
+	if strings.HasPrefix(msg.Topic, GlobalPrefix) {
+		out += " That topic is machine-wide, so subscribers in every namespace received it."
 	}
-	out := fmt.Sprintf("Published to #%s. %d other live session(s) subscribe to it.", topic, n)
-	if n == 0 {
+	if num == 0 {
 		out += " Nobody is listening right now, but the message is on the log for anyone who subscribes later."
 	}
 	if msg.Payload != "" {
@@ -398,7 +479,7 @@ func mcpPublish(topic, text string) (string, error) {
 	return out, nil
 }
 
-func mcpSubscription(action, topic string) (string, error) {
+func mcpSubscription(ns Namespace, action, topic string) (string, error) {
 	sid := CurrentSessionID()
 	if sid == "" {
 		return "", fmt.Errorf("not running inside a Claude Code session")
@@ -407,15 +488,16 @@ func mcpSubscription(action, topic string) (string, error) {
 		return "", fmt.Errorf("'topic' is required")
 	}
 	if action == "subscribe" {
-		if err := Subscribe(sid, topic); err != nil {
+		if err := ns.Subscribe(sid, topic); err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("Subscribed to #%s. Messages published from now on will arrive in this session, even while idle.", topic), nil
+		return fmt.Sprintf("Subscribed to %s. Messages published from now on will arrive in this session, even while idle.",
+			TopicLabel(topic)), nil
 	}
-	if err := Unsubscribe(sid, topic); err != nil {
+	if err := ns.Unsubscribe(sid, topic); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("Unsubscribed from #%s.", topic), nil
+	return fmt.Sprintf("Unsubscribed from %s.", TopicLabel(topic)), nil
 }
 
 func mcpTopics() (string, error) {
@@ -437,9 +519,32 @@ func mcpTopics() (string, error) {
 		if mine[t.Name] {
 			mark = "* "
 		}
-		fmt.Fprintf(&b, "%s#%s  (%d subscriber(s))\n", mark, t.Name, t.Subscribers)
+		scope := ""
+		if t.Global {
+			scope = "  [machine-wide]"
+		}
+		fmt.Fprintf(&b, "%s%s  (%d subscriber(s))%s\n", mark, TopicLabel(t.Name), t.Subscribers, scope)
 	}
 	b.WriteString("\n* = this session subscribes")
+	return b.String(), nil
+}
+
+func mcpNamespaces() (string, error) {
+	spaces, err := ListNamespaces()
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	for _, info := range spaces {
+		mark := "  "
+		if info.Current {
+			mark = "* "
+		}
+		fmt.Fprintf(&b, "%s%s  live=%d  deaf=%d\n", mark, info.Name, info.Live, info.Deaf)
+	}
+	b.WriteString("\n* = this session's namespace. Sessions in other namespaces cannot be listed " +
+		"or addressed without naming theirs, and a session cannot move: its namespace is fixed " +
+		"when it starts. '@' topics reach every namespace.")
 	return b.String(), nil
 }
 
@@ -454,6 +559,7 @@ func mcpWhoami() (string, error) {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "session:     %s\n", e.SessionID)
+	fmt.Fprintf(&b, "namespace:   %s\n", e.Namespace)
 	fmt.Fprintf(&b, "name:        %s\n", orDash(e.Name))
 	fmt.Fprintf(&b, "description: %s\n", orDash(e.Description))
 	fmt.Fprintf(&b, "cwd:         %s\n", e.Cwd)

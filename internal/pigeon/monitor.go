@@ -76,7 +76,14 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 		return nil
 	}
 
-	if err := EnsureDirs(); err != nil {
+	// The namespace is fixed here, for the same reason a monitor cannot be
+	// rebound mid-session: from now on this process holds a lock in that
+	// namespace's directory and follows that namespace's topics. Changing where
+	// a session lives means restarting it.
+	ns, origin := ResolveNamespace()
+	logf("namespace %s (from %s)", ns, origin)
+
+	if err := ns.EnsureDirs(); err != nil {
 		return err
 	}
 
@@ -86,7 +93,7 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	// sessions can detect a dead monitor just by trying to take it.
 	// Deliberately never unlinked: removing the file would let a second
 	// process lock a different inode and both believe they hold it.
-	lock, acquired, err := tryExclusive(LockPath(sid))
+	lock, acquired, err := tryExclusive(ns.LockPath(sid))
 	if err != nil {
 		return err
 	}
@@ -97,15 +104,15 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	}
 	defer lock.Close()
 
-	if err := register(sid, logf); err != nil {
+	if err := register(ns, sid, logf); err != nil {
 		logf("registration failed: %v", err)
 	}
 
-	spool := SpoolPath(sid)
+	spool := ns.SpoolPath(sid)
 	if f, err := os.OpenFile(spool, os.O_WRONLY|os.O_CREATE, 0o600); err == nil {
 		f.Close()
 	}
-	logf("armed session=%s spool=%s", sid, spool)
+	logf("armed session=%s namespace=%s spool=%s", sid, ns, spool)
 
 	// Trap before doing anything interruptible, so a signal arriving during
 	// startup is not lost, and release the handlers on the way out.
@@ -119,26 +126,26 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 
 	lines := make(chan *Message, 256)
 
-	go heartbeat(sid, done)
+	go heartbeat(ns, sid, done)
 	go watchdog(CurrentClaudePID(), sigc, done, logf)
 
 	// Direct inbox: resume from our own cursor so mail queued while no monitor
 	// was listening is delivered when one comes back, rather than skipped.
-	inboxOffset := readCursors(sid)[inboxCursorKey]
+	inboxOffset := ns.readCursors(sid)[inboxCursorKey]
 	if inboxOffset > endOffset(spool) {
 		inboxOffset = 0
 	}
 	go followSource(spool, inboxOffset, lines, done,
-		func(n int64) { _ = mutateCursors(sid, func(c map[string]int64) { c[inboxCursorKey] = n }) },
-		func() int64 { return readCursors(sid)[inboxCursorKey] },
+		func(off int64) { _ = ns.mutateCursors(sid, func(c map[string]int64) { c[inboxCursorKey] = off }) },
+		func() int64 { return ns.readCursors(sid)[inboxCursorKey] },
 		logf)
 
 	// Topics: started and stopped as subscriptions change.
-	go manageSubscriptions(sid, lines, done, logf)
+	go manageSubscriptions(ns, sid, lines, done, logf)
 
 	// Deregister on the way out, but leave the spool in place: anything queued
 	// for this session should survive until a monitor actually reads it.
-	defer RemoveEntry(sid)
+	defer ns.RemoveEntry(sid)
 
 	emit := newRateLimiter(stdout, spool)
 	for {
@@ -151,7 +158,7 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 			if m.From.SessionID != "" && m.From.SessionID == sid {
 				continue
 			}
-			emit(Render(m))
+			emit(ns.Render(m))
 		}
 	}
 }
@@ -159,7 +166,7 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 // manageSubscriptions starts a follower per subscribed topic and stops it when
 // the session unsubscribes, re-reading the registry entry as the source of
 // truth so MCP and CLI changes both take effect without a restart.
-func manageSubscriptions(sid string, out chan<- *Message, done <-chan struct{}, logf func(string, ...any)) {
+func manageSubscriptions(ns Namespace, sid string, out chan<- *Message, done <-chan struct{}, logf func(string, ...any)) {
 	type follower struct{ stop chan struct{} }
 	active := map[string]*follower{}
 
@@ -180,13 +187,18 @@ func manageSubscriptions(sid string, out chan<- *Message, done <-chan struct{}, 
 		case <-t.C:
 		}
 
-		e, err := ReadEntry(sid)
+		e, err := ns.ReadEntry(sid)
 		if err != nil {
 			continue
 		}
 		want := map[string]bool{}
 		for _, topic := range e.Subscriptions {
-			want[topic] = true
+			// The entry is a file on disk, so a subscription is not necessarily
+			// something Subscribe validated. Following an unchecked name would
+			// let a planted entry point this session's reader at any file.
+			if ref, err := ParseTopicRef(topic); err == nil {
+				want[ref.String()] = true
+			}
 		}
 
 		for topic := range want {
@@ -195,19 +207,19 @@ func manageSubscriptions(sid string, out chan<- *Message, done <-chan struct{}, 
 			}
 			stop := make(chan struct{})
 			active[topic] = &follower{stop: stop}
-			path := TopicPath(topic)
+			path := ns.TopicPath(topic)
 			// Resume from our own cursor so each subscriber reads the shared
 			// log independently and nobody consumes anyone else's messages.
-			cur := readCursors(sid)
+			cur := ns.readCursors(sid)
 			off, ok := cur[topic]
 			if !ok {
 				off = endOffset(path)
 			}
 			tp := topic
-			persist := func(n int64) {
-				_ = mutateCursors(sid, func(c map[string]int64) { c[tp] = n })
+			persist := func(at int64) {
+				_ = ns.mutateCursors(sid, func(c map[string]int64) { c[tp] = at })
 			}
-			reload := func() int64 { return readCursors(sid)[tp] }
+			reload := func() int64 { return ns.readCursors(sid)[tp] }
 			logf("following topic %q from offset %d", topic, off)
 			go followSource(path, off, out, stop, persist, reload, logf)
 		}
@@ -222,7 +234,7 @@ func manageSubscriptions(sid string, out chan<- *Message, done <-chan struct{}, 
 	}
 }
 
-func register(sid string, logf func(string, ...any)) error {
+func register(ns Namespace, sid string, logf func(string, ...any)) error {
 	pid := CurrentClaudePID()
 	cwd := CurrentCwd()
 
@@ -242,7 +254,7 @@ func register(sid string, logf func(string, ...any)) error {
 	// Preserve identity and subscriptions declared earlier in this session.
 	var name, desc string
 	var subs []string
-	prev, err := ReadEntry(sid)
+	prev, err := ns.ReadEntry(sid)
 	if err == nil {
 		name, desc, subs = prev.Name, prev.Description, prev.Subscriptions
 	} else {
@@ -250,29 +262,36 @@ func register(sid string, logf func(string, ...any)) error {
 		// config. After that the session's own declarations are authoritative,
 		// so a `pigeon name` or `pigeon unsubscribe` is not quietly undone the
 		// next time a monitor starts for the same id.
-		name, desc, subs = applyProjectConfig(sid, cwd, cfg, logf)
+		name, desc, subs = applyProjectConfig(ns, sid, cwd, cfg, logf)
 	}
 
-	// Everyone gets the public mailbox by default, so a broadcast reaches the
-	// machine without anyone configuring anything.
+	// Everyone gets both public mailboxes by default: this namespace's, and the
+	// machine-wide one. `@all` crossing the boundary is the deliberate hole in
+	// the isolation -- a broadcast meant for everybody has to reach everybody --
+	// and `pigeon unsubscribe @all` closes it for a session that would rather
+	// not hear it.
 	if subs == nil {
-		subs = []string{PublicTopic}
+		subs = defaultSubscriptions()
 	}
 	// Seed a cursor only for a topic we have never followed, so a new
 	// subscription starts at the end of its log rather than replaying history
 	// as a burst of notifications. Re-seeding an existing one would throw away
 	// the session's read position on every monitor restart, silently skipping
 	// whatever was published while it was down.
-	existing := readCursors(sid)
+	existing := ns.readCursors(sid)
 	for _, t := range subs {
-		if _, seen := existing[t]; !seen {
-			_ = seedCursor(sid, t)
+		if _, seen := existing[t]; seen {
+			continue
+		}
+		if ref, err := ParseTopicRef(t); err == nil {
+			_ = ns.seedCursor(sid, ref)
 		}
 	}
 
 	now := nowRFC3339()
-	return WriteEntry(&Entry{
+	return ns.WriteEntry(&Entry{
 		SessionID:     sid,
+		Namespace:     ns.String(),
 		Name:          name,
 		Description:   desc,
 		PID:           pid,
@@ -288,13 +307,21 @@ func register(sid string, logf func(string, ...any)) error {
 	})
 }
 
+// defaultSubscriptions is what a session comes up listening to before any
+// config or command has a say.
+func defaultSubscriptions() []string {
+	subs := []string{PublicTopic, GlobalPublicTopic}
+	sort.Strings(subs)
+	return subs
+}
+
 // applyProjectConfig seeds a brand-new session's identity from the project it
 // started in. The config's shape was validated when it was loaded; what is
 // decided here is what a template actually produces for *this* session, and
 // what to do when the config asks for something this machine cannot give it --
 // most often a name another live session already answers to.
-func applyProjectConfig(sid, cwd string, cfg *ProjectConfig, logf func(string, ...any)) (name, desc string, subs []string) {
-	subs = []string{PublicTopic}
+func applyProjectConfig(ns Namespace, sid, cwd string, cfg *ProjectConfig, logf func(string, ...any)) (name, desc string, subs []string) {
+	subs = defaultSubscriptions()
 	if cfg == nil {
 		return "", "", subs
 	}
@@ -303,7 +330,7 @@ func applyProjectConfig(sid, cwd string, cfg *ProjectConfig, logf func(string, .
 	// this session may not have leaves it unnamed and says why. That is the
 	// honest outcome -- the session is still reachable by id, and no reply is
 	// misrouted.
-	res := cfg.Resolve(sid, cwd)
+	res := cfg.Resolve(ns, sid, cwd)
 	for _, p := range res.Problems {
 		logf("project config: %s", p)
 	}
@@ -326,7 +353,7 @@ func hostname() string {
 
 // heartbeat refreshes the entry so a wedged monitor -- still holding the lock
 // but no longer working -- is still reported as not delivering.
-func heartbeat(sid string, done <-chan struct{}) {
+func heartbeat(ns Namespace, sid string, done <-chan struct{}) {
 	t := time.NewTicker(heartbeatInterval)
 	defer t.Stop()
 	for {
@@ -337,7 +364,7 @@ func heartbeat(sid string, done <-chan struct{}) {
 			// Through MutateEntry, not ReadEntry+WriteEntry: this ticks every
 			// 15s against a file the CLI and MCP also write, and an unlocked
 			// read-modify-write here is exactly how the entry gets shredded.
-			_ = MutateEntry(sid, func(e *Entry) error {
+			_ = ns.MutateEntry(sid, func(e *Entry) error {
 				e.HeartbeatAt = nowRFC3339()
 				return nil
 			})

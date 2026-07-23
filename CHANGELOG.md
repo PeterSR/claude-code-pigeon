@@ -6,7 +6,69 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+- **Breaking (on-disk layout).** The six state directories moved from `<state>/sessions`,
+  `inbox`, `topics`, `cursors`, `locks` and `payloads` to
+  `<state>/namespaces/<namespace>/…`, with a new `<state>/shared/` holding the
+  machine-wide topic logs and their payloads. The first pigeon command after the upgrade
+  moves the old tree into `namespaces/default/`, once, under a lock, idempotently, and
+  logs that it did: live sessions keep their queued mail, their cursors and their
+  addresses. Anything that read those paths directly has to change; nothing else does.
+
 ### Added
+- Namespaces: isolated groups of sessions, with `default` for anyone who never thinks
+  about them. A session sees, resolves, names and broadcasts only inside its own, so two
+  namespaces can both hold a session called `api` without either losing its address.
+
+  The isolation is structural rather than a filter: each namespace owns a complete state
+  tree, so a session in `acme` cannot see `default`'s registry because that is not the
+  directory it reads. A field plus a filter would have put the rule in `ListSessions`,
+  target resolution, name uniqueness, topic listing, the publish subscriber count, prune,
+  doctor and every MCP tool, and missing one of them leaks somebody else's sessions.
+
+  A namespace comes from `PIGEON_NAMESPACE`, then `"namespace"` in the project's
+  `.claude/pigeon.json`, then `pigeon namespace <name>`, then `default`. It is fixed when
+  a session's monitor arms, for the same reason monitors cannot be rebound mid-session:
+  the monitor holds a lock in that namespace's directory and follows its topics. Moving a
+  session means restarting it.
+- Global topics: a topic written `@ops` is one log the whole machine shares, while `ops`
+  is one log per namespace. The `@` works everywhere a topic is accepted -- CLI, MCP and
+  the project config -- and is shell-safe, unlike `*`, `!` or `~`. Every session now
+  subscribes to `@all` as well as `all`, deliberately: a broadcast meant for everyone on
+  the machine has to reach everyone on the machine. `pigeon unsubscribe @all` opts out.
+- `pigeon namespaces` lists every namespace with its live and deaf session counts, and
+  `pigeon namespace [<name>]` shows or sets the one shell invocations use, recorded in
+  `<state>/cli.json`. Setting it is `kubectl config set-context`, not a live move, and it
+  says so; it also says when something already outranks the preference just set.
+- `-n`/`--namespace` on `ls`, `send`, `publish`, `topics` and `prune`, and
+  `--all-namespaces` on `ls`, `topics` and `prune`. Cross-namespace `send` is allowed:
+  anyone who can write the state directory could append to that spool by hand, so blocking
+  it would buy inconvenience rather than isolation. `pigeon prune --all-namespaces` is
+  what clears the entry a session leaves behind in its old namespace when a project config
+  changes which one it declares.
+- `pigeon ls` ends with a count of the sessions it is not showing, and only when there are
+  some. Isolation you have forgotten about looks exactly like an empty machine, so the
+  footer is what makes the mechanism discoverable again. `--all-namespaces` gains a
+  NAMESPACE column, and `--json` and `list_sessions` publish the namespace so consumers do
+  not have to infer it.
+- A notification names the sender's namespace, and qualifies its reply hint with `-n`,
+  exactly when the message could have arrived from outside the recipient's namespace: a
+  global topic, or a cross-namespace direct message. Everywhere else it is a constant, and
+  a constant in every notification is noise. The namespace is sanitised and bounded like
+  every other peer-controlled field, and the whole line still fits the render budget.
+- The MCP server gains `list_namespaces`, and an optional `namespace` input on
+  `list_sessions`, `send_message`, `publish`, `subscribe` and `unsubscribe`. A namespace
+  that cannot be a directory name is refused rather than replaced, since acting on
+  `default` instead of what was asked for is how a message reaches the wrong people.
+- `pigeon doctor` reports the namespace and where it came from, and its peers check counts
+  what is deliberately out of sight. A session that quietly landed in the wrong namespace
+  registers fine, sends fine, and simply cannot see anyone, so "where did this come from"
+  is the whole diagnosis.
+- `pigeon statusline` is unchanged and says nothing about namespaces: silent when healthy,
+  `deaf` or `not armed` otherwise. It does now look a session up in every namespace before
+  calling it unarmed, because it is spawned per render with an environment and a working
+  directory that need not match the ones its monitor armed with, and one wrong lit line is
+  what turns the widget into wallpaper.
 - Project defaults in `.claude/pigeon.json`: a checkout can declare the `name`,
   `description` and `topics` that sessions started in it come up with, so a team
   shares one wiring by committing a file. The config seeds a session's first

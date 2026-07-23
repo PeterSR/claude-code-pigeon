@@ -81,7 +81,7 @@ func statuslineFor(sid string, opts StatuslineOptions) string {
 		return ""
 	}
 
-	e, err := ReadEntry(sid)
+	ns, e, err := locateSession(sid)
 	if err != nil {
 		// Registered is the normal state for any session started after
 		// `pigeon install`. Not being registered means the monitor never
@@ -95,13 +95,45 @@ func statuslineFor(sid string, opts StatuslineOptions) string {
 	case StatusDeaf, StatusDead:
 		// Only now is a count meaningful: the monitor is not draining the
 		// spool, so whatever is on it is genuinely waiting.
-		if n := Pending(sid); n > 0 {
+		if n := ns.Pending(sid); n > 0 {
 			return decorate(fmt.Sprintf("deaf · %d waiting", n), opts)
 		}
 		return decorate("deaf", opts)
 	default:
 		return ""
 	}
+}
+
+// locateSession finds a session's entry in this namespace, or failing that in
+// any namespace.
+//
+// The statusline is spawned per render, with an environment and a working
+// directory that need not match the ones the monitor armed with, so resolving a
+// namespace here can land somewhere the session simply is not. Reporting "not
+// armed" for a healthy session is the false alarm this widget exists to avoid:
+// one wrong lit line and it becomes wallpaper. Searching by exact session id
+// cannot pick the wrong session, so the fallback costs nothing but a few globs
+// in the case that is already an alarm.
+func locateSession(sid string) (Namespace, *Entry, error) {
+	ns := CurrentNamespace()
+	e, err := ns.ReadEntry(sid)
+	if err == nil {
+		return ns, e, nil
+	}
+	spaces, lerr := ListNamespaces()
+	if lerr != nil {
+		return ns, nil, err
+	}
+	for _, info := range spaces {
+		other, perr := ParseNamespace(info.Name)
+		if perr != nil || other.Is(ns) {
+			continue
+		}
+		if e, perr := other.ReadEntry(sid); perr == nil {
+			return other, e, nil
+		}
+	}
+	return ns, nil, err
 }
 
 func decorate(text string, opts StatuslineOptions) string {

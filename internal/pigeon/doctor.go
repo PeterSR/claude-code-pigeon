@@ -86,12 +86,29 @@ func Diagnose() []Check {
 	out = append(out, checkSession())
 	out = append(out, checkOptOut())
 	out = append(out, checkVersion())
+	out = append(out, checkNamespace())
 	out = append(out, checkState())
 	out = append(out, checkPlugin()...)
 	out = append(out, checkProjectConfig())
 	out = append(out, checkRegistration()...)
 	out = append(out, checkPeers())
 	return out
+}
+
+// checkNamespace names the group this session is in and where that came from.
+//
+// Getting it wrong is silent by construction: a session in the wrong namespace
+// registers fine, sends fine, and simply cannot see anyone. Since nothing else
+// in the UI mentions namespaces at all, "where did this come from" is the whole
+// diagnosis.
+func checkNamespace() Check {
+	ns, origin := ResolveNamespace()
+	detail := fmt.Sprintf("%s (from %s)", ns, origin)
+	if raw := strings.TrimSpace(os.Getenv(EnvNamespace)); raw != "" && ValidNamespace(raw) != nil {
+		return warn("namespace", detail,
+			"set "+EnvNamespace+" to a valid namespace or unset it; this session is in "+ns.String())
+	}
+	return ok("namespace", detail)
 }
 
 // checkProjectConfig makes a project's defaults visible. Without this, a
@@ -124,14 +141,17 @@ func checkProjectConfig() Check {
 			"remove the field, or set "+EnvOptOut+"=1 in this session's environment to override it")
 	}
 
-	res := cfg.Resolve(CurrentSessionID(), cwd)
+	res := cfg.Resolve(CurrentNamespace(), CurrentSessionID(), cwd)
 	problems = append(problems, res.Problems...)
 	if len(problems) > 0 {
 		return warn("project config", path+": "+strings.Join(problems, "; "),
 			"the rejected fields are ignored; the rest still apply")
 	}
 
-	parts := make([]string, 0, 4)
+	parts := make([]string, 0, 5)
+	if cfg.Namespace != "" {
+		parts = append(parts, "namespace="+cfg.Namespace)
+	}
 	if res.Name != "" {
 		parts = append(parts, "name="+res.Name)
 	}
@@ -367,7 +387,8 @@ func checkRegistration() []Check {
 }
 
 func checkPeers() Check {
-	entries, err := ListSessions(false, false)
+	ns := CurrentNamespace()
+	entries, err := ns.ListSessions(false, false)
 	if err != nil {
 		return warn("peers", "cannot read the registry: "+err.Error(), "")
 	}
@@ -388,7 +409,29 @@ func checkPeers() Check {
 	if deaf > 0 {
 		detail += fmt.Sprintf(", %d deaf", deaf)
 	}
+	// A count of what is deliberately out of sight. "0 live" in a namespace
+	// nobody meant to be in looks identical to an empty machine otherwise.
+	if elsewhere, spaces := peersElsewhere(ns); elsewhere > 0 {
+		detail += fmt.Sprintf("; %d in %d other namespace(s)", elsewhere, spaces)
+	}
 	return ok("peers", detail)
+}
+
+func peersElsewhere(ns Namespace) (sessions, spaces int) {
+	all, err := ListNamespaces()
+	if err != nil {
+		return 0, 0
+	}
+	for _, info := range all {
+		if info.Name == ns.String() {
+			continue
+		}
+		if n := info.Live + info.Deaf; n > 0 {
+			sessions += n
+			spaces++
+		}
+	}
+	return sessions, spaces
 }
 
 // Doctor renders the diagnosis and reports whether delivery is currently

@@ -70,7 +70,11 @@ type TemplateContext struct {
 }
 
 // NewTemplateContext gathers the facts a template may refer to for one session.
-func NewTemplateContext(sessionID, cwd string) TemplateContext {
+//
+// The namespace is needed for .Seq alone, and it matters: peers in another
+// namespace are not peers, so counting them would name the first session in a
+// checkout api-3 because two unrelated ones happen to sit in the same path.
+func NewTemplateContext(ns Namespace, sessionID, cwd string) TemplateContext {
 	dir := ""
 	if cwd != "" {
 		dir = filepath.Base(cwd)
@@ -83,7 +87,7 @@ func NewTemplateContext(sessionID, cwd string) TemplateContext {
 		User:    currentUsername(),
 		Session: sessionID,
 		Short:   Short(sessionID),
-		Seq:     seqInCwd(sessionID, cwd),
+		Seq:     seqInCwd(ns, sessionID, cwd),
 	}
 }
 
@@ -109,13 +113,21 @@ var templateFuncs = template.FuncMap{
 
 // RenderName renders a name template for one session and validates the result.
 func RenderName(src, sessionID, cwd string) (string, error) {
-	return renderName(src, NewTemplateContext(sessionID, cwd))
+	return CurrentNamespace().RenderName(src, sessionID, cwd)
+}
+
+func (n Namespace) RenderName(src, sessionID, cwd string) (string, error) {
+	return renderName(src, NewTemplateContext(n, sessionID, cwd))
 }
 
 // RenderDescription renders a description template for one session, then
 // flattens and bounds it the way any other free text is.
 func RenderDescription(src, sessionID, cwd string) (string, error) {
-	return renderDescription(src, NewTemplateContext(sessionID, cwd))
+	return CurrentNamespace().RenderDescription(src, sessionID, cwd)
+}
+
+func (n Namespace) RenderDescription(src, sessionID, cwd string) (string, error) {
+	return renderDescription(src, NewTemplateContext(n, sessionID, cwd))
 }
 
 // renderName rejects rather than repairs. Quietly rewriting a rendered name
@@ -224,11 +236,11 @@ func (w *boundedWriter) Write(p []byte) (int, error) {
 // before this session registers (from a monitor) or after (from the CLI).
 // Sessions the registry does not carry a cwd for cannot be counted, which
 // includes any that declared themselves private.
-func seqInCwd(sessionID, cwd string) int {
+func seqInCwd(ns Namespace, sessionID, cwd string) int {
 	if cwd == "" {
 		return 1
 	}
-	all, err := ListSessions(false, false)
+	all, err := ns.ListSessions(false, false)
 	if err != nil {
 		return 1
 	}

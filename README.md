@@ -356,7 +356,7 @@ reply hint it renders carries `-n` so the answer comes back to the right place.
 
 ### Upgrading
 
-The on-disk layout changed. The first pigeon command after the upgrade moves the six state
+The on-disk layout changed in 0.2.0. The first pigeon command after the upgrade moves the six state
 directories into `namespaces/default/`, once, under a lock, and says so on stderr. Live
 sessions keep their queued mail, their cursors and their addresses.
 

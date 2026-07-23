@@ -6,27 +6,7 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
-### Added
-- Private namespaces, declared in a machine-level config at
-  `$XDG_CONFIG_HOME/pigeon/config.json`. A private namespace is invisible and
-  unaddressable from inside a Claude Code session, entirely normal from within
-  itself, and sealed against machine-wide `@` topics in both directions.
-
-  Policy is deliberately not a project setting: a `.claude/pigeon.json` arrives
-  with a `git clone`, so a repository may say which namespace its sessions join
-  but never that a namespace is private. The rule keys on
-  `CLAUDE_CODE_SESSION_ID`, which covers the MCP server and an agent's shell
-  alike while leaving your own terminal as the escape hatch. It is a boundary
-  against ordinary reach rather than a sandbox, and the README says so.
-
-### Changed
-- **Breaking (on-disk layout).** The six state directories moved from `<state>/sessions`,
-  `inbox`, `topics`, `cursors`, `locks` and `payloads` to
-  `<state>/namespaces/<namespace>/…`, with a new `<state>/shared/` holding the
-  machine-wide topic logs and their payloads. The first pigeon command after the upgrade
-  moves the old tree into `namespaces/default/`, once, under a lock, idempotently, and
-  logs that it did: live sessions keep their queued mail, their cursors and their
-  addresses. Anything that read those paths directly has to change; nothing else does.
+## [0.2.0] - 2026-07-23
 
 ### Added
 - Namespaces: isolated groups of sessions, with `default` for anyone who never thinks
@@ -82,6 +62,17 @@ All notable changes to this project are documented here. Format follows
   calling it unarmed, because it is spawned per render with an environment and a working
   directory that need not match the ones its monitor armed with, and one wrong lit line is
   what turns the widget into wallpaper.
+- Private namespaces, declared in a machine-level config at
+  `$XDG_CONFIG_HOME/pigeon/config.json`. A private namespace is invisible and
+  unaddressable from inside a Claude Code session, entirely normal from within
+  itself, and sealed against machine-wide `@` topics in both directions.
+
+  Policy is deliberately not a project setting: a `.claude/pigeon.json` arrives
+  with a `git clone`, so a repository may say which namespace its sessions join
+  but never that a namespace is private. The rule keys on
+  `CLAUDE_CODE_SESSION_ID`, which covers the MCP server and an agent's shell
+  alike while leaving your own terminal as the escape hatch. It is a boundary
+  against ordinary reach rather than a sandbox, and the README says so.
 - Project defaults in `.claude/pigeon.json`: a checkout can declare the `name`,
   `description` and `topics` that sessions started in it come up with, so a team
   shares one wiring by committing a file. The config seeds a session's first
@@ -124,9 +115,63 @@ All notable changes to this project are documented here. Format follows
   the file no longer contains them, along with any template problem, whether the project
   is private, and whether it has taken itself off the bus.
 
+### Changed
+- **Breaking (on-disk layout).** The six state directories moved from `<state>/sessions`,
+  `inbox`, `topics`, `cursors`, `locks` and `payloads` to
+  `<state>/namespaces/<namespace>/…`, with a new `<state>/shared/` holding the
+  machine-wide topic logs and their payloads. The first pigeon command after the upgrade
+  moves the old tree into `namespaces/default/`, once, under a lock, idempotently, and
+  logs that it did: live sessions keep their queued mail, their cursors and their
+  addresses. Anything that read those paths directly has to change; nothing else does.
+
 ### Fixed
 - Re-registering a session no longer fast-forwards its topic cursors. A monitor
   restart could skip everything published to a subscribed topic while it was down.
+- A cursor is a logical offset, bytes since the beginning of a log's life, and each log
+  records how much compaction has thrown away. It used to be a raw file position that
+  compaction rewound behind the followers' backs, so between the rewrite and the rewind
+  the file and the cursor described different eras of the same log: a follower that read
+  in that window either skipped the whole compacted log permanently, around 350 messages
+  in the reproduction, or replayed it and had the rate limiter drop 319 of them.
+  Compaction now adds to the log's base and touches no cursor at all.
+- `pigeon prune` no longer sweeps lock files. It trimmed the suffix and read the
+  remainder as a session id, so `<sid>.entry.lock` and `topic-deploys.lock` became names
+  nobody had registered and were removed, for live sessions and active topics alike.
+  Unlinking a lock is how two processes come to hold different inodes of it: with a
+  publisher holding a topic lock, a single `pigeon prune` removed the lock, the
+  compaction later in the same command took a fresh inode instead of blocking, and a line
+  already reported as sent went to the replaced log. An abandoned lock is a zero-byte
+  inode and costs nothing to keep.
+- `pigeon prune` reclaims payload files. A body that overflows the notification budget
+  spills to a file, and nothing removed it afterwards except `uninstall --purge`. Prune
+  keeps exactly the payloads still named by a message in a surviving spool or topic log,
+  which is exact where an age rule would not be: an unread message on a deaf session's
+  spool needs its payload however old it is, and one whose message has been compacted
+  away is garbage the moment it goes.
+- A notification never trims its payload pointer, which is the only route to a body that
+  did not fit. When head and tail exceeded the budget the body's allowance was clamped
+  upward and a final truncate cut the tail, where the pointer sits. Hints are now dropped
+  whole and cheapest first: the topic, which the header already names, then the working
+  directory and the reply address, both recoverable with `pigeon ls`, then the namespace
+  tag. The header is built from parts that can be given up too, so a long state path
+  cannot push the line over the budget with nothing to catch it.
+- A zero render budget no longer panics the monitor by indexing backwards.
+- The MCP server no longer spins on malformed input. It answered a parse error and
+  carried on, but a `json.Decoder` does not resync after a syntax error, so the bad bytes
+  stayed buffered and every later decode failed on the same input: it never served
+  another request and never exited. The framing is newline-delimited, so it now reads a
+  line at a time, which consumes the bad input.
+- The rate limiter's notice names the log its suppressed messages went to. It named the
+  direct spool for everything, so a suppressed topic message sent the recipient to a file
+  it had never been written to, and that notice is the only recovery hint they get.
+  Anything still suppressed when the monitor stops is now reported rather than dropped.
+
+### Security
+- `Sanitize` folds square brackets and drops the Unicode formatting categories. Every
+  hint in a notification is bracketed and only angle brackets were neutralised, so an
+  ordinary message body could forge a payload pointer at any path, a reply address it did
+  not own, or an entire second notification from a peer that never sent one.
+  `unicode.IsControl` reports only Latin-1, so a bidi override went through as well.
 
 ## [0.1.0] - 2026-07-23
 
@@ -180,5 +225,6 @@ First release.
   nothing is not enough: recipients read the `shell:user@host` stamp as an address
   and waste a call discovering it is not one.
 
-[Unreleased]: https://github.com/PeterSR/claude-code-pigeon/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/PeterSR/claude-code-pigeon/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/PeterSR/claude-code-pigeon/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/PeterSR/claude-code-pigeon/releases/tag/v0.1.0

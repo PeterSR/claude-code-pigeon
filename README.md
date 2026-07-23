@@ -31,8 +31,18 @@ One static binary is the whole product — CLI, background monitor, and MCP serv
 
 ```console
 $ go install github.com/PeterSR/claude-code-pigeon/cmd/pigeon@latest
+```
+
+Pre-built binaries for Linux, macOS and FreeBSD (amd64 and arm64) are attached to each
+tagged [release](https://github.com/PeterSR/claude-code-pigeon/releases); download one,
+put it on your `PATH`, and skip the build.
+
+Either way, then:
+
+```console
 $ pigeon install       # writes the plugin
 # restart Claude Code
+$ pigeon doctor        # confirm this session can actually receive
 ```
 
 `pigeon install` scaffolds a plugin at `~/.claude/skills/pigeon`, which auto-loads as
@@ -65,6 +75,8 @@ pigeon topics                   topics and subscriber counts
 pigeon name <name>              declare a name, usable as an address
 pigeon describe <text>          declare what this session is working on
 pigeon whoami                   this session's identity and address
+pigeon doctor [--json]          check whether this session can receive mail
+pigeon statusline [--plain]     one-line alarm for a Claude Code statusline
 pigeon prune                    forget sessions whose process is gone
 ```
 
@@ -115,6 +127,65 @@ brand-new session gets a new id and will not see it, so treat `deaf` as "probabl
 arrive" rather than "will arrive eventually". `pigeon prune` clears the spool once the
 process is gone.
 
+### Diagnosing it: `pigeon doctor`
+
+Delivery is a chain — session id, state directory, plugin, monitor binary, registration —
+and when a link breaks the symptom is always the same: messages stop arriving and nothing
+says why. `doctor` checks each link separately and names the one that broke.
+
+```console
+$ pigeon doctor
+ok    session         9f3c1a20
+ok    state dir       /home/you/.claude/pigeon
+ok    plugin          /home/you/.claude/skills/pigeon
+warn  monitor binary  plugin runs /usr/local/bin/pigeon, but this is /home/you/go/bin/pigeon
+                      -> sessions arm the plugin's copy, not this one; run `pigeon install` to point it here
+FAIL  this session    registered but no monitor is listening
+                      -> the monitor died or never started; restart the session, or run `pigeon arm`
+```
+
+It exits non-zero if anything is a `FAIL`, so it works in a health check. `--json` gives
+the same checks machine-readably.
+
+The `monitor binary` check is worth calling out: `go install` writes a new binary while
+the plugin keeps pointing at wherever the old one lived, so sessions silently keep arming
+the stale copy. Nothing else reports that.
+
+### Seeing it: `pigeon statusline`
+
+```json
+{
+  "statusLine": { "type": "command", "command": "pigeon statusline" }
+}
+```
+
+**A healthy session renders nothing at all.** There is deliberately no peer list and no
+unread count: a live monitor drains the spool within about a second, so there is never a
+standing backlog to display, and listing whichever other sessions happen to be running
+fills the line with work you are not doing. A statusline that is always lit becomes
+wallpaper, and wallpaper is what you stop reading before the one time it mattered.
+
+It renders only when this session **cannot** receive:
+
+```
+🕊 deaf · 3 waiting     monitor stopped; mail is piling up on the spool
+🕊 not armed            the monitor never started for this session
+```
+
+Those are the only states where a count is real, and the only ones nothing else in the UI
+reports. If you already have a statusline, append pigeon's output to it — the command
+prints one line or nothing, so concatenating is safe:
+
+```bash
+#!/bin/bash
+input=$(cat)
+line=$(your-existing-statusline <<<"$input")
+alarm=$(pigeon statusline <<<"$input")
+printf '%s%s' "$line" "${alarm:+ $alarm}"
+```
+
+`--plain` drops the emoji and colour.
+
 ## Opting a session out
 
 Set `PIGEON=0` in its environment. Intended for programmatically driven sessions
@@ -126,6 +197,14 @@ how it started the session, so it declares it — pigeon does not try to infer i
 Claude Code plugins can declare background monitors that the host starts at session start,
 with no model involvement. Every line such a monitor prints to stdout is delivered to that
 session as a `<task_notification>`, which wakes it if idle.
+
+**This behaviour is shipped but undocumented.** That monitors are started at all, that
+`CLAUDE_CODE_SESSION_ID` is injected into them, and that their stdout becomes a
+notification are all observed, not promised — verified end to end against Claude Code
+2.1.217, and requiring 2.1.105 or newer for the session id. A future release could change
+any of it, and the failure would be silent. That is what `pigeon doctor` is for: it checks
+each assumption separately and warns when your Claude Code is newer than the version this
+was tested against.
 
 pigeon's monitor follows two kinds of source: the session's own inbox spool, and one log
 per subscribed topic. It identifies itself from `CLAUDE_CODE_SESSION_ID`, which Claude Code

@@ -6,30 +6,7 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
-### Added
-- `pigeon prune` now reclaims topic logs: a log nobody subscribes to is removed, and
-  the prefix every live subscriber has already read is compacted away. Followers
-  detect a replaced log and resume from their cursor rather than replaying it.
-- `pigeon ls` and the `list_sessions` tool say which row is the calling session, and
-  say so explicitly when the caller is not registered or is a plain shell.
-- Builds for Linux, macOS, FreeBSD, OpenBSD and Windows. File locking and process
-  liveness are behind a platform abstraction; on Windows the CLI works but the
-  monitor stands down, since Claude Code only arms plugin monitors on Unix.
-- GoReleaser configuration and a release workflow; CI now also cross-compiles every
-  supported target and validates the release config.
-- `skills/session-coordination`, an example Claude Code skill. Not installed by
-  `pigeon install` -- copy it to `~/.claude/skills/` deliberately.
-- `pigeon version` reports the commit and build date.
-- The generated plugin manifest carries author, homepage and licence, so
-  `claude plugin validate` is warning-free.
-
-### Fixed
-- A message from a shell is now marked as having no reply address. Saying nothing
-  was not enough: recipients read the `shell:user@host` stamp as an address and
-  wasted a call discovering it was not one.
-- `pigeon prune` left the entry lock and cursor file behind.
-
-## [0.1.0] - 2026-07-22
+## [0.1.0] - 2026-07-23
 
 First release.
 
@@ -49,6 +26,37 @@ First release.
 - Opt-out via `PIGEON=0` for programmatically driven sessions.
 - Overflow bodies spill to a payload file so notifications stay inside Claude Code's
   ~512-character clip.
+- `pigeon doctor` checks each link in the delivery chain separately -- session id,
+  state directory, plugin, monitor binary, MCP registration, this session's
+  registration -- and names the one that broke, rather than leaving "messages
+  stopped arriving" as the only symptom. Exits non-zero when delivery is broken, so
+  it works in a health check; `--json` for scripts. It warns when Claude Code is
+  newer than the version the mechanism was verified against, and catches the upgrade
+  trap where `go install` writes a new binary while the plugin keeps arming the old
+  one.
+- `pigeon statusline` renders a one-line alarm for a Claude Code statusline. A
+  healthy session renders nothing at all: a live monitor drains the spool within
+  about a second, so there is no standing unread count worth showing. The line
+  appears only when this session cannot receive -- `deaf`, with the number of
+  messages genuinely waiting, or `not armed`.
+- `pigeon prune` reclaims topic logs: a log nobody subscribes to is removed, and
+  the prefix every live subscriber has already read is compacted away. Followers
+  detect a replaced log and resume from their cursor rather than replaying it.
+- `pigeon ls` and the `list_sessions` tool say which row is the calling session, and
+  say so explicitly when the caller is not registered or is a plain shell.
+- Builds for Linux, macOS, FreeBSD, OpenBSD and Windows. File locking and process
+  liveness are behind a platform abstraction; on Windows the CLI works but the
+  monitor stands down, since Claude Code only arms plugin monitors on Unix.
+- GoReleaser configuration and a release workflow; CI cross-compiles every supported
+  target and validates the release config.
+- `skills/session-coordination`, an example Claude Code skill. Not installed by
+  `pigeon install` -- copy it to `~/.claude/skills/` deliberately.
+- `pigeon version` reports the commit and build date.
+- The generated plugin manifest carries author, homepage and licence, so
+  `claude plugin validate` is warning-free.
+- A message sent from a plain shell is marked as having no reply address. Saying
+  nothing is not enough: recipients read the `shell:user@host` stamp as an address
+  and waste a call discovering it is not one.
 
 [Unreleased]: https://github.com/PeterSR/claude-code-pigeon/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/PeterSR/claude-code-pigeon/releases/tag/v0.1.0

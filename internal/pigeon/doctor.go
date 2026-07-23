@@ -88,9 +88,40 @@ func Diagnose() []Check {
 	out = append(out, checkVersion())
 	out = append(out, checkState())
 	out = append(out, checkPlugin()...)
+	out = append(out, checkProjectConfig())
 	out = append(out, checkRegistration()...)
 	out = append(out, checkPeers())
 	return out
+}
+
+// checkProjectConfig makes a project's defaults visible. Without this, a
+// session named by a file in the checkout is a small mystery: nobody typed the
+// name, and nothing else reports where it came from.
+func checkProjectConfig() Check {
+	cwd := CurrentCwd()
+	cfg, problems, err := LoadProjectConfig(cwd)
+	switch {
+	case err != nil:
+		return warn("project config", err.Error(),
+			"fix or remove the file; sessions here fall back to no project defaults")
+	case len(problems) > 0:
+		return warn("project config", ProjectConfigPath(cwd)+": "+strings.Join(problems, "; "),
+			"the rejected fields are ignored; the rest still apply")
+	case cfg == nil:
+		return ok("project config", "none at "+ProjectConfigPath(cwd))
+	}
+
+	parts := make([]string, 0, 3)
+	if cfg.Name != "" {
+		parts = append(parts, "name="+cfg.Name)
+	}
+	if cfg.Description != "" {
+		parts = append(parts, "description set")
+	}
+	if len(cfg.Topics) > 0 {
+		parts = append(parts, "topics="+strings.Join(cfg.Topics, ","))
+	}
+	return ok("project config", ProjectConfigPath(cwd)+" ("+strings.Join(parts, ", ")+")")
 }
 
 // checkSession is first because nothing downstream can be interpreted without

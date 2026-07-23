@@ -6,6 +6,23 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- Project defaults in `.claude/pigeon.json`: a checkout can declare the `name`,
+  `description` and `topics` that sessions started in it come up with, so a team
+  shares one wiring by committing a file. The config seeds a session's first
+  registration only, leaving `pigeon name`, `describe` and `unsubscribe`
+  authoritative afterwards, and it never takes a name another live session already
+  holds. `pigeon doctor` reports which config was found and what it applied.
+
+  The file arrives with a `git clone`, so it is treated as untrusted: a name that is
+  not a valid address is rejected rather than sanitised, the description is flattened
+  and bounded, topics are validated and capped, and the read itself is size-limited.
+  A rejected field is dropped and reported rather than failing the whole file.
+
+### Fixed
+- Re-registering a session no longer fast-forwards its topic cursors. A monitor
+  restart could skip everything published to a subscribed topic while it was down.
+
 ## [0.1.0] - 2026-07-23
 
 First release.

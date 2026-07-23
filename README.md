@@ -86,6 +86,42 @@ Sender identity is attached automatically. A session never has to know its own a
 replies to work; a message from a plain shell is stamped `shell:user@host` and carries no
 reply handle, because there is nowhere to reply to.
 
+### Project defaults
+
+A project can declare what sessions started in it should look like, in
+`.claude/pigeon.json`:
+
+```json
+{
+  "name": "api",
+  "description": "the payments service",
+  "topics": ["deploys", "ci"]
+}
+```
+
+A session opened in that checkout comes up already named `api`, already described, and
+already listening to `#deploys` and `#ci` alongside the default `#all`. Commit the file
+and everyone working on the repo gets the same wiring without configuring anything.
+
+Two rules make it predictable:
+
+- **The config seeds a session; it does not own it.** It is read only at a session's
+  first registration. After that `pigeon name`, `pigeon describe` and
+  `pigeon unsubscribe` are authoritative, so your own choices are not undone the next
+  time a monitor starts for that session.
+- **A taken name is not stolen.** A name is an address, so if another live session
+  already holds it the new session stays unnamed rather than making replies ambiguous.
+  It is still reachable by session id, and the monitor log says what happened.
+
+`pigeon doctor` reports which config was found and what it applied, so a session named
+by a file in the repo is never a mystery.
+
+Because the file arrives with a `git clone`, every field in it is validated exactly as
+strictly as one typed at the CLI: a name that is not a valid address is rejected rather
+than sanitised, the description is flattened and bounded, topic names are checked, and
+the topic count is capped. One bad field is dropped and reported; it does not cost you
+the rest of the file.
+
 ### Topics
 
 Every session joins `all` by default, so `pigeon publish all "…"` broadcasts to the

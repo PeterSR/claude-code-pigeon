@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -87,7 +88,7 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	}
 	defer lock.Close()
 
-	if err := register(sid); err != nil {
+	if err := register(sid, logf); err != nil {
 		logf("registration failed: %v", err)
 	}
 
@@ -212,20 +213,41 @@ func manageSubscriptions(sid string, out chan<- *Message, done <-chan struct{}, 
 	}
 }
 
-func register(sid string) error {
+func register(sid string, logf func(string, ...any)) error {
 	pid := CurrentClaudePID()
+	cwd := CurrentCwd()
+
 	// Preserve identity and subscriptions declared earlier in this session.
 	var name, desc string
 	var subs []string
-	if prev, err := ReadEntry(sid); err == nil {
+	prev, err := ReadEntry(sid)
+	if err == nil {
 		name, desc, subs = prev.Name, prev.Description, prev.Subscriptions
+	} else {
+		// Only a session's *first* registration reads the project config.
+		// After that the session's own declarations are authoritative, so a
+		// `pigeon name` or `pigeon unsubscribe` is not quietly undone the next
+		// time a monitor starts for the same id.
+		name, desc, subs = applyProjectConfig(sid, cwd, logf)
 	}
+
 	// Everyone gets the public mailbox by default, so a broadcast reaches the
 	// machine without anyone configuring anything.
 	if subs == nil {
 		subs = []string{PublicTopic}
-		_ = seedCursor(sid, PublicTopic)
 	}
+	// Seed a cursor only for a topic we have never followed, so a new
+	// subscription starts at the end of its log rather than replaying history
+	// as a burst of notifications. Re-seeding an existing one would throw away
+	// the session's read position on every monitor restart, silently skipping
+	// whatever was published while it was down.
+	existing := readCursors(sid)
+	for _, t := range subs {
+		if _, seen := existing[t]; !seen {
+			_ = seedCursor(sid, t)
+		}
+	}
+
 	now := nowRFC3339()
 	return WriteEntry(&Entry{
 		SessionID:     sid,
@@ -233,7 +255,7 @@ func register(sid string) error {
 		Description:   desc,
 		PID:           pid,
 		ProcStart:     ProcStart(pid),
-		Cwd:           CurrentCwd(),
+		Cwd:           cwd,
 		Host:          hostname(),
 		StartedAt:     now,
 		HeartbeatAt:   now,
@@ -241,6 +263,46 @@ func register(sid string) error {
 		CCVersion:     os.Getenv(EnvVersion),
 		Driven:        os.Getenv(EnvChild) == "1",
 	})
+}
+
+// applyProjectConfig seeds a brand-new session's identity from the project it
+// started in. Everything it returns has already been validated by
+// LoadProjectConfig; what is decided here is what to do when the config asks
+// for something this machine cannot give it.
+func applyProjectConfig(sid, cwd string, logf func(string, ...any)) (name, desc string, subs []string) {
+	subs = []string{PublicTopic}
+
+	cfg, problems, err := LoadProjectConfig(cwd)
+	for _, p := range problems {
+		logf("project config: %s", p)
+	}
+	if err != nil {
+		logf("project config: %v", err)
+		return "", "", subs
+	}
+	if cfg == nil {
+		return "", "", subs
+	}
+
+	// A name is an address, so two sessions must never answer to it. Leaving
+	// the second one unnamed is the honest outcome: it is still reachable by
+	// id, and nobody is misrouted. Silently suffixing would invent an address
+	// the project never declared.
+	switch {
+	case cfg.Name == "":
+	case NameTaken(cfg.Name, sid):
+		logf("project config: name %q is already taken by a live session; staying unnamed", cfg.Name)
+	default:
+		name = cfg.Name
+	}
+
+	desc = cfg.Description
+	subs = append(subs, cfg.Topics...)
+	sort.Strings(subs)
+
+	logf("project config: %s applied (name=%q topics=%v)",
+		ProjectConfigPath(cwd), name, subs)
+	return name, desc, subs
 }
 
 func hostname() string {

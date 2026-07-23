@@ -18,6 +18,36 @@ All notable changes to this project are documented here. Format follows
   not a valid address is rejected rather than sanitised, the description is flattened
   and bounded, topics are validated and capped, and the read itself is size-limited.
   A rejected field is dropped and reported rather than failing the whole file.
+- `name`, `description` and the new `onNameTaken` in `.claude/pigeon.json` are Go
+  `text/template` source, rendered per session, so a checkout can declare what its
+  sessions should be called rather than what one of them is called. A string with no
+  `{{` is still a literal. The context is `.Cwd`, `.Dir`, `.Branch` (read straight from
+  `.git/HEAD`, handling a detached HEAD and a `.git` file), `.Host`, `.User`,
+  `.Session`, `.Short` and `.Seq`, plus `snake`, `kebab`, `lower`, `upper`, `trunc` and
+  `default`. `onNameTaken` is tried exactly once when the rendered name is already held
+  by a live session, so `{{.Name}}-{{.Seq}}` brings the second session in a checkout up
+  as `api-2`; a fallback that is also taken leaves the session unnamed and says why,
+  rather than hunting for a free name nobody declared.
+
+  The templates get the same treatment as the rest of the file, because a name is
+  rendered into other sessions' notification lines: the source is length-bounded before
+  parsing, execution writes into a bounded buffer so no template can produce unbounded
+  output, and a rendered name is validated and rejected rather than repaired. A broken
+  template is a reported problem, never a failed registration.
+- `pigeon name --template` and `pigeon describe --template`, and `nameTemplate` /
+  `descriptionTemplate` on the MCP `set_identity` tool, rendering the same context. A
+  rendered name that another live session holds is refused, and the message names the
+  value that collided rather than the template.
+- `"enabled": false` in a project config keeps sessions started in that checkout off the
+  bus entirely, as `PIGEON=0` does for one session. The environment outranks the file in
+  both directions.
+- `"private": true` registers the session and leaves it addressable, but publishes no
+  cwd and no description, so neither reaches another session's listing or notification
+  lines. It is enforced on every write to the registry entry rather than only at
+  startup, and a private session's outgoing messages carry no directory either.
+- `pigeon doctor` reports the project config's *rendered* values, since with templates
+  the file no longer contains them, along with any template problem, whether the project
+  is private, and whether it has taken itself off the bus.
 
 ### Fixed
 - Re-registering a session no longer fast-forwards its topic cursors. A monitor

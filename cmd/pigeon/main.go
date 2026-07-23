@@ -47,8 +47,8 @@ const usage = `pigeon -- message passing between live Claude Code sessions
   pigeon unsubscribe <topic>     stop receiving it
   pigeon topics                  list topics and subscriber counts
   pigeon whoami                  show this session's identity and address
-  pigeon name <name>             declare this session's name (usable as address)
-  pigeon describe <text>         declare what this session is working on
+  pigeon name [<name>]           declare this session's name (usable as address)
+  pigeon describe [<text>]       declare what this session is working on
   pigeon doctor [--json]         check whether this session can receive mail
   pigeon statusline [--plain]    one-line status for a Claude Code statusline
   pigeon prune                   forget dead sessions and reclaim topic logs
@@ -56,7 +56,10 @@ const usage = `pigeon -- message passing between live Claude Code sessions
   pigeon mcp                     run the MCP server (used by the plugin)
   pigeon version
 
-Targets resolve as: exact session id, declared name, id prefix, cwd basename.`
+Targets resolve as: exact session id, declared name, id prefix, cwd basename.
+
+name and describe also take --template '{{.Dir}}-{{.Seq}}', rendered against
+this session. See the README for every field and function.`
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
@@ -94,9 +97,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "whoami":
 		err = cmdWhoami(stdout)
 	case "name":
-		err = cmdName(rest, stdout)
+		err = cmdName(rest, stdout, stderr)
 	case "describe":
-		err = cmdDescribe(rest, stdout)
+		err = cmdDescribe(rest, stdout, stderr)
 	case "doctor":
 		err = cmdDoctor(rest, stdout, stderr)
 	case "statusline":
@@ -348,24 +351,53 @@ func cmdWhoami(w io.Writer) error {
 	fmt.Fprintf(w, "status:       %s\n", e.Status)
 	fmt.Fprintf(w, "topics:       %s\n", dash(strings.Join(e.Subscriptions, ", ")))
 	fmt.Fprintf(w, "inbox:        %s\n", pigeon.SpoolPath(e.SessionID))
+	if e.Private {
+		// The blank cwd and description above are a deliberate policy, not a
+		// failure to register properly. Say which.
+		fmt.Fprintln(w, "private:      this project publishes no cwd or description")
+	}
 	fmt.Fprintf(w, "\nothers reach you with:  pigeon send %s \"...\"\n", e.Addr())
 	return nil
 }
 
-func cmdName(args []string, w io.Writer) error {
+func cmdName(args []string, w, stderr io.Writer) error {
+	fs := flags("name", stderr)
+	tmpl := fs.String("template", "", "render the name from a Go text/template (see README)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+
 	e, err := ownEntry()
 	if err != nil {
 		return err
 	}
-	if len(args) == 0 {
+	if *tmpl == "" && len(rest) == 0 {
 		fmt.Fprintln(w, dash(e.Name))
 		return nil
 	}
-	name := strings.TrimSpace(strings.Join(args, " "))
+
+	name := strings.TrimSpace(strings.Join(rest, " "))
+	if *tmpl != "" {
+		if name != "" {
+			return fmt.Errorf("give either a name or --template, not both")
+		}
+		// Rendered names are validated, never repaired: a template that
+		// produces something unusable must not hand this session an address
+		// nobody declared.
+		if name, err = pigeon.RenderName(*tmpl, e.SessionID, pigeon.CurrentCwd()); err != nil {
+			return fmt.Errorf("--template: %w", err)
+		}
+	}
 	if err := pigeon.ValidName(name); err != nil {
 		return err
 	}
 	if pigeon.NameTaken(name, e.SessionID) {
+		// Which name collided is the useful part when a template produced it,
+		// since the template itself is not what is taken.
+		if *tmpl != "" {
+			return fmt.Errorf("the template rendered %q, which another live session already uses", name)
+		}
 		return fmt.Errorf("another live session already uses the name %q", name)
 	}
 	if err := pigeon.MutateEntry(e.SessionID, func(en *pigeon.Entry) error {
@@ -378,16 +410,32 @@ func cmdName(args []string, w io.Writer) error {
 	return nil
 }
 
-func cmdDescribe(args []string, w io.Writer) error {
+func cmdDescribe(args []string, w, stderr io.Writer) error {
+	fs := flags("describe", stderr)
+	tmpl := fs.String("template", "", "render the description from a Go text/template (see README)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+
 	e, err := ownEntry()
 	if err != nil {
 		return err
 	}
-	if len(args) == 0 {
+	if *tmpl == "" && len(rest) == 0 {
 		fmt.Fprintln(w, dash(e.Description))
 		return nil
 	}
-	desc := pigeon.Sanitize(strings.Join(args, " "))
+
+	desc := pigeon.Sanitize(strings.Join(rest, " "))
+	if *tmpl != "" {
+		if desc != "" {
+			return fmt.Errorf("give either a description or --template, not both")
+		}
+		if desc, err = pigeon.RenderDescription(*tmpl, e.SessionID, pigeon.CurrentCwd()); err != nil {
+			return fmt.Errorf("--template: %w", err)
+		}
+	}
 	if err := pigeon.MutateEntry(e.SessionID, func(en *pigeon.Entry) error {
 		en.Description = desc
 		return nil
@@ -395,6 +443,10 @@ func cmdDescribe(args []string, w io.Writer) error {
 		return err
 	}
 	fmt.Fprintln(w, "description updated")
+	if e.Private {
+		// Saying nothing would leave you believing peers can see it.
+		fmt.Fprintln(w, "this project is marked private, so the description is not published to other sessions")
+	}
 	return nil
 }
 

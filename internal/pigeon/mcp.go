@@ -138,7 +138,13 @@ func tools() []toolDef {
 			Name: "set_identity",
 			Description: "Declare this session's name and/or description so other sessions " +
 				"can find and address it. The name must be a single word and unique among " +
-				"live sessions; it then works as an address.",
+				"live sessions; it then works as an address. Instead of a literal, either " +
+				"field can be given as a Go text/template rendered against this session: " +
+				"{{.Dir}} the working directory's basename, {{.Cwd}} its full path, " +
+				"{{.Branch}} the checked-out git branch, {{.Host}}, {{.User}}, {{.Session}}, " +
+				"{{.Short}} the 8-character session id, and {{.Seq}}, which counts this " +
+				"session among those already in the same directory. Functions: snake, kebab, " +
+				"lower, upper, trunc N, default \"fallback\".",
 			InputSchema: obj(map[string]any{
 				"type": "object",
 				"properties": obj(map[string]any{
@@ -149,6 +155,18 @@ func tools() []toolDef {
 					"description": obj(map[string]any{
 						"type":        "string",
 						"description": "What this session is working on.",
+					}),
+					"nameTemplate": obj(map[string]any{
+						"type": "string",
+						"description": "Template for the name, e.g. \"{{.Dir}}-{{.Seq}}\". " +
+							"Rejected if it renders to something that is not a valid name. " +
+							"Give this or 'name', not both.",
+					}),
+					"descriptionTemplate": obj(map[string]any{
+						"type": "string",
+						"description": "Template for the description, e.g. " +
+							"\"{{.Dir}} on {{.Branch | default \\\"no branch\\\"}}\". " +
+							"Give this or 'description', not both.",
 					}),
 				}),
 			}),
@@ -273,11 +291,13 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		return mcpWhoami()
 	case "set_identity":
 		var a struct {
-			Name        string `json:"name"`
-			Description string `json:"description"`
+			Name                string `json:"name"`
+			Description         string `json:"description"`
+			NameTemplate        string `json:"nameTemplate"`
+			DescriptionTemplate string `json:"descriptionTemplate"`
 		}
 		_ = json.Unmarshal(raw, &a)
-		return mcpSetIdentity(a.Name, a.Description)
+		return mcpSetIdentity(a.Name, a.Description, a.NameTemplate, a.DescriptionTemplate)
 	}
 	return "", fmt.Errorf("unknown tool %q", name)
 }
@@ -439,11 +459,17 @@ func mcpWhoami() (string, error) {
 	fmt.Fprintf(&b, "cwd:         %s\n", e.Cwd)
 	fmt.Fprintf(&b, "status:      %s\n", e.Status)
 	fmt.Fprintf(&b, "topics:      %s\n", orDash(strings.Join(e.Subscriptions, ", ")))
+	if e.Private {
+		// The blank cwd and description above are a deliberate policy rather
+		// than a half-finished registration. Say which, or the model will try
+		// to fix it.
+		b.WriteString("private:     this project publishes no cwd or description\n")
+	}
 	fmt.Fprintf(&b, "\nOther sessions reach this one with: pigeon send %s \"...\"", e.Addr())
 	return b.String(), nil
 }
 
-func mcpSetIdentity(name, desc string) (string, error) {
+func mcpSetIdentity(name, desc, nameTmpl, descTmpl string) (string, error) {
 	sid := CurrentSessionID()
 	if sid == "" {
 		return "", fmt.Errorf("not running inside a Claude Code session")
@@ -452,6 +478,28 @@ func mcpSetIdentity(name, desc string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("this session is not registered; install the plugin and restart")
 	}
+
+	// A template and a literal for the same field is an ambiguity the caller
+	// has to settle, not one to guess at: picking either would give a name
+	// nobody asked for.
+	cwd := CurrentCwd()
+	if nameTmpl != "" {
+		if name != "" {
+			return "", fmt.Errorf("give either 'name' or 'nameTemplate', not both")
+		}
+		if name, err = RenderName(nameTmpl, sid, cwd); err != nil {
+			return "", fmt.Errorf("nameTemplate: %w", err)
+		}
+	}
+	if descTmpl != "" {
+		if desc != "" {
+			return "", fmt.Errorf("give either 'description' or 'descriptionTemplate', not both")
+		}
+		if desc, err = RenderDescription(descTmpl, sid, cwd); err != nil {
+			return "", fmt.Errorf("descriptionTemplate: %w", err)
+		}
+	}
+
 	if name != "" {
 		name = strings.TrimSpace(name)
 		if err := ValidName(name); err != nil {
@@ -476,7 +524,13 @@ func mcpSetIdentity(name, desc string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("Identity updated. Other sessions can now reach this one with: pigeon send %s \"...\"", e.Addr()), nil
+	out := fmt.Sprintf("Identity updated. Other sessions can now reach this one with: pigeon send %s \"...\"", e.Addr())
+	if e.Private && desc != "" {
+		// Silently dropping it would leave the model believing peers can see
+		// what this session is working on.
+		out += " This project is marked private, so the description is not published to other sessions."
+	}
+	return out, nil
 }
 
 func orDash(s string) string {

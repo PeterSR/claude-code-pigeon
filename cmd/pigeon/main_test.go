@@ -362,6 +362,90 @@ func TestNameRejectsOneAlreadyTaken(t *testing.T) {
 	wantContains(t, r, "stderr", "already uses the name")
 }
 
+func TestNameFromATemplate(t *testing.T) {
+	withHome(t)
+	t.Setenv(pigeon.EnvProjectDir, "/home/p/api")
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "")
+
+	if r := invoke(t, "name", "--template", "{{.Dir}}-{{.Seq}}"); r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	if r := invoke(t, "name"); !strings.Contains(r.stdout, "api-1") {
+		t.Errorf("name readback: %s", r)
+	}
+	// A template renders to a name or to nothing; it never renders to an
+	// address this session may not answer to.
+	r := invoke(t, "name", "--template", "{{.Cwd}}")
+	if r.code != 1 {
+		t.Errorf("accepted a rendered path as a name: %s", r)
+	}
+	wantContains(t, r, "stderr", "invalid name")
+
+	if r := invoke(t, "name", "--template", "{{.Dir}}", "literal"); r.code != 1 {
+		t.Errorf("accepted a template and a literal together: %s", r)
+	}
+}
+
+// A collision has to name the value that collided, since the template itself
+// is not the thing another session is holding.
+func TestNameTemplateReportsACollision(t *testing.T) {
+	withHome(t)
+	t.Setenv(pigeon.EnvProjectDir, "/home/p/api")
+	register(t, "bbbb2222-0000-0000-0000-000000000000", "api")
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "")
+
+	r := invoke(t, "name", "--template", "{{.Dir}}")
+	if r.code != 1 {
+		t.Fatalf("a taken name was stolen: %s", r)
+	}
+	wantContains(t, r, "stderr", `the template rendered "api"`)
+}
+
+func TestDescribeFromATemplate(t *testing.T) {
+	withHome(t)
+	t.Setenv(pigeon.EnvProjectDir, "/home/p/api")
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+
+	if r := invoke(t, "describe", "--template", `{{.Dir}} on {{.Branch | default "no branch"}}`); r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	if r := invoke(t, "describe"); !strings.Contains(r.stdout, "api on no branch") {
+		t.Errorf("describe readback: %s", r)
+	}
+	if r := invoke(t, "describe", "--template", "{{.Nope}}"); r.code != 1 {
+		t.Errorf("a broken template was accepted: %s", r)
+	}
+	if r := invoke(t, "describe", "--template", "{{.Dir}}", "literal"); r.code != 1 {
+		t.Errorf("accepted a template and a literal together: %s", r)
+	}
+	if r := invoke(t, "describe", "--nonsense"); r.code != 1 {
+		t.Errorf("a bad flag did not surface as an error: %s", r)
+	}
+}
+
+// A private session's blank cwd and description are a deliberate policy, not a
+// half-finished registration. Both commands that would otherwise look broken
+// have to say which.
+func TestPrivateSessionSaysWhyItsFieldsAreBlank(t *testing.T) {
+	withHome(t)
+	e := asSession(t, "aaaa1111-0000-0000-0000-000000000000", "client")
+	e.Private = true
+	if err := pigeon.WriteEntry(e); err != nil {
+		t.Fatalf("WriteEntry: %v", err)
+	}
+
+	wantContains(t, invoke(t, "whoami"), "stdout", "private:")
+	r := invoke(t, "describe", "the acquisition")
+	wantContains(t, r, "stdout", "not published to other sessions")
+	stored, err := pigeon.ReadEntry(e.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Description != "" {
+		t.Errorf("description = %q, want it withheld", stored.Description)
+	}
+}
+
 func TestDescribeStoresSanitisedText(t *testing.T) {
 	withHome(t)
 	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")

@@ -416,6 +416,54 @@ func TestMonitorStandsDownWhenOptedOut(t *testing.T) {
 	}
 }
 
+// A project can take its own sessions off the bus, and it has to work the same
+// way PIGEON=0 does: no entry, so nothing tries to message a session that
+// deliberately is not there.
+func TestMonitorStandsDownWhenTheProjectIsDisabled(t *testing.T) {
+	withHome(t)
+	const sid = "mon-disabled-1"
+	dir := writeProjectConfig(t, `{"name": "api", "enabled": false}`)
+	t.Setenv(EnvSessionID, sid)
+	t.Setenv(EnvOptOut, "")
+	t.Setenv(EnvProjectDir, dir)
+
+	stderr := &syncWriter{}
+	go func() { _ = RunMonitor(&syncWriter{}, stderr) }()
+
+	eventually(t, 5*time.Second, "the project opt-out notice", func() bool {
+		return stderr.has("disabled by " + ProjectConfigPath(dir))
+	})
+	if _, err := ReadEntry(sid); err == nil {
+		t.Error("a disabled project registered a session, so peers would try to message it")
+	}
+}
+
+// The launcher knows how it started the session; the config arrived with a
+// clone. So an explicit PIGEON=1 keeps this session on the bus anyway.
+func TestEnvOptInOverridesADisabledProject(t *testing.T) {
+	withHome(t)
+	const sid = "mon-override-1"
+	dir := writeProjectConfig(t, `{"name": "api", "enabled": false}`)
+	t.Setenv(EnvSessionID, sid)
+	t.Setenv(EnvProjectDir, dir)
+	t.Setenv(EnvClaudePID, strconv.Itoa(os.Getpid()))
+	// Deliberately not startMonitor: it clears the opt-out variable, which is
+	// the whole subject of this test.
+	t.Setenv(EnvOptOut, "1")
+
+	m := &monitor{sid: sid, stdout: &syncWriter{}, stderr: &syncWriter{}, exited: make(chan error, 1)}
+	go func() { m.exited <- RunMonitor(m.stdout, m.stderr) }()
+	t.Cleanup(func() { m.stop(t) })
+
+	eventually(t, 5*time.Second, "the session to register anyway", func() bool {
+		_, err := ReadEntry(sid)
+		return err == nil
+	})
+	if m.stderr.has("standing down") {
+		t.Errorf("the monitor stood down despite %s=1:\n%s", EnvOptOut, m.stderr.String())
+	}
+}
+
 func TestSecondMonitorStandsDownRatherThanDoubleDeliver(t *testing.T) {
 	withHome(t)
 	const sid = "mon-second-1"

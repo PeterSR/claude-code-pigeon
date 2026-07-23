@@ -72,8 +72,8 @@ pigeon publish <topic> <text>   publish to everyone subscribed
 pigeon subscribe <topic>        join a topic (takes effect in ~1s, no restart)
 pigeon unsubscribe <topic>
 pigeon topics                   topics and subscriber counts
-pigeon name <name>              declare a name, usable as an address
-pigeon describe <text>          declare what this session is working on
+pigeon name [<name>]            declare a name, usable as an address
+pigeon describe [<text>]        declare what this session is working on
 pigeon whoami                   this session's identity and address
 pigeon doctor [--json]          check whether this session can receive mail
 pigeon statusline [--plain]     one-line alarm for a Claude Code statusline
@@ -85,6 +85,10 @@ Targets resolve as **exact session id → declared name → id prefix → cwd ba
 Sender identity is attached automatically. A session never has to know its own address for
 replies to work; a message from a plain shell is stamped `shell:user@host` and carries no
 reply handle, because there is nowhere to reply to.
+
+`name` and `describe` also take `--template '{{.Dir}}-{{.Seq}}'`, rendered against this
+session. The fields and functions are the ones in [Project defaults](#project-defaults)
+below.
 
 ### Project defaults
 
@@ -113,14 +117,96 @@ Two rules make it predictable:
   already holds it the new session stays unnamed rather than making replies ambiguous.
   It is still reachable by session id, and the monitor log says what happened.
 
-`pigeon doctor` reports which config was found and what it applied, so a session named
-by a file in the repo is never a mystery.
+#### Naming a session after what it is
+
+The useful defaults are the ones a committed file cannot know: which directory, which
+branch, how many sessions are already open here. So `name`, `description` and
+`onNameTaken` are Go [`text/template`](https://pkg.go.dev/text/template) source, rendered
+per session:
+
+```json
+{
+  "name": "{{.Dir | kebab}}",
+  "onNameTaken": "{{.Name}}-{{.Seq}}",
+  "description": "{{.Dir}} on {{.Branch | default \"no branch\"}}",
+  "topics": ["deploys", "ci"]
+}
+```
+
+A string with no `{{` is a literal, so plain `"name": "api"` keeps working and nothing
+has to be escaped.
+
+| Field | What it is |
+|---|---|
+| `.Cwd` | full path of the project directory |
+| `.Dir` | its basename |
+| `.Branch` | the checked-out branch, read straight from `.git/HEAD`. A detached HEAD gives the short commit; anywhere that is not a repository gives `""` |
+| `.Host` | hostname |
+| `.User` | login name |
+| `.Session` | full session id |
+| `.Short` | its first 8 characters, the form `pigeon ls` shows |
+| `.Seq` | 1 plus the number of live sessions already in this directory |
+| `.Name` | in `onNameTaken` only: the name that was already taken |
+
+| Function | What it does |
+|---|---|
+| `snake` | lowercases, and turns every run of anything that is not a letter or digit into `_` |
+| `kebab` | the same, with `-` |
+| `lower`, `upper` | case |
+| `trunc N` | keep the first N characters: `{{.Dir \| trunc 8}}` |
+| `default "x"` | `x` when the value is empty |
+
+`snake` and `kebab` exist because a real branch is not a real address: `feature/API v2`
+has to become `feature-api-v2` before anything can be sent to it.
+
+`onNameTaken` is tried **once**, and only when the rendered name is already held by
+another live session. If it is absent, fails to render, or renders to a name that is also
+taken, the session stays unnamed and the monitor log says why. There is no loop that hunts
+for a free name, because the name it eventually found would be an address nobody declared.
+With `{{.Name}}-{{.Seq}}` the second session in a checkout comes up as `api-2`, which is
+the case the field exists for.
+
+#### Keeping a project quiet
+
+```json
+{ "enabled": false }
+```
+
+Sessions started in this checkout stay off the bus entirely, the same as setting
+`PIGEON=0` in their environment. The environment still wins in both directions: `PIGEON=1`
+keeps a session addressable in a project that disables itself, and `PIGEON=0` still opts
+one out of a project that does not.
+
+```json
+{ "private": true }
+```
+
+The session registers and stays addressable by name and session id, but its working
+directory and description are never published. Neither appears in another session's
+`pigeon ls`, in `list_sessions`, or in the notification line a message from it produces.
+Intended for client work you would rather not have surfaced in an unrelated window. The
+withholding is enforced on every write to the entry, not just at startup, so a later
+`pigeon describe` does not quietly undo it. One consequence worth knowing: `.Seq` counts
+sessions by working directory, so it cannot see private ones.
+
+`pigeon doctor` reports which config was found and what it applied. It reports the
+*rendered* values, since with templates the file no longer contains them, so a session
+named by a file in the repo is never a mystery.
 
 Because the file arrives with a `git clone`, every field in it is validated exactly as
 strictly as one typed at the CLI: a name that is not a valid address is rejected rather
 than sanitised, the description is flattened and bounded, topic names are checked, and
 the topic count is capped. One bad field is dropped and reported; it does not cost you
 the rest of the file.
+
+That applies to the templates too, which are a hostile repository's most obvious lever:
+a name and description are rendered into *other* sessions' notification lines. The source
+is length-bounded before it is parsed, execution writes into a bounded buffer so no
+template can produce unbounded output, and the rendered name is put through the same
+validation a typed one is, and rejected rather than repaired. A template that fails to
+parse, fails to render, or renders to something unusable is a reported problem and never a
+failed registration: the session still comes up, unnamed, and the monitor log says what
+happened.
 
 ### Topics
 
@@ -133,7 +219,8 @@ else's messages. Subscribing starts from now — history is not replayed into yo
 
 The plugin exposes `list_sessions`, `send_message`, `publish`, `subscribe`,
 `unsubscribe`, `list_topics`, `whoami` and `set_identity`, so a session can do all of this
-itself.
+itself. `set_identity` takes `nameTemplate` and `descriptionTemplate` alongside the literal
+fields, with the same context and functions as the project config.
 
 ### An example skill
 
@@ -227,6 +314,10 @@ printf '%s%s' "$line" "${alarm:+ $alarm}"
 Set `PIGEON=0` in its environment. Intended for programmatically driven sessions
 (claude-p, pupptyeer, CI) where a driver already owns the conversation. The launcher knows
 how it started the session, so it declares it — pigeon does not try to infer it.
+
+A whole project can opt out with `"enabled": false` in its `.claude/pigeon.json`. The
+environment outranks the file, since a launcher knows more about how a session started
+than a file that arrived with a clone does.
 
 ## How it works
 

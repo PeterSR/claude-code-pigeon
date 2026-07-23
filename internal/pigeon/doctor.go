@@ -97,31 +97,54 @@ func Diagnose() []Check {
 // checkProjectConfig makes a project's defaults visible. Without this, a
 // session named by a file in the checkout is a small mystery: nobody typed the
 // name, and nothing else reports where it came from.
+//
+// It reports the *rendered* values rather than the file's text, because with
+// templates the file no longer says what a session gets. Rendering goes
+// through the same Resolve a starting monitor uses, so this cannot drift into
+// a second, more optimistic implementation of the same rules.
 func checkProjectConfig() Check {
 	cwd := CurrentCwd()
+	path := ProjectConfigPath(cwd)
 	cfg, problems, err := LoadProjectConfig(cwd)
-	switch {
-	case err != nil:
+	if err != nil {
 		return warn("project config", err.Error(),
 			"fix or remove the file; sessions here fall back to no project defaults")
-	case len(problems) > 0:
-		return warn("project config", ProjectConfigPath(cwd)+": "+strings.Join(problems, "; "),
-			"the rejected fields are ignored; the rest still apply")
-	case cfg == nil:
-		return ok("project config", "none at "+ProjectConfigPath(cwd))
+	}
+	if cfg == nil && len(problems) == 0 {
+		return ok("project config", "none at "+path)
 	}
 
-	parts := make([]string, 0, 3)
-	if cfg.Name != "" {
-		parts = append(parts, "name="+cfg.Name)
+	if !cfg.IsEnabled() {
+		if optOutSet() {
+			return warn("project config",
+				fmt.Sprintf("%s: \"enabled\": false, overridden by %s=%s", path, EnvOptOut, os.Getenv(EnvOptOut)),
+				"the environment wins, so this session does take part")
+		}
+		return warn("project config", path+`: "enabled": false, so sessions started here stay off the bus`,
+			"remove the field, or set "+EnvOptOut+"=1 in this session's environment to override it")
 	}
-	if cfg.Description != "" {
+
+	res := cfg.Resolve(CurrentSessionID(), cwd)
+	problems = append(problems, res.Problems...)
+	if len(problems) > 0 {
+		return warn("project config", path+": "+strings.Join(problems, "; "),
+			"the rejected fields are ignored; the rest still apply")
+	}
+
+	parts := make([]string, 0, 4)
+	if res.Name != "" {
+		parts = append(parts, "name="+res.Name)
+	}
+	if res.Description != "" {
 		parts = append(parts, "description set")
 	}
-	if len(cfg.Topics) > 0 {
-		parts = append(parts, "topics="+strings.Join(cfg.Topics, ","))
+	if len(res.Topics) > 0 {
+		parts = append(parts, "topics="+strings.Join(res.Topics, ","))
 	}
-	return ok("project config", ProjectConfigPath(cwd)+" ("+strings.Join(parts, ", ")+")")
+	if res.Private {
+		parts = append(parts, "private: cwd and description are not published")
+	}
+	return ok("project config", path+" ("+strings.Join(parts, ", ")+")")
 }
 
 // checkSession is first because nothing downstream can be interpreted without

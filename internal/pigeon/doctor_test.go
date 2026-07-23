@@ -428,6 +428,68 @@ func TestDoctorJSONIsMachineReadable(t *testing.T) {
 	}
 }
 
+// --- project config --------------------------------------------------------
+
+// A session named by a file in the checkout is otherwise a small mystery:
+// nobody typed the name, and with templates the file does not even contain it.
+func TestDoctorReportsTheRenderedProjectConfig(t *testing.T) {
+	withHome(t)
+	dir := writeProjectConfig(t, `{"name": "{{.Dir | kebab}}-{{.Seq}}", "topics": ["ci"], "private": true}`)
+	t.Setenv(EnvProjectDir, dir)
+	t.Setenv(EnvSessionID, "aaaa1111")
+
+	got := findCheck(t, Diagnose(), "project config")
+	if got.Level != CheckOK {
+		t.Fatalf("level = %v: %+v", got.Level, got)
+	}
+	want := "name=" + fold(filepath.Base(dir), '-') + "-1"
+	if !strings.Contains(got.Detail, want) {
+		t.Errorf("detail %q does not report the rendered %q", got.Detail, want)
+	}
+	for _, s := range []string{"topics=ci", "private"} {
+		if !strings.Contains(got.Detail, s) {
+			t.Errorf("detail %q is missing %q", got.Detail, s)
+		}
+	}
+}
+
+func TestDoctorReportsTemplateProblems(t *testing.T) {
+	withHome(t)
+	// The name renders to a path, which is not an address. doctor is where you
+	// find that out, rather than by starting a session and seeing what happens.
+	dir := writeProjectConfig(t, `{"name": "{{.Cwd}}"}`)
+	t.Setenv(EnvProjectDir, dir)
+	t.Setenv(EnvSessionID, "aaaa1111")
+
+	got := findCheck(t, Diagnose(), "project config")
+	if got.Level != CheckWarn {
+		t.Fatalf("level = %v, want warn: %+v", got.Level, got)
+	}
+	if !strings.Contains(got.Detail, "invalid name") {
+		t.Errorf("detail %q does not name the problem", got.Detail)
+	}
+}
+
+func TestDoctorReportsADisabledProject(t *testing.T) {
+	withHome(t)
+	dir := writeProjectConfig(t, `{"enabled": false}`)
+	t.Setenv(EnvProjectDir, dir)
+	t.Setenv(EnvOptOut, "")
+
+	got := findCheck(t, Diagnose(), "project config")
+	if got.Level != CheckWarn || !strings.Contains(got.Detail, "stay off the bus") {
+		t.Errorf("a disabled project was not reported: %+v", got)
+	}
+
+	// When the environment overrides it, say which one is actually in force
+	// rather than repeating what the file asked for.
+	t.Setenv(EnvOptOut, "1")
+	got = findCheck(t, Diagnose(), "project config")
+	if !strings.Contains(got.Detail, "overridden by "+EnvOptOut) {
+		t.Errorf("the override was not reported: %+v", got)
+	}
+}
+
 func TestCheckLevelString(t *testing.T) {
 	cases := map[CheckLevel]string{CheckOK: "ok", CheckWarn: "warn", CheckFail: "fail"}
 	for level, want := range cases {

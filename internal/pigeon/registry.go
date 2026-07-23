@@ -48,6 +48,9 @@ type Entry struct {
 	Subscriptions []string `json:"subscriptions,omitempty"`
 	CCVersion     string   `json:"ccVersion,omitempty"`
 	Driven        bool     `json:"driven,omitempty"`
+	// Private sessions publish no cwd and no description. The flag itself is
+	// published so this session can be told why its own entry looks bare.
+	Private bool `json:"private,omitempty"`
 
 	// Derived at read time, never persisted.
 	Status Status `json:"-"`
@@ -107,6 +110,11 @@ func ReadEntry(sessionID string) (*Entry, error) {
 }
 
 // WriteEntry persists atomically so a reader never sees a half-written entry.
+//
+// A private session's entry is written without its cwd or description. That is
+// enforced here rather than at registration because every later write lands
+// here too -- a heartbeat, a subscribe, a `pigeon describe` -- and any one of
+// them would otherwise put back what the project asked to keep off the bus.
 func WriteEntry(e *Entry) error {
 	if err := ValidSessionID(e.SessionID); err != nil {
 		return err
@@ -114,7 +122,11 @@ func WriteEntry(e *Entry) error {
 	if err := EnsureDirs(); err != nil {
 		return err
 	}
-	b, err := json.MarshalIndent(e, "", "  ")
+	rec := *e
+	if rec.Private {
+		rec.Cwd, rec.Description = "", ""
+	}
+	b, err := json.MarshalIndent(&rec, "", "  ")
 	if err != nil {
 		return err
 	}

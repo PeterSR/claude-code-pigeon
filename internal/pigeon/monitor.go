@@ -53,6 +53,15 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 		return nil
 	}
 
+	// A project can keep its own sessions off the bus, for the same reason a
+	// launcher can: not every checkout is one you want peers waking you about.
+	// The environment still outranks the file, so PIGEON=1 overrides it.
+	if cwd := CurrentCwd(); ProjectDisabled(cwd) {
+		logf("disabled by %s -- standing down", ProjectConfigPath(cwd))
+		block()
+		return nil
+	}
+
 	// CurrentSessionID validates the value, so an unsubstituted "${...}"
 	// literal or anything else unsafe already arrives here as "".
 	sid := CurrentSessionID()
@@ -217,6 +226,19 @@ func register(sid string, logf func(string, ...any)) error {
 	pid := CurrentClaudePID()
 	cwd := CurrentCwd()
 
+	// The config is read at every registration, but only *seeds* identity at
+	// the first one. Reading it every time is what keeps `private` honest: it
+	// is the project's standing rule about what may be published, not a
+	// session's declaration, so a monitor restart must not start publishing a
+	// directory the checkout asked to keep off the bus.
+	cfg, problems, cerr := LoadProjectConfig(cwd)
+	for _, p := range problems {
+		logf("project config: %s", p)
+	}
+	if cerr != nil {
+		logf("project config: %v", cerr)
+	}
+
 	// Preserve identity and subscriptions declared earlier in this session.
 	var name, desc string
 	var subs []string
@@ -224,11 +246,11 @@ func register(sid string, logf func(string, ...any)) error {
 	if err == nil {
 		name, desc, subs = prev.Name, prev.Description, prev.Subscriptions
 	} else {
-		// Only a session's *first* registration reads the project config.
-		// After that the session's own declarations are authoritative, so a
-		// `pigeon name` or `pigeon unsubscribe` is not quietly undone the next
-		// time a monitor starts for the same id.
-		name, desc, subs = applyProjectConfig(sid, cwd, logf)
+		// Only a session's *first* registration takes identity from the
+		// config. After that the session's own declarations are authoritative,
+		// so a `pigeon name` or `pigeon unsubscribe` is not quietly undone the
+		// next time a monitor starts for the same id.
+		name, desc, subs = applyProjectConfig(sid, cwd, cfg, logf)
 	}
 
 	// Everyone gets the public mailbox by default, so a broadcast reaches the
@@ -262,47 +284,36 @@ func register(sid string, logf func(string, ...any)) error {
 		Subscriptions: subs,
 		CCVersion:     os.Getenv(EnvVersion),
 		Driven:        os.Getenv(EnvChild) == "1",
+		Private:       cfg != nil && cfg.Private,
 	})
 }
 
 // applyProjectConfig seeds a brand-new session's identity from the project it
-// started in. Everything it returns has already been validated by
-// LoadProjectConfig; what is decided here is what to do when the config asks
-// for something this machine cannot give it.
-func applyProjectConfig(sid, cwd string, logf func(string, ...any)) (name, desc string, subs []string) {
+// started in. The config's shape was validated when it was loaded; what is
+// decided here is what a template actually produces for *this* session, and
+// what to do when the config asks for something this machine cannot give it --
+// most often a name another live session already answers to.
+func applyProjectConfig(sid, cwd string, cfg *ProjectConfig, logf func(string, ...any)) (name, desc string, subs []string) {
 	subs = []string{PublicTopic}
-
-	cfg, problems, err := LoadProjectConfig(cwd)
-	for _, p := range problems {
-		logf("project config: %s", p)
-	}
-	if err != nil {
-		logf("project config: %v", err)
-		return "", "", subs
-	}
 	if cfg == nil {
 		return "", "", subs
 	}
 
-	// A name is an address, so two sessions must never answer to it. Leaving
-	// the second one unnamed is the honest outcome: it is still reachable by
-	// id, and nobody is misrouted. Silently suffixing would invent an address
-	// the project never declared.
-	switch {
-	case cfg.Name == "":
-	case NameTaken(cfg.Name, sid):
-		logf("project config: name %q is already taken by a live session; staying unnamed", cfg.Name)
-	default:
-		name = cfg.Name
+	// Resolve reports rather than repairs: a template that renders to a name
+	// this session may not have leaves it unnamed and says why. That is the
+	// honest outcome -- the session is still reachable by id, and no reply is
+	// misrouted.
+	res := cfg.Resolve(sid, cwd)
+	for _, p := range res.Problems {
+		logf("project config: %s", p)
 	}
 
-	desc = cfg.Description
-	subs = append(subs, cfg.Topics...)
+	subs = append(subs, res.Topics...)
 	sort.Strings(subs)
 
-	logf("project config: %s applied (name=%q topics=%v)",
-		ProjectConfigPath(cwd), name, subs)
-	return name, desc, subs
+	logf("project config: %s applied (name=%q topics=%v private=%v)",
+		ProjectConfigPath(cwd), res.Name, subs, res.Private)
+	return res.Name, res.Description, subs
 }
 
 func hostname() string {

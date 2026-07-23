@@ -88,7 +88,13 @@ func CurrentSender() Sender {
 	s := Sender{Kind: "session", SessionID: sid, Cwd: CurrentCwd()}
 	if e, err := ReadEntry(sid); err == nil {
 		s.Name = e.Name
-		if e.Cwd != "" {
+		switch {
+		case e.Private:
+			// Render shows the sender's directory to every recipient, which is
+			// exactly what a private project asked not to happen. The cwd we
+			// started in is no more publishable than the registered one.
+			s.Cwd = ""
+		case e.Cwd != "":
 			s.Cwd = e.Cwd
 		}
 	}

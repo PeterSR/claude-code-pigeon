@@ -170,6 +170,61 @@ func TestSetIdentityUpdatesNameAndDescription(t *testing.T) {
 	}
 }
 
+func TestSetIdentityRendersTemplates(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "bbbb2222-3333")
+	t.Setenv(EnvProjectDir, "/home/p/api")
+	liveEntry(t, "aaaa1111-2222", "api", "/home/p/api")
+	liveEntry(t, "bbbb2222-3333", "", "/home/p/api")
+
+	toolText(t, "set_identity", map[string]any{
+		"nameTemplate":        "{{.Dir}}-{{.Seq}}",
+		"descriptionTemplate": "second session in {{.Dir}}",
+	})
+	e, err := ReadEntry("bbbb2222-3333")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Name != "api-2" {
+		t.Errorf("name = %q, want api-2", e.Name)
+	}
+	if e.Description != "second session in api" {
+		t.Errorf("description = %q", e.Description)
+	}
+}
+
+// A template and a literal for the same field is an ambiguity the caller has
+// to settle: picking either would give the session a name nobody asked for.
+func TestSetIdentityRefusesATemplateAndALiteralTogether(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "aaaa1111-2222")
+	liveEntry(t, "aaaa1111-2222", "", "/home/p/api")
+
+	for _, args := range []map[string]any{
+		{"name": "alpha", "nameTemplate": "{{.Dir}}"},
+		{"description": "work", "descriptionTemplate": "{{.Dir}}"},
+	} {
+		if got := toolText(t, "set_identity", args); !strings.Contains(got, "not both") {
+			t.Errorf("%v: got %q, want a refusal", args, got)
+		}
+	}
+}
+
+// A template that renders to something unusable is reported, not repaired.
+func TestSetIdentityRejectsAnUnusableRenderedName(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "aaaa1111-2222")
+	t.Setenv(EnvProjectDir, "/home/p/api")
+	liveEntry(t, "aaaa1111-2222", "", "/home/p/api")
+
+	if got := toolText(t, "set_identity", map[string]any{"nameTemplate": "{{.Cwd}}"}); !strings.Contains(got, "invalid name") {
+		t.Errorf("got %q, want a name-validation error", got)
+	}
+	if got := toolText(t, "set_identity", map[string]any{"nameTemplate": "{{.Dir"}); !strings.Contains(got, "nameTemplate") {
+		t.Errorf("got %q, want the broken template named", got)
+	}
+}
+
 func TestSubscribeAndListTopicsViaMCP(t *testing.T) {
 	withHome(t)
 	t.Setenv(EnvSessionID, "aaaa1111-2222")

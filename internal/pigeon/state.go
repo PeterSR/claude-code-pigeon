@@ -101,6 +101,11 @@ func CurrentClaudePID() int {
 	return pid
 }
 
+// optOutSet reports whether the opt-out variable is set at all, either way.
+// That is how an explicit PIGEON=1 outranks a project config that would
+// otherwise take this session off the bus.
+func optOutSet() bool { return strings.TrimSpace(os.Getenv(EnvOptOut)) != "" }
+
 // OptedOut reports whether this session should stay off the bus.
 func OptedOut() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvOptOut))) {

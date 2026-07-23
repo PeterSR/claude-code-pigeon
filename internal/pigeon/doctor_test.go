@@ -141,6 +141,7 @@ func TestCompareVersions(t *testing.T) {
 // context, so it is a finding, not a detail -- and it has to be sampled before
 // EnsureDirs tightens it back, or the finding is unreachable.
 func TestDoctorWarnsOnAWorldWritableStateDir(t *testing.T) {
+	requirePOSIXModes(t)
 	home := withHome(t)
 	if err := os.Chmod(home, 0o777); err != nil {
 		t.Skipf("chmod: %v", err)
@@ -162,6 +163,7 @@ func TestDoctorWarnsOnAWorldWritableStateDir(t *testing.T) {
 }
 
 func TestDoctorAcceptsAnOwnerOnlyStateDir(t *testing.T) {
+	requirePOSIXModes(t)
 	withHome(t)
 	if got := findCheck(t, Diagnose(), "state dir"); got.Level != CheckOK {
 		t.Errorf("state dir check = %+v, want ok", got)
@@ -174,9 +176,7 @@ func TestDoctorAcceptsAnOwnerOnlyStateDir(t *testing.T) {
 // there, so these tests never read or write the developer's real ~/.claude.
 func withPlugin(t *testing.T) string {
 	t.Helper()
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home) // os.UserHomeDir on Windows
+	home := withUserHome(t)
 	dir := filepath.Join(home, ".claude", "skills", "pigeon")
 	for _, d := range []string{filepath.Join(dir, ".claude-plugin"), filepath.Join(dir, "monitors")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -200,9 +200,7 @@ func writePluginMonitor(t *testing.T, dir, command string) {
 
 func TestDoctorFailsWhenThePluginIsNotInstalled(t *testing.T) {
 	withHome(t)
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
+	withUserHome(t)
 
 	got := findCheck(t, Diagnose(), "plugin")
 	if got.Level != CheckFail || !strings.Contains(got.Hint, "pigeon install") {
@@ -240,6 +238,8 @@ func TestDoctorFlagsAPluginPointingAtADifferentBinary(t *testing.T) {
 }
 
 func TestDoctorFlagsANonExecutableMonitorBinary(t *testing.T) {
+	// Windows has no execute bit, so there is no such state to detect.
+	requirePOSIXModes(t)
 	withHome(t)
 	dir := withPlugin(t)
 	other := filepath.Join(t.TempDir(), "pigeon")

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,40 @@ func withHome(t *testing.T) string {
 		t.Fatalf("EnsureDirs: %v", err)
 	}
 	return dir
+}
+
+// withUserHome redirects os.UserHomeDir at a throwaway directory, so nothing
+// here can scaffold into or delete a real ~/.claude.
+//
+// Both variables are needed: os.UserHomeDir reads HOME on Unix and USERPROFILE
+// on Windows. Setting only HOME leaves Windows pointing at the real profile.
+func withUserHome(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+	return dir
+}
+
+// requirePOSIXModes skips assertions about Unix permission bits. Windows
+// models none of them -- a directory created 0700 stats as 0777 -- so such an
+// assertion tests the platform rather than this code.
+func requirePOSIXModes(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not modelled on Windows")
+	}
+}
+
+// requireRenameOverOpenFile skips tests that replace a file another handle
+// still has open. POSIX allows it; Windows refuses with a sharing violation.
+// Topic compaction relies on it, so this is a real limitation on Windows
+// rather than a test artefact -- see the README's Limits section.
+func requireRenameOverOpenFile(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows refuses to rename over a file that is still open")
+	}
 }
 
 // liveEntry registers a session backed by this test process, so liveness checks
@@ -892,6 +927,7 @@ func TestPruneTopicsKeepsSubscribedLogs(t *testing.T) {
 }
 
 func TestPruneTopicsCompactsAndRewindsCursors(t *testing.T) {
+	requireRenameOverOpenFile(t)
 	withHome(t)
 	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
 	if err := Subscribe("aaaa1111-2222", "busy"); err != nil {
@@ -984,6 +1020,7 @@ func TestPruneTopicsWaitsForTheSlowestSubscriber(t *testing.T) {
 }
 
 func TestFollowerResumesFromCursorAfterCompaction(t *testing.T) {
+	requireRenameOverOpenFile(t)
 	dir := withHome(t)
 	path := filepath.Join(dir, "log.ndjson")
 

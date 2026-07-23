@@ -5,6 +5,7 @@ package pigeon
 import (
 	"fmt"
 	"io"
+	"os"
 	"syscall"
 	"time"
 )
@@ -87,3 +88,9 @@ func processExists(pid int) bool {
 	const stillActive = 259
 	return code == stillActive
 }
+
+// isExecutable is always true on Windows. There is no execute bit: whether a
+// file runs is decided by its extension at spawn time. Testing Unix mode bits
+// here would report every healthy install as broken, since a file written by
+// Go carries none of them.
+func isExecutable(os.FileInfo) bool { return true }

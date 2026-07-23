@@ -13,8 +13,7 @@ import (
 func withPluginHome(t *testing.T) (home, plugin string) {
 	t.Helper()
 	withHome(t)
-	home = t.TempDir()
-	t.Setenv("HOME", home)
+	home = withUserHome(t)
 
 	got, err := pluginDir()
 	if err != nil {
@@ -304,6 +303,12 @@ func TestArmOutsideASession(t *testing.T) {
 }
 
 func TestArmPrintsTheMonitorCallWhenNothingIsListening(t *testing.T) {
+	// The printed command is shell-quoted for the POSIX shell Claude Code
+	// runs a monitor with. On a platform that arms no monitors there is no
+	// such shell, and quoting a Windows path for one is meaningless.
+	if !MonitorSupported {
+		t.Skip("monitors are not armed on this platform")
+	}
 	withHome(t)
 	const sid = "arm-1111-2222"
 	t.Setenv(EnvSessionID, sid)

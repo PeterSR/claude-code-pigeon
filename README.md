@@ -232,6 +232,9 @@ are written to `payloads/` and the recipient gets a path instead.
   not arm plugin monitors there, so a Windows session cannot receive.
 - PID-reuse detection needs Linux `/proc`; elsewhere a recycled PID can make a dead
   session look alive until something prunes it.
+- `pigeon prune` does not compact topic logs on Windows. Compaction replaces a log by
+  rename, which Windows refuses while any process still holds it open. Forgetting dead
+  sessions still works; only the space reclaim is skipped.
 - One machine. No network transport.
 - 30 notifications per minute per session; beyond that pigeon reports suppression rather
   than being stopped by Claude Code.

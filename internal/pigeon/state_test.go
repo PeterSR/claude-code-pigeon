@@ -11,8 +11,7 @@ import (
 // --- state locations -------------------------------------------------------
 
 func TestHomeFallsBackToTheClaudeDirectory(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("HOME", dir)
+	dir := withUserHome(t)
 	// Everything below depends on this path, so getting the fallback wrong
 	// silently splits a machine into two buses that cannot see each other.
 	for _, unset := range []string{"", "   "} {
@@ -29,6 +28,7 @@ func TestHomeFallsBackToTheClaudeDirectory(t *testing.T) {
 }
 
 func TestEnsureDirsIsOwnerOnly(t *testing.T) {
+	requirePOSIXModes(t)
 	withHome(t)
 	// The spool is an injection surface into a live agent: anyone who can
 	// write it can put text in someone's context, so it is never shared.

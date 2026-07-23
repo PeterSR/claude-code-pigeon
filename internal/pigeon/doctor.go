@@ -229,7 +229,7 @@ func checkMonitorBinary(cmd string) Check {
 		return fail("monitor binary", bin+" does not exist",
 			"the plugin points at a binary that has moved or been deleted; run `pigeon install` again")
 	}
-	if fi.Mode()&0o111 == 0 {
+	if !isExecutable(fi) {
 		return fail("monitor binary", bin+" is not executable", "chmod +x it, or run `pigeon install` again")
 	}
 	if self, err := os.Executable(); err == nil {

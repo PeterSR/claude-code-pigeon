@@ -75,3 +75,7 @@ func processExists(pid int) bool {
 	err := syscall.Kill(pid, 0)
 	return err == nil || err == syscall.EPERM
 }
+
+// isExecutable reports whether a file can be run. Any execute bit will do: the
+// plugin binary only has to be runnable by whoever starts the session.
+func isExecutable(fi os.FileInfo) bool { return fi.Mode()&0o111 != 0 }

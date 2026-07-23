@@ -145,6 +145,13 @@ func (n Namespace) Publish(topic, text string, from Sender) (*Message, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A private namespace is sealed against machine-wide topics in both
+	// directions. Blocking only what flows in would be a privacy hole rather
+	// than a feature: a namespace that can still broadcast to @all publishes
+	// exactly what it was made private to keep in.
+	if ref.Global && n.IsPrivate() {
+		return nil, fmt.Errorf("namespace %q is private, so it cannot publish to the machine-wide topic %s", n, ref)
+	}
 	if err := n.EnsureDirs(); err != nil {
 		return nil, err
 	}
@@ -442,12 +449,25 @@ func (n Namespace) ListTopics() ([]TopicInfo, error) {
 
 // allSessions is every live session on the machine. Used only where a global
 // topic makes the whole machine the right denominator.
+// allSessions is the audience for a global topic: every session on the machine
+// except those in a namespace sealed against them.
+//
+// Filtering here rather than at each call site is deliberate. This is the one
+// function that crosses namespaces on purpose, so it is the one place the
+// exception to that has to hold.
 func allSessions() []*Entry {
 	out, err := ListAllSessions(false, false)
 	if err != nil {
 		return nil
 	}
-	return out
+	kept := out[:0]
+	for _, e := range out {
+		if e.NS().IsPrivate() {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	return kept
 }
 
 // SubscriberCount reports how many live sessions besides exceptSessionID would

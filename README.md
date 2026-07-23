@@ -442,6 +442,49 @@ printf '%s%s' "$line" "${alarm:+ $alarm}"
 
 `--plain` drops the emoji and colour.
 
+### Private namespaces
+
+A namespace can be marked private in your machine config, which lives where user
+configuration lives rather than in any repository:
+
+`$XDG_CONFIG_HOME/pigeon/config.json`, or `~/.config/pigeon/config.json`
+
+```json
+{
+  "namespaces": {
+    "clients": { "private": true }
+  }
+}
+```
+
+**This is deliberately not a project setting.** A `.claude/pigeon.json` arrives with a
+`git clone`, so if privacy lived there a cloned repository could mark its own namespace
+private and hide its sessions from you, or mark yours public. A repository may say which
+namespace its sessions belong to; only you may say which namespaces are private.
+
+A private namespace is:
+
+- **Invisible from outside, to Claude.** It is not listed by `pigeon namespaces`, not
+  included in `ls --all-namespaces`, and not addressable with `-n`. The MCP tools cannot
+  see or reach it at all.
+- **Entirely normal from inside.** Its members see each other, message each other, and
+  see the other (non-private) namespaces around them, exactly as any session does.
+- **Sealed against machine-wide topics, both ways.** Its sessions do not join `@all`, do
+  not receive any `@topic`, and cannot publish to one. A private namespace that could
+  still broadcast to `@all` would publish exactly what it was made private to keep in.
+
+The escape hatch is your own terminal. The rule keys on `CLAUDE_CODE_SESSION_ID`, which
+Claude Code injects into everything it spawns -- the MCP server and the agent's shell
+alike -- and which a terminal you opened yourself does not have. So `pigeon ls -n clients`
+works for you and not for the agent sitting in another window.
+
+**What this is not.** It is a boundary against ordinary reach, not a sandbox. Anything
+that can run `env -u CLAUDE_CODE_SESSION_ID pigeon ls -n clients` can still look, and
+pigeon has no privilege with which to stop it -- the state directory is yours and every
+process running as you can read it. What it buys is that a private namespace never lands
+in a model's context by accident, which is the thing actually worth having. If you need
+a real boundary, run those sessions as a different user.
+
 ## Opting a session out
 
 Set `PIGEON=0` in its environment. Intended for programmatically driven sessions

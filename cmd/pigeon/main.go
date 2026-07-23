@@ -159,7 +159,18 @@ func namespaceOf(name string) (pigeon.Namespace, error) {
 	if strings.TrimSpace(name) == "" {
 		return pigeon.CurrentNamespace(), nil
 	}
-	return pigeon.ParseNamespace(name)
+	ns, err := pigeon.ParseNamespace(name)
+	if err != nil {
+		return ns, err
+	}
+	// Naming a namespace explicitly is the one way to reach into one that would
+	// not be listed, so it is the one place the privacy rule has to hold. It
+	// only refuses inside a Claude Code session: from your own terminal this is
+	// the escape hatch.
+	if err := pigeon.CheckNamespaceAccess(ns); err != nil {
+		return ns, err
+	}
+	return ns, nil
 }
 
 // elsewhere counts the sessions this listing is deliberately not showing.

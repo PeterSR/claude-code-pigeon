@@ -201,9 +201,16 @@ func manageSubscriptions(ns Namespace, sid string, out chan<- *Message, done <-c
 			// The entry is a file on disk, so a subscription is not necessarily
 			// something Subscribe validated. Following an unchecked name would
 			// let a planted entry point this session's reader at any file.
-			if ref, err := ParseTopicRef(topic); err == nil {
-				want[ref.String()] = true
+			ref, err := ParseTopicRef(topic)
+			if err != nil {
+				continue
 			}
+			// A private namespace is sealed against machine-wide topics, so a
+			// subscription to one is not honoured however it got into the entry.
+			if ref.Global && ns.IsPrivate() {
+				continue
+			}
+			want[ref.String()] = true
 		}
 
 		for topic := range want {
@@ -275,7 +282,7 @@ func register(ns Namespace, sid string, logf func(string, ...any)) error {
 	// and `pigeon unsubscribe @all` closes it for a session that would rather
 	// not hear it.
 	if subs == nil {
-		subs = defaultSubscriptions()
+		subs = defaultSubscriptions(ns)
 	}
 	now := nowRFC3339()
 	if err := ns.WriteEntry(&Entry{
@@ -321,7 +328,13 @@ func register(ns Namespace, sid string, logf func(string, ...any)) error {
 
 // defaultSubscriptions is what a session comes up listening to before any
 // config or command has a say.
-func defaultSubscriptions() []string {
+func defaultSubscriptions(ns Namespace) []string {
+	// A private namespace joins its own mailbox only. @all is the one place
+	// isolation is deliberately not absolute, and a namespace declared private
+	// is precisely the one that opted out of that.
+	if ns.IsPrivate() {
+		return []string{PublicTopic}
+	}
 	subs := []string{PublicTopic, GlobalPublicTopic}
 	sort.Strings(subs)
 	return subs
@@ -333,7 +346,7 @@ func defaultSubscriptions() []string {
 // what to do when the config asks for something this machine cannot give it --
 // most often a name another live session already answers to.
 func applyProjectConfig(ns Namespace, sid, cwd string, cfg *ProjectConfig, logf func(string, ...any)) (name, desc string, subs []string) {
-	subs = defaultSubscriptions()
+	subs = defaultSubscriptions(ns)
 	if cfg == nil {
 		return "", "", subs
 	}

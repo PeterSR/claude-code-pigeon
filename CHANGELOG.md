@@ -6,6 +6,19 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- Private namespaces, declared in a machine-level config at
+  `$XDG_CONFIG_HOME/pigeon/config.json`. A private namespace is invisible and
+  unaddressable from inside a Claude Code session, entirely normal from within
+  itself, and sealed against machine-wide `@` topics in both directions.
+
+  Policy is deliberately not a project setting: a `.claude/pigeon.json` arrives
+  with a `git clone`, so a repository may say which namespace its sessions join
+  but never that a namespace is private. The rule keys on
+  `CLAUDE_CODE_SESSION_ID`, which covers the MCP server and an agent's shell
+  alike while leaving your own terminal as the escape hatch. It is a boundary
+  against ordinary reach rather than a sandbox, and the README says so.
+
 ### Changed
 - **Breaking (on-disk layout).** The six state directories moved from `<state>/sessions`,
   `inbox`, `topics`, `cursors`, `locks` and `payloads` to

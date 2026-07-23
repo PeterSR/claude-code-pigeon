@@ -329,7 +329,17 @@ func mcpNamespace(arg string) (Namespace, error) {
 	if strings.TrimSpace(arg) == "" {
 		return CurrentNamespace(), nil
 	}
-	return ParseNamespace(arg)
+	ns, err := ParseNamespace(arg)
+	if err != nil {
+		return ns, err
+	}
+	// The MCP server is a model's hands, so a private namespace is refused here
+	// whatever the environment says. The CLI's check is conditional because a
+	// human runs it too; nothing but a model calls this.
+	if ns.IsPrivate() && !CurrentNamespace().Is(ns) {
+		return ns, &PrivacyError{NS: ns}
+	}
+	return ns, nil
 }
 
 func callTool(name string, raw json.RawMessage) (string, error) {

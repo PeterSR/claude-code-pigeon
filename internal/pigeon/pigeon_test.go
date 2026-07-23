@@ -98,7 +98,7 @@ func mustNS(t *testing.T, name string) Namespace {
 // defaultSubs is what a session comes up subscribed to, plus whatever a config
 // added, in the order the entry stores them.
 func defaultSubs(extra ...string) string {
-	subs := append(defaultSubscriptions(), extra...)
+	subs := append(defaultSubscriptions(DefaultNamespace()), extra...)
 	sort.Strings(subs)
 	return strings.Join(subs, ",")
 }

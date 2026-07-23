@@ -108,6 +108,12 @@ func checkNamespace() Check {
 		return warn("namespace", detail,
 			"set "+EnvNamespace+" to a valid namespace or unset it; this session is in "+ns.String())
 	}
+	// A private namespace changes what this session can reach, so a session
+	// wondering why a peer or a broadcast never arrived should find the reason
+	// here rather than deduce it.
+	if ns.IsPrivate() {
+		detail += " -- private: sealed from machine-wide topics, and invisible to sessions outside it"
+	}
 	return ok("namespace", detail)
 }
 

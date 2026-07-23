@@ -346,6 +346,11 @@ func ListNamespaces() ([]NamespaceInfo, error) {
 		if err != nil {
 			continue
 		}
+		// A private namespace does not exist as far as anything inside a
+		// Claude Code session is concerned, unless it is the one asking.
+		if checkPrivateAccess(ns) != nil {
+			continue
+		}
 		info := NamespaceInfo{Name: name, Current: ns.Is(current)}
 		entries, err := ns.ListSessions(false, false)
 		if err == nil {

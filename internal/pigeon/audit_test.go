@@ -249,3 +249,173 @@ func TestShellSenderKeepsCwdForANormalProject(t *testing.T) {
 		t.Errorf("Cwd = %q, want %q", s.Cwd, dir)
 	}
 }
+
+// --- compaction must not race the followers -------------------------------
+
+// Cursors are logical offsets and compaction only moves the base, so the two
+// operations share no mutable number. These are the interleavings that lost or
+// duplicated messages when the cursor held a raw file position and compaction
+// rewound it: a follower reloading between the rename and its own rewind
+// adopted an offset pointing at the end of the compacted file and skipped it
+// entirely, and one whose write landed after the rewind replayed the whole log.
+func TestCompactionDoesNotMoveAnyCursor(t *testing.T) {
+	withHome(t)
+	ns := DefaultNamespace()
+	from := Sender{Kind: "shell", Name: "sh"}
+
+	fast := liveEntryIn(t, ns, "aaaa1111", "fast", "/tmp/a")
+	slow := liveEntryIn(t, ns, "bbbb2222", "slow", "/tmp/b")
+	for _, e := range []*Entry{fast, slow} {
+		if err := ns.Subscribe(e.SessionID, "busy"); err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+	}
+
+	body := strings.Repeat("x", 400)
+	for i := 0; i < 500; i++ {
+		if _, err := ns.Publish("busy", body, from); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+	}
+	path := ns.TopicPath("busy")
+	full := endOffset(path)
+	if full < minCompactBytes*2 {
+		t.Skipf("log is only %d bytes; not enough to compact", full)
+	}
+
+	// fast has read everything; slow is halfway. Only the prefix both have
+	// passed may be cut.
+	half := full / 2
+	if err := ns.mutateCursors(fast.SessionID, func(m map[string]int64) { m["busy"] = full }); err != nil {
+		t.Fatal(err)
+	}
+	if err := ns.mutateCursors(slow.SessionID, func(m map[string]int64) { m["busy"] = half }); err != nil {
+		t.Fatal(err)
+	}
+
+	before := map[string]int64{
+		fast.SessionID: ns.readCursors(fast.SessionID)["busy"],
+		slow.SessionID: ns.readCursors(slow.SessionID)["busy"],
+	}
+
+	res, err := ns.PruneTopics()
+	if err != nil {
+		t.Fatalf("PruneTopics: %v", err)
+	}
+	if res.TopicsCompacted != 1 {
+		t.Fatalf("TopicsCompacted = %d, want 1", res.TopicsCompacted)
+	}
+
+	// The invariant the old design could not hold: compaction rewrote the log
+	// and touched nobody's cursor.
+	for sid, want := range before {
+		if got := ns.readCursors(sid)["busy"]; got != want {
+			t.Errorf("compaction moved %s's cursor from %d to %d", sid, want, got)
+		}
+	}
+	// And the base absorbed exactly what was cut, so a logical offset still
+	// names the same message.
+	if base := readBase(path); base == 0 || base+endOffset(path) != full {
+		t.Errorf("base %d + size %d != original %d", base, endOffset(path), full)
+	}
+}
+
+// The end-to-end property: a subscriber that was behind when the log was
+// compacted still receives every message it had not read, exactly once.
+func TestFollowerLosesNothingAcrossACompaction(t *testing.T) {
+	withHome(t)
+	ns := DefaultNamespace()
+	from := Sender{Kind: "shell", Name: "sh"}
+
+	slow := liveEntryIn(t, ns, "bbbb2222", "slow", "/tmp/b")
+	if err := ns.Subscribe(slow.SessionID, "busy"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	body := strings.Repeat("y", 400)
+	const total = 500
+	for i := 0; i < total; i++ {
+		if _, err := ns.Publish("busy", body, from); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+	}
+	path := ns.TopicPath("busy")
+	if endOffset(path) < minCompactBytes*2 {
+		t.Skip("log too small to compact")
+	}
+
+	// Read the first half, the way a follower would have.
+	consumed := countRecordsUpTo(t, path, endOffset(path)/2)
+	cut := recordOffset(t, path, consumed)
+	if err := ns.mutateCursors(slow.SessionID, func(m map[string]int64) { m["busy"] = cut }); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ns.PruneTopics(); err != nil {
+		t.Fatalf("PruneTopics: %v", err)
+	}
+
+	// Now follow from the stored cursor, as a restarting monitor does.
+	out := make(chan *Message, total)
+	stop := make(chan struct{})
+	go followSource(path, ns.readCursors(slow.SessionID)["busy"], out, stop,
+		func(at int64) { _ = ns.mutateCursors(slow.SessionID, func(m map[string]int64) { m["busy"] = at }) },
+		func(string, ...any) {})
+
+	got := 0
+	deadline := time.After(10 * time.Second)
+	for got < total-consumed {
+		select {
+		case <-out:
+			got++
+		case <-deadline:
+			close(stop)
+			t.Fatalf("delivered %d of the %d unread messages after compaction", got, total-consumed)
+		}
+	}
+	close(stop)
+
+	select {
+	case m := <-out:
+		t.Errorf("a message was delivered twice after compaction: %+v", m)
+	default:
+	}
+}
+
+// countRecordsUpTo reports how many whole records end at or before off.
+func countRecordsUpTo(t *testing.T, path string, off int64) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, at := 0, int64(0)
+	for _, line := range strings.SplitAfter(string(b), "\n") {
+		if line == "" {
+			break
+		}
+		at += int64(len(line))
+		if at > off {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// recordOffset is the byte offset just past record n.
+func recordOffset(t *testing.T, path string, n int) int64 {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := int64(0)
+	for i, line := range strings.SplitAfter(string(b), "\n") {
+		if i >= n || line == "" {
+			break
+		}
+		at += int64(len(line))
+	}
+	return at
+}

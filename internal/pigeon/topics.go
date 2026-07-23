@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -241,6 +242,71 @@ func (n Namespace) Unsubscribe(sessionID, topic string) error {
 	})
 }
 
+// --- log bases -------------------------------------------------------------
+//
+// A cursor is a LOGICAL offset: bytes since the beginning of a log's life,
+// counting everything compaction has since thrown away. The base file records
+// how much that is, so physical position = logical - base.
+//
+// Storing raw file positions instead, and rewinding every subscriber's cursor
+// when the log is compacted, cannot be made correct. Compaction and the
+// followers then both mutate the same numbers, and those numbers change
+// meaning halfway through the operation: a follower that reloaded between the
+// rename and its own rewind adopted an un-rewound cursor pointing at the end
+// of the compacted file and skipped everything in it, while one whose write
+// landed after the rewind held an old-coordinate offset larger than the new
+// file, which reads as truncation and replays the whole log. Both were
+// reproducible; both are message loss or a duplicate flood in a system whose
+// entire job is delivery.
+//
+// With logical offsets, compaction touches no cursor at all. It adds to the
+// base, every stored offset keeps its meaning, and there is nothing left for a
+// follower to race with.
+
+func basePath(logPath string) string {
+	return strings.TrimSuffix(logPath, ".ndjson") + ".base"
+}
+
+// readBase reports how many bytes have been compacted away from a log. A
+// missing base file means none have, which is also the right answer for the
+// direct inbox spool, which is never compacted.
+func readBase(logPath string) int64 {
+	b, err := os.ReadFile(basePath(logPath))
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// writeBase records the new base after a compaction. Callers hold the topic
+// lock, so this does not serialise against another compaction; the temp file
+// is for readers, who must never observe a half-written number.
+func writeBase(logPath string, n int64) error {
+	tmp, err := os.CreateTemp(filepath.Dir(logPath), "base-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if _, err := tmp.WriteString(strconv.FormatInt(n, 10)); err != nil {
+		tmp.Close()
+		_ = os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	if err := os.Chmod(name, 0o600); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	return os.Rename(name, basePath(logPath))
+}
+
 // --- cursors ---------------------------------------------------------------
 //
 // Each session keeps its own read offset per topic, so a shared append-only
@@ -309,13 +375,18 @@ func mutateCursors(sessionID string, fn func(map[string]int64)) error {
 	return CurrentNamespace().mutateCursors(sessionID, fn)
 }
 
+// seedCursor starts a new subscription at the end of the log, so joining a
+// topic does not replay its history as a burst of notifications. The offset is
+// logical, so it stays correct across every later compaction.
 func (n Namespace) seedCursor(sessionID string, ref TopicRef) error {
+	path := ref.path(n)
+	var size int64
+	if fi, err := os.Stat(path); err == nil {
+		size = fi.Size()
+	}
+	end := readBase(path) + size
 	return n.mutateCursors(sessionID, func(m map[string]int64) {
-		var size int64
-		if fi, err := os.Stat(ref.path(n)); err == nil {
-			size = fi.Size()
-		}
-		m[ref.String()] = size
+		m[ref.String()] = end
 	})
 }
 
@@ -536,9 +607,12 @@ func pruneTopicDir(dir string, global bool, subscribers func(TopicRef) []*Entry,
 			continue
 		}
 
-		// Nobody is listening, so nothing in the file can still be wanted.
+		// Nobody is listening, so nothing in the file can still be wanted. The
+		// base goes with it: a log that comes back later starts a fresh life,
+		// and a stale base would put every new subscriber past the end of it.
 		if len(subs) == 0 {
 			if err := os.Remove(p); err == nil {
+				_ = os.Remove(basePath(p))
 				res.TopicsRemoved++
 				res.BytesReclaimed += fi.Size()
 			}
@@ -546,12 +620,17 @@ func pruneTopicDir(dir string, global bool, subscribers func(TopicRef) []*Entry,
 			continue
 		}
 
-		cut := fi.Size()
+		// Cursors are logical, so convert once here and work in file
+		// coordinates for the cut itself.
+		base := readBase(p)
+		logicalEnd := base + fi.Size()
+		slowest := logicalEnd
 		for _, e := range subs {
-			if off := cursorNS(e).readCursors(e.SessionID)[ref.String()]; off < cut {
-				cut = off
+			if off := cursorNS(e).readCursors(e.SessionID)[ref.String()]; off < slowest {
+				slowest = off
 			}
 		}
+		cut := slowest - base
 		if cut < minCompactBytes {
 			unlock.Close()
 			continue
@@ -561,14 +640,19 @@ func pruneTopicDir(dir string, global bool, subscribers func(TopicRef) []*Entry,
 			unlock.Close()
 			continue
 		}
-		// Rewind every subscriber so their offsets still point at the same
-		// messages. A follower notices the file shrank and reloads from here.
-		for _, e := range subs {
-			_ = cursorNS(e).mutateCursors(e.SessionID, func(m map[string]int64) {
-				if off, ok := m[ref.String()]; ok {
-					m[ref.String()] = off - cut
-				}
-			})
+		// No cursor is touched. Every subscriber's logical offset already
+		// means the same message it did before, which is the whole point of
+		// storing them that way: there is no window in which a follower can
+		// see a compacted file and an uncompacted cursor, or the reverse.
+		//
+		// Write the base after the rename, never before. A follower that looks
+		// in between computes a physical offset past the end of the new file
+		// and simply waits for the next poll, which costs a fraction of a
+		// second; the opposite order would leave the base claiming bytes were
+		// cut that a failed rename had left in place.
+		if err := writeBase(p, base+cut); err != nil {
+			unlock.Close()
+			continue
 		}
 		res.TopicsCompacted++
 		res.BytesReclaimed += cut

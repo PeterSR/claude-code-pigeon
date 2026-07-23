@@ -627,7 +627,7 @@ func TestFollowSourceDeliversNewLinesOnly(t *testing.T) {
 	out := make(chan *Message, 4)
 	stop := make(chan struct{})
 	defer close(stop)
-	go followSource(path, endOffset(path), out, stop, nil, nil, func(string, ...any) {})
+	go followSource(path, endOffset(path), out, stop, nil, func(string, ...any) {})
 
 	post, _ := json.Marshal(&Message{ID: "new", Text: "after", From: Sender{Kind: "shell"}})
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
@@ -659,7 +659,7 @@ func TestFollowSourceRecoversFromTruncation(t *testing.T) {
 	out := make(chan *Message, 4)
 	stop := make(chan struct{})
 	defer close(stop)
-	go followSource(path, endOffset(path), out, stop, nil, nil, func(string, ...any) {})
+	go followSource(path, endOffset(path), out, stop, nil, func(string, ...any) {})
 
 	// Truncate, then write a fresh message: the follower must reset rather
 	// than sit past the end of a shorter file forever.
@@ -953,7 +953,7 @@ func TestPruneTopicsKeepsSubscribedLogs(t *testing.T) {
 	}
 }
 
-func TestPruneTopicsCompactsAndRewindsCursors(t *testing.T) {
+func TestPruneTopicsCompactsWithoutMovingCursors(t *testing.T) {
 	requireRenameOverOpenFile(t)
 	withHome(t)
 	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
@@ -997,9 +997,15 @@ func TestPruneTopicsCompactsAndRewindsCursors(t *testing.T) {
 	if after.Size() != 0 {
 		t.Errorf("log is %d bytes after everyone read it, want 0", after.Size())
 	}
-	// The cursor must move with the data, or the follower would replay.
-	if got := readCursors("aaaa1111-2222")["busy"]; got != 0 {
-		t.Errorf("cursor = %d after compaction, want 0", got)
+	// The cursor must NOT move. Offsets are logical, so the base absorbs the
+	// cut and every stored position keeps meaning the same message. Rewinding
+	// cursors instead is what let compaction and a follower race over the same
+	// number, which lost messages one way and replayed the log the other.
+	if got := readCursors("aaaa1111-2222")["busy"]; got != before.Size() {
+		t.Errorf("compaction moved the cursor from %d to %d", before.Size(), got)
+	}
+	if base := readBase(TopicPath("busy")); base != before.Size() {
+		t.Errorf("base = %d after cutting %d bytes", base, before.Size())
 	}
 	if res.BytesReclaimed < before.Size() {
 		t.Errorf("BytesReclaimed = %d, want at least %d", res.BytesReclaimed, before.Size())
@@ -1065,15 +1071,19 @@ func TestFollowerResumesFromCursorAfterCompaction(t *testing.T) {
 	write("old")
 	cut := endOffset(path)
 
-	// The follower starts past the old entry, as a caught-up reader would.
-	saved := int64(0) // where the cursor points *after* the prefix is cut
+	// The follower starts past the old entry, as a caught-up reader would. Its
+	// offset is logical, so it keeps meaning the same place after the cut.
 	out := make(chan *Message, 8)
 	stop := make(chan struct{})
 	defer close(stop)
-	go followSource(path, cut, out, stop, nil, func() int64 { return saved }, func(string, ...any) {})
+	go followSource(path, cut, out, stop, nil, func(string, ...any) {})
 
-	// Compact away the prefix the follower has already passed, then append.
+	// Compact away the prefix the follower has already passed, exactly as
+	// pruneTopicDir does it: rewrite, then record what was cut.
 	if err := compactFrom(path, cut); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeBase(path, cut); err != nil {
 		t.Fatal(err)
 	}
 	write("fresh")

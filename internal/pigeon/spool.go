@@ -151,15 +151,30 @@ func (n Namespace) Pending(sessionID string) int {
 	}
 	defer f.Close()
 
-	off := n.readCursors(sessionID)[inboxCursorKey]
-	// A cursor past the end means the spool was truncated or replaced under
-	// us. Counting from zero over-reports, but reporting nothing pending for a
-	// deaf session is the worse failure of the two.
-	if off < 0 || off > endOffset(path) {
-		off = 0
+	// Cursors are logical offsets, so convert through the base the same way a
+	// follower does. The spool is never compacted, so in practice the base is
+	// zero and this is the identity -- but deriving it rather than assuming it
+	// is what stops this from silently disagreeing with the monitor if that
+	// ever changes.
+	fi, err := f.Stat()
+	if err != nil {
+		return 0
 	}
-	if off > 0 {
-		if _, err := f.Seek(off, io.SeekStart); err != nil {
+	base := readBase(path)
+	physical := n.readCursors(sessionID)[inboxCursorKey] - base
+	switch {
+	case physical < 0:
+		// Behind what was cut away: everything still on disk is unread.
+		physical = 0
+	case physical > fi.Size():
+		// Past the end: the spool was truncated or replaced under us, so the
+		// stored position means nothing. Count everything that is there. This
+		// over-reports, but the number exists to warn that mail is piling up
+		// on a deaf session, and reporting none would hide exactly that.
+		physical = 0
+	}
+	if physical > 0 {
+		if _, err := f.Seek(physical, io.SeekStart); err != nil {
 			return 0
 		}
 	}

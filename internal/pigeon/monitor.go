@@ -26,6 +26,12 @@ const subCheckInterval = time.Second
 // produce too many events, so we suppress and report rather than get killed.
 const maxPerMinute = 30
 
+// overrunGrace is how many polls a follower waits when the log is shorter than
+// its own position before deciding this is not a compaction. Compaction leaves
+// that window open for one rename plus one small write, so a handful of polls
+// is generous; waiting forever would hide a real truncation.
+const overrunGrace = 5
+
 // RunMonitor is the process Claude Code arms at session start. Every line it
 // writes to stdout becomes a <task_notification> in this session, waking it
 // from idle. It follows two kinds of source:
@@ -131,13 +137,11 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 
 	// Direct inbox: resume from our own cursor so mail queued while no monitor
 	// was listening is delivered when one comes back, rather than skipped.
+	// The spool is never compacted, so its base is always zero and a logical
+	// offset is a file position. followSource re-derives that either way.
 	inboxOffset := ns.readCursors(sid)[inboxCursorKey]
-	if inboxOffset > endOffset(spool) {
-		inboxOffset = 0
-	}
 	go followSource(spool, inboxOffset, lines, done,
 		func(off int64) { _ = ns.mutateCursors(sid, func(c map[string]int64) { c[inboxCursorKey] = off }) },
-		func() int64 { return ns.readCursors(sid)[inboxCursorKey] },
 		logf)
 
 	// Topics: started and stopped as subscriptions change.
@@ -213,15 +217,14 @@ func manageSubscriptions(ns Namespace, sid string, out chan<- *Message, done <-c
 			cur := ns.readCursors(sid)
 			off, ok := cur[topic]
 			if !ok {
-				off = endOffset(path)
+				off = readBase(path) + endOffset(path)
 			}
 			tp := topic
 			persist := func(at int64) {
 				_ = ns.mutateCursors(sid, func(c map[string]int64) { c[tp] = at })
 			}
-			reload := func() int64 { return ns.readCursors(sid)[tp] }
 			logf("following topic %q from offset %d", topic, off)
-			go followSource(path, off, out, stop, persist, reload, logf)
+			go followSource(path, off, out, stop, persist, logf)
 		}
 
 		for topic, f := range active {
@@ -408,20 +411,23 @@ func endOffset(path string) int64 {
 	return 0
 }
 
-// followSource tails an NDJSON log from an offset, tolerating truncation and a
-// file that does not exist yet. persist, when non-nil, records the read offset
-// so a restart resumes rather than replays.
+// followSource tails an NDJSON log from a LOGICAL offset, tolerating
+// compaction, truncation, and a file that does not exist yet. persist, when
+// non-nil, records the logical offset so a restart resumes rather than
+// replays.
+//
+// Working in logical offsets is what makes this safe against a concurrent
+// compaction. The physical position is derived from the base on every pass, so
+// a compaction that lands mid-poll changes where we read, never what we have
+// read: there is no shared number for the compactor and this loop to race
+// over, and no window in which one of them sees the file in one era and the
+// cursor in another.
 func followSource(path string, offset int64, out chan<- *Message, stop <-chan struct{},
-	persist func(int64), reload func() int64, logf func(string, ...any)) {
+	persist func(int64), logf func(string, ...any)) {
 
-	// Track file identity, not just size. Compaction replaces the log via
-	// rename, so the inode changes while the size may land anywhere -- a
-	// shrink check alone misses a rewrite that happens to end up the same
-	// length or longer, and the follower then stalls or reads garbage.
-	var seen os.FileInfo
-	if fi, err := os.Stat(path); err == nil {
-		seen = fi
-	}
+	// Consecutive passes seeing a file shorter than our position. Compaction
+	// produces exactly one or two of these; anything sustained is not one.
+	overrun := 0
 
 	for {
 		select {
@@ -435,34 +441,49 @@ func followSource(path string, offset int64, out chan<- *Message, stop <-chan st
 			time.Sleep(pollInterval)
 			continue
 		}
-		replaced := seen != nil && !os.SameFile(seen, fi)
-		seen = fi
+		// Convert to a file position every pass, never once at the top. The
+		// base is what a compaction changes, so re-reading it here is what
+		// makes a compaction invisible to this loop.
+		base := readBase(path)
+		physical := offset - base
 
-		// Identity alone is not enough: the log may have been replaced before
-		// this follower ever saw the original. Every valid offset in an NDJSON
-		// log is either 0 or one byte past a newline, so a misaligned offset
-		// is proof the file underneath changed.
-		if !replaced && offset > 0 && offset <= fi.Size() && !atRecordBoundary(path, offset) {
-			replaced = true
+		if physical < 0 {
+			// Compaction cut past where we had read. It computes the cut as
+			// the minimum over live subscribers, so this means we were not
+			// counted as one -- unsubscribed and resubscribed, or our entry
+			// was unreadable when prune ran. The messages are already gone;
+			// resume at the start of what survives rather than sit on an
+			// offset that can never be reached.
+			logf("%s was compacted past this session's position; %d bytes were missed",
+				path, -physical)
+			offset = base
+			physical = 0
 		}
 
-		if replaced || fi.Size() < offset {
-			// The file shrank. That is either a compaction, which rewound our
-			// persisted cursor by the amount it cut, or a genuine truncation.
-			// Trusting the persisted cursor covers both; resetting to zero
-			// would replay the whole log as duplicate notifications.
-			next := int64(0)
-			if reload != nil {
-				next = reload()
+		if physical > fi.Size() {
+			// Compaction renames the log and then writes the base, so for a
+			// moment the file is short while the base still says otherwise.
+			// That resolves within a poll. Anything that persists is not a
+			// compaction -- an external truncation, or a log deleted and
+			// recreated -- and must not be waited on forever.
+			overrun++
+			if overrun <= overrunGrace {
+				time.Sleep(pollInterval)
+				continue
 			}
-			if next > fi.Size() {
-				next = 0
-			}
-			logf("%s was replaced or truncated (%d -> %d bytes); resuming at %d",
-				path, offset, fi.Size(), next)
-			offset = next
+			// Not a compaction, so this is not the file we were reading:
+			// truncated, or replaced with unrelated content. Read it from the
+			// start rather than skipping to the end. Which of its bytes we
+			// have already seen is unknowable, and re-delivering a message is
+			// recoverable in a way that never delivering one is not.
+			logf("%s is shorter than this session's position and stayed that way; "+
+				"re-reading it from the start (%d bytes)", path, fi.Size())
+			offset = base
+			physical = 0
 		}
-		if fi.Size() == offset {
+		overrun = 0
+
+		if physical == fi.Size() {
 			time.Sleep(pollInterval)
 			continue
 		}
@@ -472,9 +493,9 @@ func followSource(path string, offset int64, out chan<- *Message, stop <-chan st
 			time.Sleep(pollInterval)
 			continue
 		}
-		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		if _, err := f.Seek(physical, io.SeekStart); err != nil {
 			f.Close()
-			offset = 0
+			offset = base
 			continue
 		}
 
@@ -507,21 +528,6 @@ func followSource(path string, offset int64, out chan<- *Message, stop <-chan st
 			persist(offset)
 		}
 	}
-}
-
-// atRecordBoundary reports whether offset sits immediately after a newline,
-// which is the only place a reader of an append-only NDJSON log may resume.
-func atRecordBoundary(path string, offset int64) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return true // cannot tell; do not thrash
-	}
-	defer f.Close()
-	var b [1]byte
-	if _, err := f.ReadAt(b[:], offset-1); err != nil {
-		return true
-	}
-	return b[0] == '\n'
 }
 
 // newRateLimiter returns an emit function that caps output per minute and

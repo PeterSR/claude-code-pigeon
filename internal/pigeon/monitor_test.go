@@ -623,7 +623,7 @@ func TestFollowSourcePersistsOffsetSoARestartDoesNotReplay(t *testing.T) {
 
 	out := make(chan *Message, 8)
 	stop := make(chan struct{})
-	go followSource(path, 0, out, stop, persist, nil, func(string, ...any) {})
+	go followSource(path, 0, out, stop, persist, func(string, ...any) {})
 
 	for _, want := range []string{"one", "two"} {
 		select {
@@ -646,7 +646,7 @@ func TestFollowSourcePersistsOffsetSoARestartDoesNotReplay(t *testing.T) {
 	out2 := make(chan *Message, 8)
 	stop2 := make(chan struct{})
 	defer close(stop2)
-	go followSource(path, readSaved(), out2, stop2, nil, nil, func(string, ...any) {})
+	go followSource(path, readSaved(), out2, stop2, nil, func(string, ...any) {})
 	appendMessage(t, path, "three")
 
 	select {
@@ -671,7 +671,7 @@ func TestFollowSourceSkipsUnparseableLines(t *testing.T) {
 	out := make(chan *Message, 4)
 	stop := make(chan struct{})
 	defer close(stop)
-	go followSource(path, 0, out, stop, nil, nil, func(string, ...any) {})
+	go followSource(path, 0, out, stop, nil, func(string, ...any) {})
 	appendMessage(t, path, "after the junk")
 
 	select {

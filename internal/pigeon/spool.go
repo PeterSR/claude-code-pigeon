@@ -342,36 +342,41 @@ func (n Namespace) Render(m *Message) string {
 	foreign := m.From.Namespace != "" && m.From.Namespace != n.String()
 	sender := truncate(Sanitize(m.From.Namespace), maxNS)
 
-	var b strings.Builder
+	var prefix string
 	switch {
 	case m.Topic == "":
-		b.WriteString("[pigeon] message from ")
+		prefix = "[pigeon] message from "
 	case global:
-		b.WriteString("[pigeon " + truncate(Sanitize(m.Topic), maxTopic) + "] from ")
+		prefix = "[pigeon " + truncate(Sanitize(m.Topic), maxTopic) + "] from "
 	default:
-		b.WriteString("[pigeon #" + truncate(Sanitize(m.Topic), maxTopic) + "] from ")
+		prefix = "[pigeon #" + truncate(Sanitize(m.Topic), maxTopic) + "] from "
 	}
-	b.WriteString(truncate(Sanitize(m.From.Display()), maxName))
-	if where := filepath.Base(m.From.Cwd); where != "" && where != "." && where != "/" {
-		b.WriteString(" (" + truncate(Sanitize(where), maxWhere) + ")")
+	prefix += truncate(Sanitize(m.From.Display()), maxName)
+
+	var where string
+	if w := filepath.Base(m.From.Cwd); w != "" && w != "." && w != "/" {
+		where = " (" + truncate(Sanitize(w), maxWhere) + ")"
 	}
 	// Named only where a message can have come from outside this namespace: a
 	// global topic, or a direct message that crossed. On a namespaced topic it
 	// is a constant, and a constant in every notification is noise.
+	var nsTag string
 	if sender != "" && (global || foreign) {
-		b.WriteString(" [ns: " + sender + "]")
+		nsTag = " [ns: " + sender + "]"
 	}
-	head := b.String()
 
-	// Build the trailing hints first, because the payload pointer must never be
-	// the thing that gets cut: it is the only route to a message whose body did
-	// not fit, so losing it strands the message entirely.
+	// The payload pointer must never be the thing that gets cut: it is the only
+	// route to a message whose body did not fit, so losing it strands the
+	// message. The old arithmetic clamped the body's allowance *up* when the
+	// rest was large, pushing the line past the budget so that a final truncate
+	// trimmed the end -- which is exactly where the pointer sits.
 	//
-	// The old arithmetic clamped the body's allowance *up* when head and tail
-	// were large, which pushed the line past the budget and left a final
-	// truncate to trim the end -- the tail, the pointer. Nothing is trimmed
-	// now. Hints are dropped whole, cheapest first, until the line fits.
-	var reply, topic, payload string
+	// So nothing is trimmed. Parts are dropped whole, in order of what the
+	// recipient can reconstruct without them, and the pointer is never in that
+	// order at all. It is also emitted first among the hints, so that if a
+	// pathological path leaves the line over budget even with everything else
+	// gone, the backstop truncate eats a hint rather than the pointer.
+	var reply, topicHint, payload string
 	if addr := m.From.Addr(); addr != "" {
 		qualifier := ""
 		if foreign {
@@ -387,7 +392,7 @@ func (n Namespace) Render(m *Message) string {
 		reply = " [no reply address: sent from a shell, not a session]"
 	}
 	if m.Topic != "" {
-		topic = " [topic: pigeon publish " + truncate(Sanitize(m.Topic), maxTopic) + "]"
+		topicHint = " [topic: pigeon publish " + truncate(Sanitize(m.Topic), maxTopic) + "]"
 	}
 	// Only ever point at a payload directory this session already knows: its
 	// own, or the shared one a global topic spills to. A hand-written spool line
@@ -398,48 +403,54 @@ func (n Namespace) Render(m *Message) string {
 		}
 	}
 
-	// A body that is spilled to a file is recoverable from the pointer, so it
-	// can be squeezed to nothing. One that is not spilled is all the recipient
-	// will ever get, so keep a readable minimum and give up a hint instead.
+	// A body spilled to a file is recoverable from the pointer, so it may be
+	// squeezed to nothing. One that was not spilled is all the recipient will
+	// ever get, so keep a readable minimum and give up something else instead.
 	minBody := 24
 	if payload != "" {
 		minBody = 0
 	}
-	room := 0
-	for {
-		room = RenderBudget - len([]rune(head)) - len([]rune(reply+topic+payload)) - 4
-		if room >= minBody {
-			break
+
+	// Each step gives up the cheapest thing left. The topic is already in the
+	// header; the working directory and the reply address are both recoverable
+	// with `pigeon ls`; the namespace tag only qualifies a reply that is by then
+	// already gone.
+	for _, give := range []func(){
+		func() {},
+		func() { topicHint = "" },
+		func() { where = "" },
+		func() { reply = "" },
+		func() { nsTag = "" },
+	} {
+		give()
+		head := prefix + where + nsTag
+		room := RenderBudget - len([]rune(head)) - len([]rune(payload+reply+topicHint)) - 4
+		if room < minBody {
+			continue
 		}
-		// Sacrifice in order of what the recipient can reconstruct without it:
-		// the topic is already named in the header, and a reply address can be
-		// found with `pigeon ls`. The pointer cannot be guessed at all.
-		switch {
-		case topic != "":
-			topic = ""
-		case reply != "":
-			reply = ""
-		default:
-			// Only the pointer is left. Keep it and let the body go.
+		if room > BodyBudget {
+			room = BodyBudget
+		}
+		if room < 0 {
 			room = 0
 		}
-		if topic == "" && reply == "" {
-			break
+		body := truncate(Sanitize(m.Text), room)
+		if body == "" {
+			return head + payload + reply + topicHint
 		}
-	}
-	if room > BodyBudget {
-		room = BodyBudget
-	}
-	if room < 0 {
-		room = 0
+		return head + " :: " + body + payload + reply + topicHint
 	}
 
-	tail := reply + topic + payload
-	body := truncate(Sanitize(m.Text), room)
-	if body == "" {
-		return head + tail
+	// Everything droppable is gone and it still does not fit, which needs a
+	// pathological state path. The pointer is the only part with no substitute,
+	// so give up the header for it before giving up any of it.
+	if len([]rune(prefix+payload)) <= RenderBudget {
+		return prefix + payload
 	}
-	return head + " :: " + body + tail
+	if len([]rune(payload)) <= RenderBudget {
+		return strings.TrimSpace(payload)
+	}
+	return truncate(prefix+payload, RenderBudget)
 }
 
 // ParseMessage reads one spool line.

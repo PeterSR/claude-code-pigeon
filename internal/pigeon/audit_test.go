@@ -2,6 +2,7 @@ package pigeon
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -259,6 +260,7 @@ func TestShellSenderKeepsCwdForANormalProject(t *testing.T) {
 // adopted an offset pointing at the end of the compacted file and skipped it
 // entirely, and one whose write landed after the rewind replayed the whole log.
 func TestCompactionDoesNotMoveAnyCursor(t *testing.T) {
+	requireRenameOverOpenFile(t)
 	withHome(t)
 	ns := DefaultNamespace()
 	from := Sender{Kind: "shell", Name: "sh"}
@@ -323,6 +325,7 @@ func TestCompactionDoesNotMoveAnyCursor(t *testing.T) {
 // The end-to-end property: a subscriber that was behind when the log was
 // compacted still receives every message it had not read, exactly once.
 func TestFollowerLosesNothingAcrossACompaction(t *testing.T) {
+	requireRenameOverOpenFile(t)
 	withHome(t)
 	ns := DefaultNamespace()
 	from := Sender{Kind: "shell", Name: "sh"}
@@ -428,27 +431,41 @@ func recordOffset(t *testing.T, path string, n int) int64 {
 // trimmed the end of the line, which is where the pointer lives. A message
 // whose body is in a file and whose pointer is cut is unreachable.
 func TestRenderKeepsThePayloadPointerWhenSpaceIsTight(t *testing.T) {
-	deep := filepath.Join(t.TempDir(), strings.Repeat("d", 60), strings.Repeat("e", 60))
-	t.Setenv(EnvHome, deep)
-	ns := mustNS(t, strings.Repeat("n", 60))
-	if err := ns.EnsureDirs(); err != nil {
-		t.Fatalf("EnsureDirs: %v", err)
-	}
+	// Swept across path lengths rather than fixed at one, because the first
+	// version of this test only passed on Linux: it leaned on t.TempDir() being
+	// short, and macOS, whose temp paths are far longer, went over the budget.
+	// The invariant has to hold at every length, so test it at every length.
+	for _, pad := range []int{0, 30, 60, 90, 120, 160, 200} {
+		t.Run(fmt.Sprintf("pad%d", pad), func(t *testing.T) {
+			home := filepath.Join(t.TempDir(), strings.Repeat("d", pad))
+			t.Setenv(EnvHome, home)
+			ns := mustNS(t, strings.Repeat("n", 60))
+			if err := ns.EnsureDirs(); err != nil {
+				t.Skipf("path too long for this filesystem: %v", err)
+			}
 
-	payload := filepath.Join(ns.PayloadsDir(), "m_deadbeefcafe.txt")
-	m := &Message{
-		From:    Sender{Kind: "session", SessionID: "aaaa1111", Name: strings.Repeat("s", 32), Cwd: "/tmp/" + strings.Repeat("w", 40), Namespace: "elsewhere"},
-		Topic:   strings.Repeat("t", 60),
-		Text:    strings.Repeat("body ", 200),
-		Payload: payload,
-	}
+			payload := filepath.Join(ns.PayloadsDir(), "m_deadbeefcafe.txt")
+			m := &Message{
+				From: Sender{
+					Kind: "session", SessionID: "aaaa1111",
+					Name: strings.Repeat("s", 32), Cwd: "/tmp/" + strings.Repeat("w", 40),
+					Namespace: "elsewhere",
+				},
+				Topic:   strings.Repeat("t", 60),
+				Text:    strings.Repeat("body ", 200),
+				Payload: payload,
+			}
 
-	got := ns.Render(m)
-	if n := len([]rune(got)); n > RenderBudget {
-		t.Errorf("line is %d runes, over the %d budget:\n%s", n, RenderBudget, got)
-	}
-	if !strings.Contains(got, payload) {
-		t.Errorf("the payload pointer was cut, stranding the message:\n%s", got)
+			got := ns.Render(m)
+			if n := len([]rune(got)); n > RenderBudget {
+				t.Errorf("line is %d runes, over the %d budget:\n%s", n, RenderBudget, got)
+			}
+			// The pointer is the only route to a body that did not fit inline.
+			// A truncated path is not a pointer.
+			if !strings.Contains(got, payload) {
+				t.Errorf("the payload pointer was cut, stranding the message:\n%s", got)
+			}
+		})
 	}
 }
 

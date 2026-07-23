@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -48,6 +49,8 @@ const usage = `pigeon -- message passing between live Claude Code sessions
   pigeon whoami                  show this session's identity and address
   pigeon name <name>             declare this session's name (usable as address)
   pigeon describe <text>         declare what this session is working on
+  pigeon doctor [--json]         check whether this session can receive mail
+  pigeon statusline [--plain]    one-line status for a Claude Code statusline
   pigeon prune                   forget dead sessions and reclaim topic logs
   pigeon monitor                 run the inbox monitor (used by the plugin)
   pigeon mcp                     run the MCP server (used by the plugin)
@@ -56,66 +59,93 @@ const usage = `pigeon -- message passing between live Claude Code sessions
 Targets resolve as: exact session id, declared name, id prefix, cwd basename.`
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println(usage)
-		return
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+}
+
+// run is main with its edges injected, so the CLI surface -- argument parsing,
+// output, exit codes -- is testable without spawning a process.
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stdout, usage)
+		return 0
 	}
-	cmd, args := os.Args[1], os.Args[2:]
+	cmd, rest := args[0], args[1:]
 
 	var err error
 	switch cmd {
 	case "arm":
-		err = pigeon.Arm(os.Stdout)
+		err = pigeon.Arm(stdout)
 	case "install":
-		err = pigeon.Install(version, os.Stdout)
+		err = pigeon.Install(version, stdout)
 	case "uninstall":
-		fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
-		purge := fs.Bool("purge", false, "also delete state and queued messages")
-		_ = fs.Parse(args)
-		err = pigeon.Uninstall(*purge, os.Stdout)
+		err = cmdUninstall(rest, stdout, stderr)
 	case "ls", "list":
-		err = cmdList(args)
+		err = cmdList(rest, stdout, stderr)
 	case "send":
-		err = cmdSend(args)
+		err = cmdSend(rest, stdout, stderr)
 	case "publish", "pub":
-		err = cmdPublish(args)
+		err = cmdPublish(rest, stdout)
 	case "subscribe", "sub":
-		err = cmdSubscribe(args)
+		err = cmdSubscribe(rest, stdout)
 	case "unsubscribe", "unsub":
-		err = cmdUnsubscribe(args)
+		err = cmdUnsubscribe(rest, stdout)
 	case "topics":
-		err = cmdTopics()
+		err = cmdTopics(stdout)
 	case "whoami":
-		err = cmdWhoami()
+		err = cmdWhoami(stdout)
 	case "name":
-		err = cmdName(args)
+		err = cmdName(rest, stdout)
 	case "describe":
-		err = cmdDescribe(args)
+		err = cmdDescribe(rest, stdout)
+	case "doctor":
+		err = cmdDoctor(rest, stdout, stderr)
+	case "statusline":
+		err = cmdStatusline(rest, stdin, stdout, stderr)
 	case "prune":
-		err = cmdPrune()
+		err = cmdPrune(stdout)
 	case "monitor":
-		err = pigeon.RunMonitor(os.Stdout, os.Stderr)
+		err = pigeon.RunMonitor(stdout, stderr)
 	case "mcp":
-		err = pigeon.RunMCP(os.Stdin, os.Stdout, version)
+		err = pigeon.RunMCP(stdin, stdout, version)
 	case "version", "--version", "-v":
-		fmt.Println(versionString())
+		fmt.Fprintln(stdout, versionString())
 	case "help", "--help", "-h":
-		fmt.Println(usage)
+		fmt.Fprintln(stdout, usage)
 	default:
 		err = fmt.Errorf("unknown command %q (try: pigeon help)", cmd)
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "pigeon: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "pigeon: %v\n", err)
+		return 1
 	}
+	return 0
 }
 
-func cmdList(args []string) error {
-	fs := flag.NewFlagSet("ls", flag.ExitOnError)
+// flags builds a flag set that reports errors instead of calling os.Exit, so a
+// bad flag surfaces as a normal error rather than killing the test binary.
+func flags(name string, stderr io.Writer) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	return fs
+}
+
+func cmdUninstall(args []string, w, stderr io.Writer) error {
+	fs := flags("uninstall", stderr)
+	purge := fs.Bool("purge", false, "also delete state and queued messages")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	return pigeon.Uninstall(*purge, w)
+}
+
+func cmdList(args []string, w, stderr io.Writer) error {
+	fs := flags("ls", stderr)
 	all := fs.Bool("all", false, "include sessions whose process has exited")
 	asJSON := fs.Bool("json", false, "machine-readable output")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	entries, err := pigeon.ListSessions(*all, false)
 	if err != nil {
@@ -132,28 +162,28 @@ func cmdList(args []string) error {
 		for _, e := range entries {
 			out = append(out, view{Entry: e, Status: string(e.Status), Addr: e.Addr()})
 		}
-		return printJSON(out)
+		return printJSON(w, out)
 	}
 	if len(entries) == 0 {
-		fmt.Println("no registered pigeon sessions")
-		fmt.Println("(a session registers when its monitor arms at startup;")
-		fmt.Println(" run `pigeon install` then restart Claude Code)")
+		fmt.Fprintln(w, "no registered pigeon sessions")
+		fmt.Fprintln(w, "(a session registers when its monitor arms at startup;")
+		fmt.Fprintln(w, " run `pigeon install` then restart Claude Code)")
 		return nil
 	}
 
 	me := pigeon.CurrentSessionID()
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "\tSESSION\tNAME\tSTATUS\tCWD\tDESCRIPTION")
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "\tSESSION\tNAME\tSTATUS\tCWD\tDESCRIPTION")
 	for _, e := range entries {
 		mark := " "
 		if e.SessionID == me {
 			mark = "*"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			mark, pigeon.Short(e.SessionID), dash(e.Name), e.Status,
 			abbrev(e.Cwd, 32), dash(truncate(e.Description, 40)))
 	}
-	if err := w.Flush(); err != nil {
+	if err := tw.Flush(); err != nil {
 		return err
 	}
 
@@ -168,28 +198,28 @@ func cmdList(args []string) error {
 	}
 	switch {
 	case self != nil:
-		fmt.Printf("\n* this session, reachable as: pigeon send %s\n", self.Addr())
+		fmt.Fprintf(w, "\n* this session, reachable as: pigeon send %s\n", self.Addr())
 	case me != "":
-		fmt.Printf("\nthis session (%s) is not registered, so nothing can reach it.\n", pigeon.Short(me))
-		fmt.Println("run `pigeon arm`, or install the plugin and restart Claude Code.")
+		fmt.Fprintf(w, "\nthis session (%s) is not registered, so nothing can reach it.\n", pigeon.Short(me))
+		fmt.Fprintln(w, "run `pigeon arm`, or install the plugin and restart Claude Code.")
 	default:
-		fmt.Println("\nnot inside a Claude Code session; anything you send is stamped")
-		fmt.Printf("%s and cannot be replied to.\n", pigeon.ShellIdentity())
+		fmt.Fprintln(w, "\nnot inside a Claude Code session; anything you send is stamped")
+		fmt.Fprintf(w, "%s and cannot be replied to.\n", pigeon.ShellIdentity())
 	}
 
 	for _, e := range entries {
 		if e.Status == pigeon.StatusDeaf {
-			fmt.Printf("\nwarning: %s is running but its monitor is not listening.\n",
+			fmt.Fprintf(w, "\nwarning: %s is running but its monitor is not listening.\n",
 				e.Display())
-			fmt.Println("messages queue on its spool, but only a monitor for the same session id")
-			fmt.Println("will read them (claude --resume); a new session gets a new id.")
+			fmt.Fprintln(w, "messages queue on its spool, but only a monitor for the same session id")
+			fmt.Fprintln(w, "will read them (claude --resume); a new session gets a new id.")
 			break
 		}
 	}
 	return nil
 }
 
-func cmdSend(args []string) error {
+func cmdSend(args []string, w, stderr io.Writer) error {
 	if len(args) < 2 {
 		return fmt.Errorf("usage: pigeon send <target> <text>")
 	}
@@ -203,12 +233,12 @@ func cmdSend(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("sent -> %s (%s)\n", pigeon.Short(to.SessionID), to.Display())
+	fmt.Fprintf(w, "sent -> %s (%s)\n", pigeon.Short(to.SessionID), to.Display())
 	if msg.Payload != "" {
-		fmt.Printf("body exceeded %d chars; full text at %s\n", pigeon.BodyBudget, msg.Payload)
+		fmt.Fprintf(w, "body exceeded %d chars; full text at %s\n", pigeon.BodyBudget, msg.Payload)
 	}
 	if to.Status == pigeon.StatusDeaf {
-		fmt.Fprintf(os.Stderr,
+		fmt.Fprintf(stderr,
 			"warning: %s has no listening monitor. The message is queued on its spool, but\n"+
 				"only a monitor for the same session id will ever read it (claude --resume).\n"+
 				"A brand-new session gets a new id and will not see it.\n",
@@ -217,7 +247,7 @@ func cmdSend(args []string) error {
 	return nil
 }
 
-func cmdPublish(args []string) error {
+func cmdPublish(args []string, w io.Writer) error {
 	if len(args) < 2 {
 		return fmt.Errorf("usage: pigeon publish <topic> <text>")
 	}
@@ -237,14 +267,14 @@ func cmdPublish(args []string) error {
 			}
 		}
 	}
-	fmt.Printf("published to #%s (%d subscriber(s) besides you)\n", topic, n)
+	fmt.Fprintf(w, "published to #%s (%d subscriber(s) besides you)\n", topic, n)
 	if msg.Payload != "" {
-		fmt.Printf("body exceeded %d chars; full text at %s\n", pigeon.BodyBudget, msg.Payload)
+		fmt.Fprintf(w, "body exceeded %d chars; full text at %s\n", pigeon.BodyBudget, msg.Payload)
 	}
 	return nil
 }
 
-func cmdSubscribe(args []string) error {
+func cmdSubscribe(args []string, w io.Writer) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: pigeon subscribe <topic>")
 	}
@@ -255,11 +285,11 @@ func cmdSubscribe(args []string) error {
 	if err := pigeon.Subscribe(e.SessionID, args[0]); err != nil {
 		return err
 	}
-	fmt.Printf("subscribed to #%s (takes effect within a second, no restart)\n", args[0])
+	fmt.Fprintf(w, "subscribed to #%s (takes effect within a second, no restart)\n", args[0])
 	return nil
 }
 
-func cmdUnsubscribe(args []string) error {
+func cmdUnsubscribe(args []string, w io.Writer) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: pigeon unsubscribe <topic>")
 	}
@@ -270,11 +300,11 @@ func cmdUnsubscribe(args []string) error {
 	if err := pigeon.Unsubscribe(e.SessionID, args[0]); err != nil {
 		return err
 	}
-	fmt.Printf("unsubscribed from #%s\n", args[0])
+	fmt.Fprintf(w, "unsubscribed from #%s\n", args[0])
 	return nil
 }
 
-func cmdTopics() error {
+func cmdTopics(w io.Writer) error {
 	topics, err := pigeon.ListTopics()
 	if err != nil {
 		return err
@@ -287,48 +317,48 @@ func cmdTopics() error {
 			}
 		}
 	}
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "\tTOPIC\tSUBSCRIBERS")
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "\tTOPIC\tSUBSCRIBERS")
 	for _, t := range topics {
 		mark := " "
 		if mine[t.Name] {
 			mark = "*"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%d\n", mark, t.Name, t.Subscribers)
+		fmt.Fprintf(tw, "%s\t%s\t%d\n", mark, t.Name, t.Subscribers)
 	}
-	return w.Flush()
+	return tw.Flush()
 }
 
-func cmdWhoami() error {
+func cmdWhoami(w io.Writer) error {
 	sid := pigeon.CurrentSessionID()
 	if sid == "" {
-		fmt.Printf("not inside a Claude Code session; sending as %s\n", pigeon.ShellIdentity())
+		fmt.Fprintf(w, "not inside a Claude Code session; sending as %s\n", pigeon.ShellIdentity())
 		return nil
 	}
 	e, err := pigeon.ReadEntry(sid)
 	if err != nil {
-		fmt.Printf("session:  %s\n", sid)
-		fmt.Println("not registered -- is the pigeon plugin installed and the session restarted?")
+		fmt.Fprintf(w, "session:  %s\n", sid)
+		fmt.Fprintln(w, "not registered -- is the pigeon plugin installed and the session restarted?")
 		return nil
 	}
-	fmt.Printf("session:      %s\n", e.SessionID)
-	fmt.Printf("name:         %s\n", dash(e.Name))
-	fmt.Printf("description:  %s\n", dash(e.Description))
-	fmt.Printf("cwd:          %s\n", e.Cwd)
-	fmt.Printf("status:       %s\n", e.Status)
-	fmt.Printf("topics:       %s\n", dash(strings.Join(e.Subscriptions, ", ")))
-	fmt.Printf("inbox:        %s\n", pigeon.SpoolPath(e.SessionID))
-	fmt.Printf("\nothers reach you with:  pigeon send %s \"...\"\n", e.Addr())
+	fmt.Fprintf(w, "session:      %s\n", e.SessionID)
+	fmt.Fprintf(w, "name:         %s\n", dash(e.Name))
+	fmt.Fprintf(w, "description:  %s\n", dash(e.Description))
+	fmt.Fprintf(w, "cwd:          %s\n", e.Cwd)
+	fmt.Fprintf(w, "status:       %s\n", e.Status)
+	fmt.Fprintf(w, "topics:       %s\n", dash(strings.Join(e.Subscriptions, ", ")))
+	fmt.Fprintf(w, "inbox:        %s\n", pigeon.SpoolPath(e.SessionID))
+	fmt.Fprintf(w, "\nothers reach you with:  pigeon send %s \"...\"\n", e.Addr())
 	return nil
 }
 
-func cmdName(args []string) error {
+func cmdName(args []string, w io.Writer) error {
 	e, err := ownEntry()
 	if err != nil {
 		return err
 	}
 	if len(args) == 0 {
-		fmt.Println(dash(e.Name))
+		fmt.Fprintln(w, dash(e.Name))
 		return nil
 	}
 	name := strings.TrimSpace(strings.Join(args, " "))
@@ -344,17 +374,17 @@ func cmdName(args []string) error {
 	}); err != nil {
 		return err
 	}
-	fmt.Printf("name set to %q -- others can now use: pigeon send %s \"...\"\n", name, name)
+	fmt.Fprintf(w, "name set to %q -- others can now use: pigeon send %s \"...\"\n", name, name)
 	return nil
 }
 
-func cmdDescribe(args []string) error {
+func cmdDescribe(args []string, w io.Writer) error {
 	e, err := ownEntry()
 	if err != nil {
 		return err
 	}
 	if len(args) == 0 {
-		fmt.Println(dash(e.Description))
+		fmt.Fprintln(w, dash(e.Description))
 		return nil
 	}
 	desc := pigeon.Sanitize(strings.Join(args, " "))
@@ -364,11 +394,45 @@ func cmdDescribe(args []string) error {
 	}); err != nil {
 		return err
 	}
-	fmt.Println("description updated")
+	fmt.Fprintln(w, "description updated")
 	return nil
 }
 
-func cmdPrune() error {
+func cmdDoctor(args []string, w, stderr io.Writer) error {
+	fs := flags("doctor", stderr)
+	asJSON := fs.Bool("json", false, "machine-readable output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	return pigeon.Doctor(w, *asJSON)
+}
+
+func cmdStatusline(args []string, stdin io.Reader, w, stderr io.Writer) error {
+	fs := flags("statusline", stderr)
+	plain := fs.Bool("plain", false, "no emoji or colour")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	return pigeon.Statusline(statuslineStdin(stdin), w, pigeon.StatuslineOptions{Plain: *plain})
+}
+
+// statuslineStdin hands over stdin only when something is actually piped in.
+// Claude Code pipes a JSON payload; a human running `pigeon statusline` at a
+// prompt is not going to type one, and reading from the terminal would just
+// hang with no indication why.
+func statuslineStdin(stdin io.Reader) io.Reader {
+	f, isFile := stdin.(*os.File)
+	if !isFile {
+		return stdin
+	}
+	fi, err := f.Stat()
+	if err != nil || fi.Mode()&os.ModeCharDevice != 0 {
+		return nil
+	}
+	return f
+}
+
+func cmdPrune(w io.Writer) error {
 	before, err := pigeon.ListSessions(true, false)
 	if err != nil {
 		return err
@@ -380,15 +444,17 @@ func cmdPrune() error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("pruned %d dead session(s)\n", len(before)-len(after))
+	fmt.Fprintf(w, "pruned %d dead session(s)\n", len(before)-len(after))
 
 	// Topic logs are append-only, so reclaim the prefix every live subscriber
 	// has already read, and drop logs nobody subscribes to.
+	orphans := pigeon.ReconcileOrphans()
 	res, err := pigeon.PruneTopics()
 	if err != nil {
 		return err
 	}
-	fmt.Printf("removed %d unsubscribed topic log(s), compacted %d, reclaimed %s\n",
+	fmt.Fprintf(w, "removed %d orphaned state file(s)\n", orphans)
+	fmt.Fprintf(w, "removed %d unsubscribed topic log(s), compacted %d, reclaimed %s\n",
 		res.TopicsRemoved, res.TopicsCompacted, humanBytes(res.BytesReclaimed))
 	return nil
 }
@@ -416,8 +482,8 @@ func ownEntry() (*pigeon.Entry, error) {
 	return e, nil
 }
 
-func printJSON(v any) error {
-	enc := json.NewEncoder(os.Stdout)
+func printJSON(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
 }

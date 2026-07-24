@@ -29,7 +29,7 @@ const (
 	// testedCCVersion is the newest release the mechanism was verified against
 	// end to end. Newer is not assumed broken -- it is untested, which is a
 	// different and milder claim.
-	testedCCVersion = "2.1.217"
+	testedCCVersion = "2.1.218"
 )
 
 // CheckLevel is how much a failed check matters.

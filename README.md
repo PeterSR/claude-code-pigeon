@@ -534,7 +534,7 @@ session as a `<task_notification>`, which wakes it if idle.
 **This behaviour is shipped but undocumented.** That monitors are started at all, that
 `CLAUDE_CODE_SESSION_ID` is injected into them, and that their stdout becomes a
 notification are all observed, not promised. They were verified end to end against Claude Code
-2.1.217, and requiring 2.1.105 or newer for the session id. A future release could change
+2.1.218, and requiring 2.1.105 or newer for the session id. A future release could change
 any of it, and the failure would be silent. That is what `pigeon doctor` is for: it checks
 each assumption separately and warns when your Claude Code is newer than the version this
 was tested against.

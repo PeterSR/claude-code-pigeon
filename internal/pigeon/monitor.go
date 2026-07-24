@@ -285,21 +285,24 @@ func register(ns Namespace, sid string, logf func(string, ...any)) error {
 		subs = defaultSubscriptions(ns)
 	}
 	now := nowRFC3339()
+	claude := LookupClaudeSession(pid, sid)
 	if err := ns.WriteEntry(&Entry{
-		SessionID:     sid,
-		Namespace:     ns.String(),
-		Name:          name,
-		Description:   desc,
-		PID:           pid,
-		ProcStart:     ProcStart(pid),
-		Cwd:           cwd,
-		Host:          hostname(),
-		StartedAt:     now,
-		HeartbeatAt:   now,
-		Subscriptions: subs,
-		CCVersion:     os.Getenv(EnvVersion),
-		Driven:        os.Getenv(EnvChild) == "1",
-		Private:       cfg != nil && cfg.Private,
+		SessionID:        sid,
+		Namespace:        ns.String(),
+		Name:             name,
+		Description:      desc,
+		PID:              pid,
+		ProcStart:        ProcStart(pid),
+		Cwd:              cwd,
+		Host:             hostname(),
+		StartedAt:        now,
+		HeartbeatAt:      now,
+		Subscriptions:    subs,
+		CCVersion:        os.Getenv(EnvVersion),
+		ClaudeName:       claude.Name,
+		ClaudeNameSource: claude.Source,
+		Driven:           os.Getenv(EnvChild) == "1",
+		Private:          cfg != nil && cfg.Private,
 	}); err != nil {
 		return err
 	}
@@ -391,6 +394,14 @@ func heartbeat(ns Namespace, sid string, done <-chan struct{}) {
 			// read-modify-write here is exactly how the entry gets shredded.
 			_ = ns.MutateEntry(sid, func(e *Entry) error {
 				e.HeartbeatAt = nowRFC3339()
+				// Refresh the host label too, so a session renamed in Claude
+				// Code mid-run is reflected within a heartbeat. Only overwrite
+				// on a successful read: a transient miss must not blank a name
+				// peers can already see. WriteEntry re-blanks it for a private
+				// session, so this cannot resurrect a withheld one.
+				if claude := LookupClaudeSession(e.PID, sid); claude.Name != "" {
+					e.ClaudeName, e.ClaudeNameSource = claude.Name, claude.Source
+				}
 				return nil
 			})
 		}

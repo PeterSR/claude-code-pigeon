@@ -91,8 +91,40 @@ func Diagnose() []Check {
 	out = append(out, checkPlugin()...)
 	out = append(out, checkProjectConfig())
 	out = append(out, checkRegistration()...)
+	out = append(out, checkClaudeSession())
 	out = append(out, checkPeers())
 	return out
+}
+
+// checkClaudeSession reports whether pigeon can read Claude Code's own session
+// name -- the /status label it reflects in `ls`, list_sessions and templates.
+//
+// This is auxiliary, not a delivery link, so it never fails: a miss means the
+// session shows pigeon's own derived name instead, and mail still arrives. It
+// earns a check anyway because the file it reads is another undocumented Claude
+// Code internal, so when a host upgrade moves it, this is where the silence gets
+// a name rather than the label just quietly going blank everywhere.
+func checkClaudeSession() Check {
+	sid := CurrentSessionID()
+	if sid == "" {
+		return ok("claude name", "not inside a session; nothing to read")
+	}
+	pid := CurrentClaudePID()
+	if pid <= 0 {
+		return warn("claude name", EnvClaudePID+" is unset, so the session index cannot be located",
+			"harmless unless you want the /status name; pigeon falls back to its own")
+	}
+	path := filepath.Join(claudeConfigDir(), "sessions", strconv.Itoa(pid)+".json")
+	cs := LookupClaudeSession(pid, sid)
+	if cs.Name == "" {
+		return warn("claude name", "no readable session index at "+path,
+			"Claude Code may have moved or renamed it; pigeon shows its own derived name instead")
+	}
+	detail := cs.Name
+	if cs.Source != "" {
+		detail += " (" + cs.Source + ")"
+	}
+	return ok("claude name", detail)
 }
 
 // checkNamespace names the group this session is in and where that came from.

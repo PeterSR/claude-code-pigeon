@@ -261,9 +261,9 @@ func cmdList(args []string, w, stderr io.Writer) error {
 	me := pigeon.CurrentSessionID()
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	if *allNS {
-		fmt.Fprintln(tw, "\tNAMESPACE\tSESSION\tNAME\tSTATUS\tCWD\tDESCRIPTION")
+		fmt.Fprintln(tw, "\tNAMESPACE\tSESSION\tNAME\tCLAUDE\tPID\tSTATUS\tCWD\tDESCRIPTION")
 	} else {
-		fmt.Fprintln(tw, "\tSESSION\tNAME\tSTATUS\tCWD\tDESCRIPTION")
+		fmt.Fprintln(tw, "\tSESSION\tNAME\tCLAUDE\tPID\tSTATUS\tCWD\tDESCRIPTION")
 	}
 	for _, e := range entries {
 		mark := " "
@@ -275,8 +275,9 @@ func cmdList(args []string, w, stderr io.Writer) error {
 		} else {
 			fmt.Fprintf(tw, "%s\t", mark)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
-			pigeon.Short(e.SessionID), dash(e.Name), e.Status,
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			pigeon.Short(e.SessionID), dash(e.Name), dash(truncate(e.ClaudeName, 24)),
+			pidCol(e.PID), e.Status,
 			abbrev(e.Cwd, 32), dash(truncate(e.Description, 40)))
 	}
 	if err := tw.Flush(); err != nil {
@@ -590,7 +591,9 @@ func cmdWhoami(w io.Writer) error {
 	}
 	fmt.Fprintf(w, "session:      %s\n", e.SessionID)
 	fmt.Fprintf(w, "namespace:    %s\n", e.Namespace)
+	fmt.Fprintf(w, "pid:          %s\n", pidCol(e.PID))
 	fmt.Fprintf(w, "name:         %s\n", dash(e.Name))
+	fmt.Fprintf(w, "claude name:  %s\n", claudeNameCol(e))
 	fmt.Fprintf(w, "description:  %s\n", dash(e.Description))
 	fmt.Fprintf(w, "cwd:          %s\n", e.Cwd)
 	fmt.Fprintf(w, "status:       %s\n", e.Status)
@@ -841,6 +844,26 @@ func dash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// pidCol renders a pid for the ls table, or a dash when there is none.
+func pidCol(pid int) string {
+	if pid <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d", pid)
+}
+
+// claudeNameCol renders Claude Code's own session name for whoami, noting how it
+// was arrived at so a mostly-cosmetic "derived" name is not read as a chosen one.
+func claudeNameCol(e *pigeon.Entry) string {
+	if strings.TrimSpace(e.ClaudeName) == "" {
+		return "-"
+	}
+	if e.ClaudeNameSource != "" {
+		return fmt.Sprintf("%s (%s)", e.ClaudeName, e.ClaudeNameSource)
+	}
+	return e.ClaudeName
 }
 
 func truncate(s string, n int) string {

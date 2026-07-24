@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -54,7 +55,16 @@ type Entry struct {
 	HeartbeatAt   string   `json:"heartbeatAt,omitempty"`
 	Subscriptions []string `json:"subscriptions,omitempty"`
 	CCVersion     string   `json:"ccVersion,omitempty"`
-	Driven        bool     `json:"driven,omitempty"`
+	// ClaudeName is Claude Code's own session name, the one /status shows, and
+	// ClaudeNameSource is how Claude Code arrived at it ("derived" from the cwd,
+	// or user-set). Both are a host label pigeon merely reflects, never an
+	// address -- Name is what routing uses. They are filled in best-effort from
+	// Claude Code's session index and refreshed by the heartbeat, so a mid-session
+	// rename shows up within about 15s; empty when the index cannot be read.
+	// Withheld for private sessions, because a derived name echoes the cwd.
+	ClaudeName       string `json:"claudeName,omitempty"`
+	ClaudeNameSource string `json:"claudeNameSource,omitempty"`
+	Driven           bool   `json:"driven,omitempty"`
 	// Private sessions publish no cwd and no description. The flag itself is
 	// published so this session can be told why its own entry looks bare.
 	Private bool `json:"private,omitempty"`
@@ -152,7 +162,11 @@ func (n Namespace) WriteEntry(e *Entry) error {
 	// cannot receive mail.
 	rec.Namespace = n.String()
 	if rec.Private {
+		// The Claude name goes too: a derived one is the cwd basename with a
+		// suffix, so publishing it would leak exactly the directory Private is
+		// meant to keep off the bus.
 		rec.Cwd, rec.Description = "", ""
+		rec.ClaudeName, rec.ClaudeNameSource = "", ""
 	}
 	b, err := json.MarshalIndent(&rec, "", "  ")
 	if err != nil {
@@ -508,9 +522,15 @@ func (n Namespace) reconcileOrphans() int {
 	return removed
 }
 
-// ResolveTarget finds a session by exact id, self-declared name, id prefix, or
-// cwd basename -- in that order. Dead sessions are never resolved; deaf ones
-// are, so the caller can warn rather than silently fail.
+// ResolveTarget finds a session by exact id, exact pid, self-declared name, id
+// prefix, or cwd basename -- in that order. Dead sessions are never resolved;
+// deaf ones are, so the caller can warn rather than silently fail.
+//
+// A pid is exact and unique among live sessions, so it ranks with the session
+// id above the fuzzier name/prefix/basename tiers. A numeric token is also a
+// valid hex id-prefix, so the pid tier wins that overlap deliberately: someone
+// typing a pid means the process, not a UUID that happens to start with those
+// digits.
 //
 // It searches one namespace, which is what makes namespaces isolation rather
 // than decoration: a name that is taken next door is not taken here, and a
@@ -532,10 +552,13 @@ func (n Namespace) ResolveTarget(token string) (*Entry, error) {
 		return nil, fmt.Errorf("no live pigeon sessions registered in namespace %q", n)
 	}
 
-	var byName, byPrefix, byCwd []*Entry
+	var byPid, byName, byPrefix, byCwd []*Entry
 	for _, e := range all {
 		if e.SessionID == token {
 			return e, nil
+		}
+		if e.PID > 0 && strconv.Itoa(e.PID) == token {
+			byPid = append(byPid, e)
 		}
 		if e.Name != "" && strings.EqualFold(e.Name, token) {
 			byName = append(byName, e)
@@ -547,7 +570,7 @@ func (n Namespace) ResolveTarget(token string) (*Entry, error) {
 			byCwd = append(byCwd, e)
 		}
 	}
-	for _, set := range [][]*Entry{byName, byPrefix, byCwd} {
+	for _, set := range [][]*Entry{byPid, byName, byPrefix, byCwd} {
 		switch len(set) {
 		case 1:
 			return set[0], nil

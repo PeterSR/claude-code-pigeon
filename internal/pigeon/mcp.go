@@ -67,9 +67,10 @@ func tools() []toolDef {
 		{
 			Name: "list_sessions",
 			Description: "List live Claude Code sessions reachable via pigeon, with their " +
-				"name, description, working directory, namespace and status. Status 'deaf' " +
-				"means the session is running but not listening, so messages to it will not " +
-				"arrive. Only this session's namespace is listed unless one is named.",
+				"name, description, working directory, namespace, status, pid, and Claude " +
+				"Code's own session name (the one /status shows, shown as claude=). Status " +
+				"'deaf' means the session is running but not listening, so messages to it " +
+				"will not arrive. Only this session's namespace is listed unless one is named.",
 			InputSchema: obj(map[string]any{
 				"type": "object",
 				"properties": obj(map[string]any{
@@ -90,7 +91,9 @@ func tools() []toolDef {
 					"to": obj(map[string]any{
 						"type": "string",
 						"description": "Target session: its declared name, session id (or a " +
-							"prefix), or the basename of its working directory.",
+							"prefix), its pid, or the basename of its working directory. " +
+							"Claude Code's own session name is not a target; use the declared " +
+							"name or pid from list_sessions.",
 					}),
 					"text": obj(map[string]any{
 						"type":        "string",
@@ -170,8 +173,9 @@ func tools() []toolDef {
 		},
 		{
 			Name: "whoami",
-			Description: "Show this session's pigeon identity: session id, namespace, declared " +
-				"name, description, and the address other sessions use to reach it.",
+			Description: "Show this session's pigeon identity: session id, namespace, pid, " +
+				"declared name, Claude Code's own session name, description, and the address " +
+				"other sessions use to reach it.",
 			InputSchema: obj(map[string]any{
 				"type":       "object",
 				"properties": obj(map[string]any{}),
@@ -185,9 +189,10 @@ func tools() []toolDef {
 				"field can be given as a Go text/template rendered against this session: " +
 				"{{.Dir}} the working directory's basename, {{.Cwd}} its full path, " +
 				"{{.Branch}} the checked-out git branch, {{.Host}}, {{.User}}, {{.Session}}, " +
-				"{{.Short}} the 8-character session id, and {{.Seq}}, which counts this " +
-				"session among those already in the same directory. Functions: snake, kebab, " +
-				"lower, upper, trunc N, default \"fallback\".",
+				"{{.Short}} the 8-character session id, {{.Seq}}, which counts this " +
+				"session among those already in the same directory, and {{.ClaudeName}} " +
+				"(alias {{.Label}}), Claude Code's own session name from /status. Functions: " +
+				"snake, kebab, lower, upper, trunc N, default \"fallback\".",
 			InputSchema: obj(map[string]any{
 				"type": "object",
 				"properties": obj(map[string]any{
@@ -425,8 +430,16 @@ func mcpList(ns Namespace) (string, error) {
 		} else {
 			b.WriteString("  ")
 		}
-		fmt.Fprintf(&b, "%s  addr=%s  status=%s  ns=%s  cwd=%s",
-			Short(e.SessionID), e.Addr(), e.Status, e.Namespace, e.Cwd)
+		fmt.Fprintf(&b, "%s  addr=%s", Short(e.SessionID), e.Addr())
+		if e.PID > 0 {
+			// A pid is also a valid send target, so surface it next to addr.
+			fmt.Fprintf(&b, "  pid=%d", e.PID)
+		}
+		fmt.Fprintf(&b, "  status=%s  ns=%s  cwd=%s", e.Status, e.Namespace, e.Cwd)
+		if e.ClaudeName != "" {
+			// Claude Code's own /status name. Informational, not an address.
+			fmt.Fprintf(&b, "  claude=%s", e.ClaudeName)
+		}
 		if e.Description != "" {
 			fmt.Fprintf(&b, "\n      %s", Sanitize(e.Description))
 		}
@@ -592,7 +605,11 @@ func mcpWhoami() (string, error) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "session:     %s\n", e.SessionID)
 	fmt.Fprintf(&b, "namespace:   %s\n", e.Namespace)
+	if e.PID > 0 {
+		fmt.Fprintf(&b, "pid:         %d\n", e.PID)
+	}
 	fmt.Fprintf(&b, "name:        %s\n", orDash(e.Name))
+	fmt.Fprintf(&b, "claude name: %s\n", claudeNameLine(e))
 	fmt.Fprintf(&b, "description: %s\n", orDash(e.Description))
 	fmt.Fprintf(&b, "cwd:         %s\n", e.Cwd)
 	fmt.Fprintf(&b, "status:      %s\n", e.Status)
@@ -676,4 +693,16 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// claudeNameLine renders Claude Code's own session name with its source, so a
+// model reading whoami can tell a derived name (cwd echo) from a chosen one.
+func claudeNameLine(e *Entry) string {
+	if strings.TrimSpace(e.ClaudeName) == "" {
+		return "-"
+	}
+	if e.ClaudeNameSource != "" {
+		return e.ClaudeName + " (" + e.ClaudeNameSource + ")"
+	}
+	return e.ClaudeName
 }

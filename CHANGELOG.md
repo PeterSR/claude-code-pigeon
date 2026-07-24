@@ -6,6 +6,25 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+- The pid is now a send target. `pigeon send <pid> "..."` resolves the session owning that
+  claude process, ahead of the fuzzier name, prefix and cwd tiers, since a pid is exact and
+  unique among live sessions. Useful when a session is unnamed and you already have its pid.
+- Claude Code's own session name -- the one `/status` shows -- is surfaced as a new `CLAUDE`
+  column in `pigeon ls`, in `list_sessions` and `whoami`, and as a `{{.ClaudeName}}`
+  (and `{{.ClaudeNameSource}}`) template field for project configs. It is a host label, not
+  an address: routing still keys on the pigeon `name`, and the Claude name is not a send
+  target. A derived name mostly echoes the cwd; it earns its place when a session is renamed
+  in Claude Code, which pigeon cannot derive on its own.
+
+  It is read best-effort from Claude Code's per-session index
+  (`~/.claude/sessions/<pid>.json`, relocated by `CLAUDE_CONFIG_DIR`), keyed by the claude
+  pid and verified against the session id before it is trusted, so a recycled pid cannot
+  mislabel a session. Like every other undocumented host behaviour pigeon leans on, `pigeon
+  doctor` checks it and it degrades to empty rather than failing. A private session withholds
+  it along with its cwd, because a derived name would leak the directory.
+- `pigeon ls` also shows a `PID` column, and `whoami` a `pid:` line.
+
 ## [0.2.0] - 2026-07-23
 
 ### Added

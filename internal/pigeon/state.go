@@ -37,6 +37,11 @@ const (
 	EnvProjectDir = "CLAUDE_PROJECT_DIR"
 	EnvVersion    = "CLAUDE_CODE_VERSION"
 	EnvChild      = "CLAUDE_CODE_CHILD_SESSION"
+	// EnvConfigDir is where Claude Code keeps its own state, which is where
+	// pigeon reads the session name /status shows. It is deliberately separate
+	// from PIGEON_HOME: pigeon's own state can be relocated without moving
+	// Claude's, and the two default to siblings under ~/.claude.
+	EnvConfigDir = "CLAUDE_CONFIG_DIR"
 
 	// EnvOptOut lets a launcher that drives sessions programmatically
 	// (claude-p, pupptyeer, CI) keep them out of the bus.

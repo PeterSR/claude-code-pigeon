@@ -8,9 +8,9 @@ keystroke, nothing to arm by hand.
 
 ```console
 $ pigeon ls
-   SESSION   NAME   STATUS  CWD                DESCRIPTION
- * aaaa1111  alpha  live    ~/dev/api-server   refactoring the parser
-   bbbb2222  beta   live    ~/dev/frontend     -
+   SESSION   NAME   CLAUDE       PID    STATUS  CWD               DESCRIPTION
+ * aaaa1111  alpha  api-server   41822  live    ~/dev/api-server  refactoring the parser
+   bbbb2222  beta   frontend-b3  41977  live    ~/dev/frontend    -
 
 $ pigeon send alpha "the build is green"
 sent -> aaaa1111 (alpha)
@@ -82,8 +82,8 @@ pigeon statusline [--plain]     one-line alarm for a Claude Code statusline
 pigeon prune                    forget sessions whose process is gone
 ```
 
-Targets resolve as **exact session id → declared name → id prefix → cwd basename**,
-within one [namespace](#namespaces). `ls`, `send`, `publish`, `topics` and `prune` take
+Targets resolve as **exact session id → pid → declared name → id prefix → cwd
+basename**, within one [namespace](#namespaces). `ls`, `send`, `publish`, `topics` and `prune` take
 `-n`/`--namespace <ns>`; `ls`, `topics` and `prune` also take `--all-namespaces`.
 
 Sender identity is attached automatically. A session never has to know its own address for
@@ -157,6 +157,9 @@ has to be escaped.
 | `.Short` | its first 8 characters, the form `pigeon ls` shows |
 | `.Seq` | 1 plus the number of live sessions already in this directory |
 | `.Name` | in `onNameTaken` only: the name that was already taken |
+| `.ClaudeName` | Claude Code's own session name, the one `/status` shows. Filled in only for the current session; empty otherwise. See [below](#the-pid-and-claude-codes-own-session-name) |
+| `.Label` | an alias for `.ClaudeName`, for templates that prefer the shorter word |
+| `.ClaudeNameSource` | how Claude Code arrived at it: `derived` from the cwd, or a value that marks it user-set |
 
 | Function | What it does |
 |---|---|
@@ -218,6 +221,33 @@ parse, fails to render, or renders to something unusable is a reported problem a
 failed registration: the session still comes up, unnamed, and the monitor log says what
 happened.
 
+### The pid and Claude Code's own session name
+
+`pigeon ls` shows two more columns, and both also appear in `list_sessions` and
+`whoami`.
+
+`PID` is the claude process id. It is a valid send target too, so `pigeon send
+41822 "..."` reaches that session. A pid is exact and unique among live
+sessions, so it resolves ahead of the fuzzier name, prefix and cwd tiers; it is
+the handle to reach when a session is unnamed and you already have its pid from
+`ps` or the OS.
+
+`CLAUDE` is the name Claude Code gives the session itself, the one `/status`
+shows. It is a label, not an address: routing keys on the pigeon `name` you
+declare, never on this, and it is not accepted as a send target. By default
+Claude Code derives it from the working directory, so it mostly echoes what
+`cwd` already says; it earns its column when you rename a session in Claude
+Code, which is the one name pigeon cannot derive for you. Templates can read it
+as `{{.ClaudeName}}`, so a workflow built around those renames can adopt it with
+`"name": "{{.ClaudeName}}"`.
+
+pigeon reads it from Claude Code's own per-session index, which is another piece
+of shipped-but-undocumented behaviour (see [How it works](#how-it-works)), so it
+fails soft: if a release moves the file the column falls back to empty, `pigeon
+doctor` reports whether the read works, and nothing else breaks. A private
+session withholds it along with its cwd, because a derived name would leak the
+directory the session asked to keep off the bus.
+
 ### Topics
 
 Every session joins `all` by default, so `pigeon publish all "…"` broadcasts to your
@@ -257,9 +287,9 @@ $ pigeon namespaces
    acme       1     1
 
 $ pigeon ls
-   SESSION   NAME   STATUS  CWD               DESCRIPTION
- * aaaa1111  alpha  live    ~/dev/api-server  refactoring the parser
-   bbbb2222  beta   live    ~/dev/frontend    -
+   SESSION   NAME   CLAUDE       PID    STATUS  CWD               DESCRIPTION
+ * aaaa1111  alpha  api-server   41822  live    ~/dev/api-server  refactoring the parser
+   bbbb2222  beta   frontend-b3  41977  live    ~/dev/frontend    -
 
 2 session(s) in 1 other namespace(s) (--all-namespaces)
 ```
@@ -508,6 +538,13 @@ notification are all observed, not promised. They were verified end to end again
 any of it, and the failure would be silent. That is what `pigeon doctor` is for: it checks
 each assumption separately and warns when your Claude Code is newer than the version this
 was tested against.
+
+The session name in `pigeon ls` leans on one more observation of the same kind: Claude Code
+writes a per-session index under its own config directory
+(`~/.claude/sessions/<pid>.json`, relocated by `CLAUDE_CONFIG_DIR`), and pigeon reads the
+`/status` name from there. It is keyed by the claude pid and verified against the session id
+before it is trusted, `pigeon doctor` reports whether the read works, and a release that
+moves the file costs the column and nothing else.
 
 pigeon's monitor follows two kinds of source: the session's own inbox spool, and one log
 per subscribed topic. It identifies itself from `CLAUDE_CODE_SESSION_ID`, which Claude Code

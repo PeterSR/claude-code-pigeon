@@ -67,6 +67,16 @@ type TemplateContext struct {
 	// Name is populated only for the onNameTaken template, where it holds the
 	// name that was already taken. It is empty everywhere else.
 	Name string
+	// ClaudeName is Claude Code's own session name (what /status shows), and
+	// ClaudeNameSource is how it arrived at it. They let a project reuse the
+	// host label, e.g. `"name": "{{.ClaudeName}}"`, and are filled in only when
+	// rendering for the current session -- the only one whose index pigeon can
+	// key off CLAUDE_PID. They are empty otherwise, including in tests.
+	ClaudeName       string
+	ClaudeNameSource string
+	// Label is an alias for ClaudeName, for templates that prefer the shorter
+	// word. It always holds the same value.
+	Label string
 }
 
 // NewTemplateContext gathers the facts a template may refer to for one session.
@@ -79,15 +89,25 @@ func NewTemplateContext(ns Namespace, sessionID, cwd string) TemplateContext {
 	if cwd != "" {
 		dir = filepath.Base(cwd)
 	}
+	// The Claude name is only knowable for the current session: its index is
+	// keyed by CLAUDE_PID, which names this process's session and no other. For
+	// any other id (a test, a peer) the fields stay empty rather than guess.
+	var claude ClaudeSession
+	if sessionID == CurrentSessionID() {
+		claude = LookupClaudeSession(CurrentClaudePID(), sessionID)
+	}
 	return TemplateContext{
-		Cwd:     cwd,
-		Dir:     dir,
-		Branch:  gitBranch(cwd),
-		Host:    hostname(),
-		User:    currentUsername(),
-		Session: sessionID,
-		Short:   Short(sessionID),
-		Seq:     seqInCwd(ns, sessionID, cwd),
+		Cwd:              cwd,
+		Dir:              dir,
+		Branch:           gitBranch(cwd),
+		Host:             hostname(),
+		User:             currentUsername(),
+		Session:          sessionID,
+		Short:            Short(sessionID),
+		Seq:              seqInCwd(ns, sessionID, cwd),
+		ClaudeName:       claude.Name,
+		ClaudeNameSource: claude.Source,
+		Label:            claude.Name,
 	}
 }
 

@@ -222,6 +222,27 @@ func TestMonitorRegistersEntryAndHoldsTheLock(t *testing.T) {
 	}
 }
 
+// register() reflects Claude Code's own session name into the entry, so peers
+// see the /status label without reading Claude Code's internals themselves.
+func TestMonitorPopulatesClaudeName(t *testing.T) {
+	withHome(t)
+	const sid = "mon-claude-name-1"
+	// Plant the index register() will read, and point EnvConfigDir at it so the
+	// lookup never touches a real ~/.claude.
+	writeClaudeIndex(t, os.Getpid(), sid, "chosen-here", "user")
+	startMonitor(t, sid)
+
+	var e *Entry
+	eventually(t, 5*time.Second, "the entry to carry the claude name", func() bool {
+		var err error
+		e, err = ReadEntry(sid)
+		return err == nil && e.ClaudeName != ""
+	})
+	if e.ClaudeName != "chosen-here" || e.ClaudeNameSource != "user" {
+		t.Fatalf("claude name = %q (%q), want chosen-here (user)", e.ClaudeName, e.ClaudeNameSource)
+	}
+}
+
 func TestMonitorDeregistersOnShutdown(t *testing.T) {
 	withHome(t)
 	const sid = "mon-shutdown-1"

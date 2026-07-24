@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
 
 // The statusline is an alarm, not a dashboard.
@@ -33,6 +34,19 @@ const (
 	ansiWarn  = "\x1b[33m"
 	ansiReset = "\x1b[0m"
 )
+
+// armGrace is how long after a session starts pigeon stays silent about a
+// missing registry entry.
+//
+// Claude Code renders the statusline at session start and caches the result,
+// re-running the command only on a real turn, not on idle time or keystrokes.
+// The monitor registers a beat later, so the first render usually happens
+// before there is an entry to find. Without this window the false "not armed"
+// from that render sticks on an idle session's bar until its next turn. Inside
+// it, a missing entry means "still arming"; past it, a missing entry is real.
+// Set well above the sub-second-to-a-second a monitor normally takes, so a
+// genuine failure still surfaces on the next render beyond it.
+const armGrace = 10 * time.Second
 
 // StatuslineOptions controls rendering. The zero value is what Claude Code
 // gets: emoji, colour, and silence when all is well.
@@ -84,8 +98,14 @@ func statuslineFor(sid string, opts StatuslineOptions) string {
 	ns, e, err := locateSession(sid)
 	if err != nil {
 		// Registered is the normal state for any session started after
-		// `pigeon install`. Not being registered means the monitor never
-		// armed, which is silent everywhere else.
+		// `pigeon install`. Not being registered usually means the monitor
+		// never armed, which is silent everywhere else -- but a session that
+		// only just started has a monitor still arming, and crying "not armed"
+		// then is a false alarm Claude Code caches onto an idle bar. Stay quiet
+		// until the session is old enough that a missing entry is real.
+		if age, ok := claudeSessionAge(sid, time.Now()); ok && age < armGrace {
+			return ""
+		}
 		return decorate("not armed", opts)
 	}
 

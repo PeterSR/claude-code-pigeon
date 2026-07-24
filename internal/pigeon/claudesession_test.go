@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeClaudeIndex plants a Claude Code session index at a throwaway config dir
@@ -32,6 +33,78 @@ func writeClaudeIndex(t *testing.T, pid int, sessionID, name, source string) {
 	}
 	if err := os.WriteFile(filepath.Join(sdir, strconv.Itoa(pid)+".json"), b, 0o600); err != nil {
 		t.Fatalf("write index: %v", err)
+	}
+}
+
+// startingSession plants a Claude Code session index for sid that started `ago`
+// in the past and points EnvConfigDir at it, without registering a pigeon
+// entry: the shape of a session whose monitor has not armed yet.
+func startingSession(t *testing.T, sid string, ago time.Duration) {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv(EnvConfigDir, dir)
+	sdir := filepath.Join(dir, "sessions")
+	if err := os.MkdirAll(sdir, 0o700); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	rec := map[string]any{
+		"pid":       os.Getpid(),
+		"sessionId": sid,
+		"startedAt": time.Now().Add(-ago).UnixMilli(),
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("marshal index: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sdir, strconv.Itoa(os.Getpid())+".json"), b, 0o600); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+}
+
+func TestClaudeSessionAgeReadsStartedAt(t *testing.T) {
+	sid := "aaaa1111-2222-3333-4444-555555555555"
+	startingSession(t, sid, 3*time.Second)
+
+	age, ok := claudeSessionAge(sid, time.Now())
+	if !ok {
+		t.Fatal("age not found for a planted index")
+	}
+	if age < 2*time.Second || age > 30*time.Second {
+		t.Errorf("age = %v, want roughly 3s", age)
+	}
+}
+
+func TestClaudeSessionAgeUnknownWhenAbsent(t *testing.T) {
+	t.Setenv(EnvConfigDir, t.TempDir()) // no sessions dir at all
+	if _, ok := claudeSessionAge("aaaa1111-2222-3333-4444-555555555555", time.Now()); ok {
+		t.Error("age reported for a session with no index")
+	}
+}
+
+// A monitor takes a beat to arm, and Claude Code renders (and caches) the
+// statusline before then. A just-started session with no entry is arming, not
+// un-armed, so the alarm stays silent rather than sticking a false "not armed"
+// onto an idle bar.
+func TestStatuslineSilentWhileMonitorArming(t *testing.T) {
+	withHome(t)
+	sid := "eeee1111-2222-3333-4444-555555555555"
+	t.Setenv(EnvSessionID, sid)
+	startingSession(t, sid, 1*time.Second) // young, and no pigeon entry
+
+	if got := statusline(t, "", StatuslineOptions{Plain: true}); got != "" {
+		t.Errorf("a just-started session rendered %q, want nothing while arming", got)
+	}
+}
+
+// Past the grace window a missing entry is real: the monitor never armed.
+func TestStatuslineNotArmedOnceGracePasses(t *testing.T) {
+	withHome(t)
+	sid := "eeee1111-2222-3333-4444-555555555555"
+	t.Setenv(EnvSessionID, sid)
+	startingSession(t, sid, armGrace+time.Minute) // old, still no entry
+
+	if got := statusline(t, "", StatuslineOptions{Plain: true}); !strings.Contains(got, "not armed") {
+		t.Errorf("got %q, want not armed once the grace window has passed", got)
 	}
 }
 

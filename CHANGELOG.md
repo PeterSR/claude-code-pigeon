@@ -25,6 +25,15 @@ All notable changes to this project are documented here. Format follows
   it along with its cwd, because a derived name would leak the directory.
 - `pigeon ls` also shows a `PID` column, and `whoami` a `pid:` line.
 
+### Fixed
+- `pigeon statusline` no longer reports a freshly started session as `not armed`. Claude Code
+  renders the statusline at session start and caches it, re-running the command only on a real
+  turn, so the first render often lands before the monitor has registered and the false alarm
+  then sticks on an idle session's bar. The statusline now stays silent about a missing entry
+  for the session's first few seconds (`startedAt` from Claude Code's session index), during
+  which the monitor is still arming; past that window a missing entry is real and reported as
+  before.
+
 ## [0.2.0] - 2026-07-23
 
 ### Added

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // maxClaudeName bounds the host label before it is stored or shown. It is a
@@ -80,4 +81,46 @@ func LookupClaudeSession(pid int, sessionID string) ClaudeSession {
 		Name:   truncateRunes(Sanitize(rec.Name), maxClaudeName),
 		Source: truncateRunes(Sanitize(rec.NameSource), maxClaudeName),
 	}
+}
+
+// claudeSessionAge reports how long ago a session started, read from Claude
+// Code's session index, and whether that is known. The index is keyed by pid,
+// so this scans it for the matching session id -- the statusline holds the id
+// but not the pid.
+//
+// It exists so the statusline can tell a monitor that is still arming (session
+// a second old, no entry yet) from one that never armed (session long up, still
+// no entry). Best-effort like everything that reads Claude Code's internals: a
+// missing file, unreadable JSON, or absent startedAt yields ok=false, and the
+// caller keeps its prior behaviour.
+func claudeSessionAge(sessionID string, now time.Time) (age time.Duration, ok bool) {
+	if ValidSessionID(sessionID) != nil {
+		return 0, false
+	}
+	dir := claudeConfigDir()
+	if dir == "" {
+		return 0, false
+	}
+	paths, err := filepath.Glob(filepath.Join(dir, "sessions", "*.json"))
+	if err != nil {
+		return 0, false
+	}
+	for _, p := range paths {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var rec struct {
+			SessionID string `json:"sessionId"`
+			StartedAt int64  `json:"startedAt"`
+		}
+		if json.Unmarshal(b, &rec) != nil || rec.SessionID != sessionID {
+			continue
+		}
+		if rec.StartedAt <= 0 {
+			return 0, false
+		}
+		return now.Sub(time.UnixMilli(rec.StartedAt)), true
+	}
+	return 0, false
 }

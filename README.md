@@ -71,9 +71,11 @@ pigeon send <target> <text>     send to one session
 pigeon publish <topic> <text>   publish to everyone subscribed
 pigeon subscribe <topic>        join a topic (takes effect in ~1s, no restart)
 pigeon unsubscribe <topic>
+pigeon listen [topic...]        receive messages in this shell, blocking
 pigeon topics                   topics and subscriber counts
 pigeon namespaces               namespaces and their session counts
 pigeon namespace [<name>]       show or set the namespace this shell uses
+pigeon as [<name>]              show or set the identity this shell acts as
 pigeon name [<name>]            declare a name, usable as an address
 pigeon describe [<text>]        declare what this session is working on
 pigeon whoami                   this session's identity and address
@@ -88,7 +90,9 @@ basename**, within one [namespace](#namespaces). `ls`, `send`, `publish`, `topic
 
 Sender identity is attached automatically. A session never has to know its own address for
 replies to work; a message from a plain shell is stamped `shell:user@host` and carries no
-reply handle, because there is nowhere to reply to.
+reply handle, because there is nowhere to reply to. From a shell that is
+[acting as an inbox](#listening-from-a-shell-automation) it is stamped as that inbox, so a
+reply reaches it.
 
 `name` and `describe` also take `--template '{{.Dir}}-{{.Seq}}'`, rendered against this
 session. The fields and functions are the ones in [Project defaults](#project-defaults)
@@ -258,6 +262,48 @@ history is not replayed into your context.
 
 A plain name is one log per namespace; a name written `@ops` is one log the whole machine
 shares. See [Namespaces](#namespaces).
+
+### Listening from a shell (automation)
+
+`pigeon send` and `pigeon publish` already work from any shell. `pigeon listen` is the
+other half: it blocks, printing messages as they arrive, so a script outside Claude Code
+can subscribe to topics and react.
+
+```console
+$ pigeon listen deploys ci          # tail two topics, print each message
+$ pigeon listen deploys | jq .text  # NDJSON when piped, so jq can read it
+```
+
+At a terminal it prints the same human line a session would see; piped, it emits one JSON
+object per line (`--json` and `--plain` force either). By default it delivers only messages
+that arrive while it is listening; `--replay` drains what is already on the log. `--count N`
+stops after N messages and `--timeout 30s` after a while, both handy in a script.
+
+Give it an identity and it becomes a **visible inbox**: it registers an ephemeral session,
+shows up in `pigeon ls` (as a `shell`), and is addressable as `pigeon send <name>` like any
+peer. It vanishes when the shell exits.
+
+```console
+$ pigeon as inbox                   # a standing identity for this shell
+$ pigeon listen all deploys         # opens the inbox "inbox", follows the topics
+```
+```console
+# meanwhile, from anywhere:
+$ pigeon send inbox "restart the worker"
+$ pigeon ls
+   SESSION   NAME   CLAUDE  PID     STATUS  CWD          DESCRIPTION
+   listen-i  inbox  shell   41990   live    ~/ops        -
+```
+
+The identity has three spellings, mirroring `pigeon namespace`: a standing `pigeon as
+<name>` (kept in `~/.claude/pigeon/cli.json`, so it survives across shells and does not care
+where you run from), a `--as <name>` flag on `listen`/`send`/`publish` for one call, and a
+`PIGEON_AS` environment variable for one script. Highest wins: `--as`, then a real Claude
+Code session, then `PIGEON_AS`, then `pigeon as`, then a plain shell. Once set, that shell's
+`send` and `publish` are stamped as the inbox so replies route back to it -- but only while
+the inbox is actually listening; with nothing holding it open the post falls back to a plain
+`shell:user@host` with no reply address, so a standing identity is never a promise nothing
+can keep.
 
 ### From MCP
 

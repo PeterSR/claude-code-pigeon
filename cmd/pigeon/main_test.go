@@ -965,3 +965,79 @@ func TestHumanBytesScales(t *testing.T) {
 		}
 	}
 }
+
+// --- as / listen -----------------------------------------------------------
+
+func TestAsGetSetClear(t *testing.T) {
+	withHome(t)
+	t.Setenv(pigeon.EnvAs, "")
+
+	// Nothing set yet.
+	if r := invoke(t, "as"); r.code != 0 || strings.TrimSpace(r.stdout) != "-" {
+		t.Errorf("as (unset): %s", r)
+	}
+	// Set it.
+	if r := invoke(t, "as", "bot"); r.code != 0 {
+		t.Errorf("as bot: %s", r)
+	} else {
+		wantContains(t, r, "stdout", "acting identity set to \"bot\"")
+	}
+	// Read it back.
+	if r := invoke(t, "as"); r.code != 0 || strings.TrimSpace(r.stdout) != "bot" {
+		t.Errorf("as (after set): %s", r)
+	}
+	// Clear it.
+	if r := invoke(t, "as", "--clear"); r.code != 0 {
+		t.Errorf("as --clear: %s", r)
+	}
+	if r := invoke(t, "as"); strings.TrimSpace(r.stdout) != "-" {
+		t.Errorf("as (after clear): %s", r)
+	}
+}
+
+func TestAsRejectsBadNameAndExtraArgs(t *testing.T) {
+	withHome(t)
+	if r := invoke(t, "as", "bad name"); r.code == 0 {
+		t.Errorf("as with a bad name should fail: %s", r)
+	}
+	if r := invoke(t, "as", "one", "two"); r.code == 0 {
+		t.Errorf("as with two names should fail: %s", r)
+	}
+	if r := invoke(t, "as", "bot", "--clear"); r.code == 0 {
+		t.Errorf("as with both a name and --clear should fail: %s", r)
+	}
+}
+
+func TestListenRejectsBadFlags(t *testing.T) {
+	withHome(t)
+	t.Setenv(pigeon.EnvAs, "")
+
+	// Contradictory output flags.
+	if r := invoke(t, "listen", "--json", "--plain", "all"); r.code == 0 {
+		t.Errorf("--json --plain together should fail: %s", r)
+	}
+	// A bad --as is refused before anything blocks.
+	if r := invoke(t, "listen", "--as", "bad name", "all"); r.code == 0 {
+		t.Errorf("a bad --as should fail: %s", r)
+	}
+	// An anonymous tail needs at least one topic. With no identity resolvable and
+	// no topic, Listen returns before it would ever block.
+	if r := invoke(t, "listen"); r.code == 0 {
+		t.Errorf("an anonymous listen with no topics should fail: %s", r)
+	} else {
+		wantContains(t, r, "stderr", "at least one topic")
+	}
+}
+
+func TestSendPublishRejectBadAs(t *testing.T) {
+	withHome(t)
+	asSession(t, "sender-1", "alpha")
+	register(t, "target-1", "beta")
+
+	if r := invoke(t, "send", "--as", "bad name", "beta", "hi"); r.code == 0 {
+		t.Errorf("send with a bad --as should fail: %s", r)
+	}
+	if r := invoke(t, "publish", "--as", "bad name", "all", "hi"); r.code == 0 {
+		t.Errorf("publish with a bad --as should fail: %s", r)
+	}
+}

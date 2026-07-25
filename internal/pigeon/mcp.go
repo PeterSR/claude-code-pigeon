@@ -70,7 +70,9 @@ func tools() []toolDef {
 				"name, description, working directory, namespace, status, pid, and Claude " +
 				"Code's own session name (the one /status shows, shown as claude=). Status " +
 				"'deaf' means the session is running but not listening, so messages to it " +
-				"will not arrive. Only this session's namespace is listed unless one is named.",
+				"will not arrive. A row marked [shell inbox] is a plain shell holding an " +
+				"inbox open with `pigeon listen`, not a Claude Code session, but is " +
+				"addressable the same way. Only this session's namespace is listed unless one is named.",
 			InputSchema: obj(map[string]any{
 				"type": "object",
 				"properties": obj(map[string]any{
@@ -439,6 +441,11 @@ func mcpList(ns Namespace) (string, error) {
 		if e.ClaudeName != "" {
 			// Claude Code's own /status name. Informational, not an address.
 			fmt.Fprintf(&b, "  claude=%s", e.ClaudeName)
+		}
+		if e.Ephemeral {
+			// A shell holding an inbox open with `pigeon listen`, not a Claude
+			// Code session. Addressable all the same.
+			b.WriteString("  [shell inbox]")
 		}
 		if e.Description != "" {
 			fmt.Fprintf(&b, "\n      %s", Sanitize(e.Description))

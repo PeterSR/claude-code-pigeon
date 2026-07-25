@@ -7,6 +7,26 @@ All notable changes to this project are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- `pigeon listen` receives messages in a plain shell, so automation outside Claude Code can
+  subscribe to topics and react. It blocks, printing each message as it arrives, reusing the
+  monitor's own follow loop, so it inherits the same compaction- and truncation-tolerance.
+  With one or more topics it is an anonymous tail; at a terminal it prints the human line a
+  session would see, and piped it emits one JSON object per line (`--json`/`--plain` force
+  either). `--replay` drains history rather than starting from now, `--count N` stops after N
+  messages, and `--timeout <dur>` after a while.
+
+  Given an identity it becomes a visible **inbox**: it registers an ephemeral session, shows
+  up in `pigeon ls` as a `shell`, is addressable as `pigeon send <name>` like any peer, and
+  vanishes when the shell exits.
+- An **acting identity** for shells, spelled three ways like `pigeon namespace`: a standing
+  `pigeon as <name>` kept in `~/.claude/pigeon/cli.json`, a `--as <name>` flag on
+  `listen`/`send`/`publish`, and a `PIGEON_AS` environment variable. Highest wins: `--as`,
+  then a real Claude Code session, then `PIGEON_AS`, then `pigeon as`, then a plain shell.
+  A shell with an identity stamps its `send` and `publish` as that inbox, so replies route
+  back -- but only while the inbox is actually listening; otherwise the post falls back to a
+  plain `shell:user@host` with no reply address, so a standing identity is never a promise
+  nothing can keep. `list_sessions` and `pigeon ls` mark such rows so a shell inbox is not
+  mistaken for a Claude Code session.
 - The pid is now a send target. `pigeon send <pid> "..."` resolves the session owning that
   claude process, ahead of the fuzzier name, prefix and cwd tiers, since a pid is exact and
   unique among live sessions. Useful when a session is unnamed and you already have its pid.

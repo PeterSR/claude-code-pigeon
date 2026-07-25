@@ -68,6 +68,12 @@ type Entry struct {
 	// Private sessions publish no cwd and no description. The flag itself is
 	// published so this session can be told why its own entry looks bare.
 	Private bool `json:"private,omitempty"`
+	// Ephemeral marks a session that is not a Claude Code session at all: a plain
+	// shell holding an inbox open with `pigeon listen`. Its pid is that shell, it
+	// has no ClaudeName to reflect, and it vanishes the moment the shell exits, so
+	// listings mark it as a shell rather than reporting a blank Claude name as
+	// something to fix.
+	Ephemeral bool `json:"ephemeral,omitempty"`
 
 	// Derived at read time, never persisted.
 	Status Status `json:"-"`

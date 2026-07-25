@@ -51,6 +51,11 @@ const (
 	// it started a session and a committed file only states where it was
 	// cloned.
 	EnvNamespace = "PIGEON_NAMESPACE"
+	// EnvAs names the ephemeral identity a plain shell acts as, for the same
+	// per-invocation reason PIGEON_NAMESPACE exists: a script states who it is
+	// speaking as. It only takes effect outside a real Claude Code session; see
+	// ActingIdentity.
+	EnvAs = "PIGEON_AS"
 )
 
 // Home is the state directory. Everything pigeon knows lives here.
@@ -250,6 +255,10 @@ const maxCLIConfigBytes = 8 << 10
 
 type cliConfig struct {
 	Namespace string `json:"namespace,omitempty"`
+	// As is the ephemeral identity a plain shell defaults to, the standing form
+	// of PIGEON_AS. Validated as a name on read, so a hand-edited value cannot
+	// steer a synthetic session id at anything unsafe.
+	As string `json:"as,omitempty"`
 }
 
 // readCLIConfig degrades to "nothing set" for a missing or unreadable file. A
@@ -269,15 +278,35 @@ func readCLIConfig() cliConfig {
 	if ValidNamespace(c.Namespace) != nil {
 		c.Namespace = ""
 	}
+	if ValidName(c.As) != nil {
+		c.As = ""
+	}
 	return c
 }
 
 // SetCLINamespace persists the namespace shell invocations default to.
 func SetCLINamespace(ns Namespace) error {
+	c := readCLIConfig()
+	c.Namespace = ns.String()
+	return writeCLIConfig(c)
+}
+
+// SetCLIIdentity persists the ephemeral identity shell invocations default to,
+// or clears it when name is empty. Kept separate from the namespace so setting
+// one never disturbs the other.
+func SetCLIIdentity(name string) error {
+	c := readCLIConfig()
+	c.As = name
+	return writeCLIConfig(c)
+}
+
+// writeCLIConfig persists the whole preference file. Callers read-modify-write
+// so one field's setter cannot wipe another's value.
+func writeCLIConfig(c cliConfig) error {
 	if err := os.MkdirAll(Home(), 0o700); err != nil {
 		return fmt.Errorf("create %s: %w", Home(), err)
 	}
-	b, err := json.MarshalIndent(cliConfig{Namespace: ns.String()}, "", "  ")
+	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}

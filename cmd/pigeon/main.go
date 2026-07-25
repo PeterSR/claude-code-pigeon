@@ -45,9 +45,11 @@ const usage = `pigeon -- message passing between live Claude Code sessions
   pigeon publish <topic> <text>  publish to a topic (everyone subscribed)
   pigeon subscribe <topic>       start receiving a topic in this session
   pigeon unsubscribe <topic>     stop receiving it
+  pigeon listen [topic...]       receive messages in this shell (blocks)
   pigeon topics                  list topics and subscriber counts
   pigeon namespaces              list namespaces and their session counts
   pigeon namespace [<name>]      show or set the namespace this shell uses
+  pigeon as [<name>]             show or set the identity this shell acts as
   pigeon whoami                  show this session's identity and address
   pigeon name [<name>]           declare this session's name (usable as address)
   pigeon describe [<text>]       declare what this session is working on
@@ -99,12 +101,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		err = cmdSubscribe(rest, stdout)
 	case "unsubscribe", "unsub":
 		err = cmdUnsubscribe(rest, stdout)
+	case "listen":
+		err = cmdListen(rest, stdout, stderr)
 	case "topics":
 		err = cmdTopics(rest, stdout, stderr)
 	case "namespaces":
 		err = cmdNamespaces(rest, stdout, stderr)
 	case "namespace", "ns":
 		err = cmdNamespace(rest, stdout, stderr)
+	case "as":
+		err = cmdAs(rest, stdout, stderr)
 	case "whoami":
 		err = cmdWhoami(stdout)
 	case "name":
@@ -149,6 +155,22 @@ func flags(name string, stderr io.Writer) *flag.FlagSet {
 func nsFlag(fs *flag.FlagSet, into *string) {
 	fs.StringVar(into, "n", "", "namespace to act in (default: this session's)")
 	fs.StringVar(into, "namespace", "", "same as -n")
+}
+
+// asFlag adds --as, the per-call spelling of the acting identity. Left empty it
+// falls through to PIGEON_AS and then `pigeon as`; a real Claude Code session
+// still outranks the ambient layers (see pigeon.ActingIdentity).
+func asFlag(fs *flag.FlagSet, into *string) {
+	fs.StringVar(into, "as", "", "act as the ephemeral inbox <name> (see: pigeon as)")
+}
+
+// checkAs rejects a --as value that is not a usable name up front, so a typo
+// stamps nothing: the alternative is a message quietly sent as a plain shell.
+func checkAs(name string) error {
+	if strings.TrimSpace(name) == "" {
+		return nil
+	}
+	return pigeon.ValidName(name)
 }
 
 // namespaceOf resolves a -n value, or this process's own namespace when the
@@ -276,7 +298,7 @@ func cmdList(args []string, w, stderr io.Writer) error {
 			fmt.Fprintf(tw, "%s\t", mark)
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			pigeon.Short(e.SessionID), dash(e.Name), dash(truncate(e.ClaudeName, 24)),
+			pigeon.Short(e.SessionID), dash(e.Name), claudeCol(e),
 			pidCol(e.PID), e.Status,
 			abbrev(e.Cwd, 32), dash(truncate(e.Description, 40)))
 	}
@@ -321,14 +343,18 @@ func cmdList(args []string, w, stderr io.Writer) error {
 
 func cmdSend(args []string, w, stderr io.Writer) error {
 	fs := flags("send", stderr)
-	var nsName string
+	var nsName, asName string
 	nsFlag(fs, &nsName)
+	asFlag(fs, &asName)
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := checkAs(asName); err != nil {
 		return err
 	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf("usage: pigeon send [-n <namespace>] <target> <text>")
+		return fmt.Errorf("usage: pigeon send [-n <namespace>] [--as <name>] <target> <text>")
 	}
 	target, text := rest[0], strings.Join(rest[1:], " ")
 
@@ -343,7 +369,7 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	msg, err := ns.Send(to, text, pigeon.CurrentSender(), "")
+	msg, err := ns.Send(to, text, pigeon.ActingSender(asName), "")
 	if err != nil {
 		return err
 	}
@@ -363,21 +389,25 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 
 func cmdPublish(args []string, w, stderr io.Writer) error {
 	fs := flags("publish", stderr)
-	var nsName string
+	var nsName, asName string
 	nsFlag(fs, &nsName)
+	asFlag(fs, &asName)
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := checkAs(asName); err != nil {
 		return err
 	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf("usage: pigeon publish [-n <namespace>] <topic> <text>")
+		return fmt.Errorf("usage: pigeon publish [-n <namespace>] [--as <name>] <topic> <text>")
 	}
 	topic, text := rest[0], strings.Join(rest[1:], " ")
 	ns, err := namespaceOf(nsName)
 	if err != nil {
 		return err
 	}
-	msg, err := ns.Publish(topic, text, pigeon.CurrentSender())
+	msg, err := ns.Publish(topic, text, pigeon.ActingSender(asName))
 	if err != nil {
 		return err
 	}
@@ -419,6 +449,49 @@ func cmdUnsubscribe(args []string, w io.Writer) error {
 	}
 	fmt.Fprintf(w, "unsubscribed from %s\n", pigeon.TopicLabel(args[0]))
 	return nil
+}
+
+// cmdListen is the receive half of pigeon for a plain shell. With no identity it
+// is an anonymous tail of the named topics; with one (--as / PIGEON_AS /
+// `pigeon as`) it opens a visible ephemeral inbox others can address directly.
+func cmdListen(args []string, stdout, stderr io.Writer) error {
+	fs := flags("listen", stderr)
+	var nsName, asName string
+	nsFlag(fs, &nsName)
+	asFlag(fs, &asName)
+	asJSON := fs.Bool("json", false, "one JSON object per line (default when stdout is not a terminal)")
+	plain := fs.Bool("plain", false, "human-readable lines (default at a terminal)")
+	replay := fs.Bool("replay", false, "deliver messages already in the logs, not only new ones")
+	count := fs.Int("count", 0, "stop after receiving this many messages")
+	timeout := fs.Duration("timeout", 0, "stop after this long, e.g. 30s or 5m")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *asJSON && *plain {
+		return fmt.Errorf("give either --json or --plain, not both")
+	}
+	if err := checkAs(asName); err != nil {
+		return err
+	}
+	ns, err := namespaceOf(nsName)
+	if err != nil {
+		return err
+	}
+	// The inbox identity is ephemeral-only: --as, then PIGEON_AS, then the
+	// standing `pigeon as`. A resolved name opens a visible inbox; none leaves an
+	// anonymous tail, which needs at least one topic (checked by Listen).
+	name, _ := pigeon.ActingName(asName)
+	return pigeon.Listen(pigeon.ListenOptions{
+		Namespace: ns,
+		As:        name,
+		Topics:    fs.Args(),
+		JSON:      *asJSON,
+		Plain:     *plain,
+		Replay:    *replay,
+		Count:     *count,
+		Timeout:   *timeout,
+		TTY:       isTerminal(stdout),
+	}, stdout, stderr)
 }
 
 func cmdTopics(args []string, w, stderr io.Writer) error {
@@ -577,9 +650,85 @@ func cmdNamespace(args []string, w, stderr io.Writer) error {
 	return nil
 }
 
+// cmdAs is get-or-set for the standing shell identity, mirroring cmdNamespace. A
+// resolved identity gives shell sends and publishes a real reply address --
+// though only while an inbox of that name is actually listening.
+func cmdAs(args []string, w, stderr io.Writer) error {
+	fs := flags("as", stderr)
+	clearIt := fs.Bool("clear", false, "forget the standing identity")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+
+	if *clearIt {
+		if len(rest) > 0 {
+			return fmt.Errorf("give either a name or --clear, not both")
+		}
+		if err := pigeon.SetCLIIdentity(""); err != nil {
+			return err
+		}
+		fmt.Fprintln(w, "standing identity cleared; shell posts are stamped as a plain shell again")
+		return nil
+	}
+
+	if len(rest) == 0 {
+		name, origin := pigeon.ActingName("")
+		if name == "" {
+			// A dash on stdout keeps `$(pigeon as)` usable; the why on stderr.
+			fmt.Fprintln(w, "-")
+			fmt.Fprintln(stderr, "(no acting identity; posts are stamped as a plain shell with no reply address)")
+			return nil
+		}
+		fmt.Fprintln(w, name)
+		fmt.Fprintf(stderr, "(from %s)\n", origin)
+		// The reply address is only real while an inbox is holding it open; say so
+		// when nothing is, rather than let a standing preference look effective.
+		if pigeon.ActingSender("").Kind != "session" {
+			fmt.Fprintf(stderr, "note: no inbox named %q is listening, so posts still go out as a plain shell.\n", name)
+			fmt.Fprintln(stderr, "open it with: pigeon listen")
+		}
+		return nil
+	}
+	if len(rest) != 1 {
+		return fmt.Errorf("usage: pigeon as [<name>]")
+	}
+	name := rest[0]
+	if err := pigeon.ValidName(name); err != nil {
+		return err
+	}
+	if err := pigeon.SetCLIIdentity(name); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "acting identity set to %q for shell invocations\n", name)
+	fmt.Fprintln(w, "open the inbox with: pigeon listen")
+	// Setting a preference that something already outranks is otherwise silent.
+	if eff, origin := pigeon.ActingName(""); eff != name {
+		fmt.Fprintf(stderr, "note: %q still applies here, from %s\n", eff, origin)
+	}
+	return nil
+}
+
 func cmdWhoami(w io.Writer) error {
 	sid := pigeon.CurrentSessionID()
 	if sid == "" {
+		// Outside a real session, a shell may still be acting as an ephemeral
+		// inbox. ActingSender only returns a session stamp when that inbox is
+		// actually listening, so its Kind is the honest test of "can I be replied
+		// to right now".
+		name, origin := pigeon.ActingName("")
+		s := pigeon.ActingSender("")
+		if s.Kind == "session" {
+			fmt.Fprintf(w, "acting as %q (from %s)\n", s.Name, origin)
+			fmt.Fprintf(w, "others reach you at:  pigeon send %s\n", s.Addr())
+			return nil
+		}
+		if name != "" {
+			fmt.Fprintf(w, "acting identity %q is set (from %s), but no inbox of that name is\n", name, origin)
+			fmt.Fprintf(w, "listening, so posts go out as %s with no reply address.\n", pigeon.ShellIdentity())
+			fmt.Fprintln(w, "open the inbox with: pigeon listen")
+			return nil
+		}
 		fmt.Fprintf(w, "not inside a Claude Code session; sending as %s\n", pigeon.ShellIdentity())
 		return nil
 	}
@@ -852,6 +1001,31 @@ func pidCol(pid int) string {
 		return "-"
 	}
 	return fmt.Sprintf("%d", pid)
+}
+
+// claudeCol renders the CLAUDE column of `pigeon ls`. A shell inbox is not a
+// Claude Code session and has no such name, so it is labelled as what it is
+// rather than shown as a blank waiting to be filled.
+func claudeCol(e *pigeon.Entry) string {
+	if e.Ephemeral {
+		return "shell"
+	}
+	return dash(truncate(e.ClaudeName, 24))
+}
+
+// isTerminal reports whether w is a terminal, so `pigeon listen` can default to
+// NDJSON for a pipe and the human line for a person. Same test statuslineStdin
+// uses on the way in.
+func isTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
 }
 
 // claudeNameCol renders Claude Code's own session name for whoami, noting how it

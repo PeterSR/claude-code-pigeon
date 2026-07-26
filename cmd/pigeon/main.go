@@ -54,7 +54,7 @@ const usage = `pigeon -- message passing between live Claude Code sessions
   pigeon name [<name>]           declare this session's name (usable as address)
   pigeon describe [<text>]       declare what this session is working on
   pigeon doctor [--json]         check whether this session can receive mail
-  pigeon statusline [--plain]    one-line status for a Claude Code statusline
+  pigeon weaverbird spec|value   status widgets for a weaverbird status line
   pigeon prune                   forget dead sessions and reclaim topic logs
   pigeon monitor                 run the inbox monitor (used by the plugin)
   pigeon mcp                     run the MCP server (used by the plugin)
@@ -119,8 +119,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		err = cmdDescribe(rest, stdout, stderr)
 	case "doctor":
 		err = cmdDoctor(rest, stdout, stderr)
-	case "statusline":
-		err = cmdStatusline(rest, stdin, stdout, stderr)
+	case "weaverbird":
+		err = cmdWeaverbird(rest, stdin, stdout)
 	case "prune":
 		err = cmdPrune(rest, stdout, stderr)
 	case "monitor":
@@ -856,31 +856,6 @@ func cmdDoctor(args []string, w, stderr io.Writer) error {
 	return pigeon.Doctor(w, *asJSON)
 }
 
-func cmdStatusline(args []string, stdin io.Reader, w, stderr io.Writer) error {
-	fs := flags("statusline", stderr)
-	plain := fs.Bool("plain", false, "no emoji or colour")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	return pigeon.Statusline(statuslineStdin(stdin), w, pigeon.StatuslineOptions{Plain: *plain})
-}
-
-// statuslineStdin hands over stdin only when something is actually piped in.
-// Claude Code pipes a JSON payload; a human running `pigeon statusline` at a
-// prompt is not going to type one, and reading from the terminal would just
-// hang with no indication why.
-func statuslineStdin(stdin io.Reader) io.Reader {
-	f, isFile := stdin.(*os.File)
-	if !isFile {
-		return stdin
-	}
-	fi, err := f.Stat()
-	if err != nil || fi.Mode()&os.ModeCharDevice != 0 {
-		return nil
-	}
-	return f
-}
-
 func cmdPrune(args []string, w, stderr io.Writer) error {
 	fs := flags("prune", stderr)
 	allNS := fs.Bool("all-namespaces", false, "sweep every namespace, not only this one")
@@ -1014,8 +989,7 @@ func claudeCol(e *pigeon.Entry) string {
 }
 
 // isTerminal reports whether w is a terminal, so `pigeon listen` can default to
-// NDJSON for a pipe and the human line for a person. Same test statuslineStdin
-// uses on the way in.
+// NDJSON for a pipe and the human line for a person.
 func isTerminal(w io.Writer) bool {
 	f, ok := w.(*os.File)
 	if !ok {

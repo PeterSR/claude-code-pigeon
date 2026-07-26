@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -501,7 +500,7 @@ func TestWhoamiSaysWhenUnregistered(t *testing.T) {
 	wantContains(t, r, "stdout", "not registered")
 }
 
-// --- doctor and statusline -------------------------------------------------
+// --- doctor ----------------------------------------------------------------
 
 func TestDoctorJSONListsChecks(t *testing.T) {
 	withHome(t)
@@ -529,29 +528,6 @@ func TestDoctorTextMentionsTheBrokenLink(t *testing.T) {
 	r := invoke(t, "doctor")
 	wantContains(t, r, "stdout", "this session")
 	wantContains(t, r, "stdout", "FAIL")
-}
-
-// The statusline is spawned per render and does not reliably inherit
-// CLAUDE_CODE_SESSION_ID, so the id on stdin has to win.
-func TestStatuslineTakesSessionIDFromStdin(t *testing.T) {
-	withHome(t)
-	register(t, "bbbb2222-0000-0000-0000-000000000000", "beta")
-	t.Setenv(pigeon.EnvSessionID, "")
-
-	r := invokeStdin(t, `{"session_id":"bbbb2222-0000-0000-0000-000000000000"}`, "statusline", "--plain")
-	if r.code != 0 {
-		t.Fatalf("%s", r)
-	}
-	wantContains(t, r, "stdout", "pigeon deaf")
-}
-
-func TestStatuslineSaysNothingForAnUnknownSession(t *testing.T) {
-	withHome(t)
-	t.Setenv(pigeon.EnvSessionID, "")
-	r := invokeStdin(t, `{}`, "statusline")
-	if r.stdout != "" {
-		t.Errorf("stdout = %q, want empty", r.stdout)
-	}
 }
 
 // --- install and uninstall -------------------------------------------------
@@ -603,41 +579,6 @@ func TestUninstallPurgeAlsoRemovesState(t *testing.T) {
 	}
 	if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
 		t.Errorf("state dir survived --purge: %v", err)
-	}
-}
-
-// --- stdin handling --------------------------------------------------------
-
-// Claude Code pipes the statusline a JSON payload. A file or pipe must be
-// read; a terminal must not be, or running `pigeon statusline` by hand hangs
-// with no indication why.
-func TestStatuslineStdinReadsAPipedFile(t *testing.T) {
-	f, err := os.CreateTemp(t.TempDir(), "input-*")
-	if err != nil {
-		t.Fatalf("CreateTemp: %v", err)
-	}
-	defer f.Close()
-	if _, err := f.WriteString(`{"session_id":"aaaa1111"}`); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	if _, err := f.Seek(0, 0); err != nil {
-		t.Fatalf("seek: %v", err)
-	}
-
-	got := statuslineStdin(f)
-	if got == nil {
-		t.Fatal("a regular file was treated as a terminal")
-	}
-	b, err := io.ReadAll(got)
-	if err != nil || !strings.Contains(string(b), "aaaa1111") {
-		t.Errorf("read back %q, err %v", b, err)
-	}
-}
-
-func TestStatuslineStdinPassesThroughNonFiles(t *testing.T) {
-	in := strings.NewReader("{}")
-	if statuslineStdin(in) != in {
-		t.Error("a non-file reader was not passed through")
 	}
 }
 

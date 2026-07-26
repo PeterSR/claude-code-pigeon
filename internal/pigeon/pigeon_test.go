@@ -84,6 +84,24 @@ func liveEntryIn(t *testing.T, ns Namespace, id, name, cwd string) *Entry {
 	return e
 }
 
+// armed registers a session and holds its monitor lock for the rest of the
+// test, which is exactly what makes a session "live" -- there is no flag for
+// it, the lock is the signal.
+func armed(t *testing.T, id, name string) *Entry {
+	t.Helper()
+	e := liveEntry(t, id, name, "/tmp/work")
+	e.HeartbeatAt = nowRFC3339()
+	if err := WriteEntry(e); err != nil {
+		t.Fatalf("WriteEntry: %v", err)
+	}
+	lock, acquired, err := tryExclusive(LockPath(id))
+	if err != nil || !acquired {
+		t.Fatalf("take monitor lock: acquired=%v err=%v", acquired, err)
+	}
+	t.Cleanup(func() { lock.Close() })
+	return e
+}
+
 // mustNS parses a namespace a test wrote itself, where a rejection is a bug in
 // the test rather than a case worth handling.
 func mustNS(t *testing.T, name string) Namespace {

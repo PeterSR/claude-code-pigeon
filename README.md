@@ -80,7 +80,7 @@ pigeon name [<name>]            declare a name, usable as an address
 pigeon describe [<text>]        declare what this session is working on
 pigeon whoami                   this session's identity and address
 pigeon doctor [--json]          check whether this session can receive mail
-pigeon statusline [--plain]     one-line alarm for a Claude Code statusline
+pigeon weaverbird spec|value    status widgets for a weaverbird status line
 pigeon prune                    forget sessions whose process is gone
 ```
 
@@ -483,40 +483,49 @@ The `monitor binary` check is worth calling out: `go install` writes a new binar
 the plugin keeps pointing at wherever the old one lived, so sessions silently keep arming
 the stale copy. Nothing else reports that.
 
-### Seeing it: `pigeon statusline`
+### Seeing it: the status line
+
+pigeon reports its state to [weaverbird](https://github.com/PeterSR/claude-code-weaverbird),
+which owns the status line and composes it from every provider you have installed. Register
+pigeon by dropping a provider file in `~/.claude/weaverbird/providers/`:
 
 ```json
 {
-  "statusLine": { "type": "command", "command": "pigeon statusline" }
+  "v": 1,
+  "name": "pigeon",
+  "spec":  { "exec": ["pigeon", "weaverbird", "spec"] },
+  "value": { "exec": ["pigeon", "weaverbird", "value"] }
 }
 ```
 
 **A healthy session renders nothing at all.** There is deliberately no peer list and no
-unread count: a live monitor drains the spool within about a second, so there is never a
-standing backlog to display, and listing whichever other sessions happen to be running
-fills the line with work you are not doing. A statusline that is always lit becomes
-wallpaper, and wallpaper is what you stop reading before the one time it mattered.
+unread count on the default widget: a live monitor drains the spool within about a second,
+so there is never a standing backlog to display, and listing whichever other sessions
+happen to be running fills the line with work you are not doing. A status line that is
+always lit becomes wallpaper, and wallpaper is what you stop reading before the one time
+it mattered.
 
-It renders only when this session **cannot** receive:
+`pigeon.wait` renders only when this session **cannot** receive:
 
 ```
-🕊 deaf · 3 waiting     monitor stopped; mail is piling up on the spool
-🕊 not armed            the monitor never started for this session
+🕊 3 waiting     monitor stopped; mail is piling up on the spool
+🕊 not armed     the monitor never started for this session
 ```
 
 Those are the only states where a count is real, and the only ones nothing else in the UI
-reports. If you already have a statusline, append pigeon's output to it: the command
-prints one line or nothing, so concatenating is safe:
+reports.
 
-```bash
-#!/bin/bash
-input=$(cat)
-line=$(your-existing-statusline <<<"$input")
-alarm=$(pigeon statusline <<<"$input")
-printf '%s%s' "$line" "${alarm:+ $alarm}"
-```
+Two further widgets are opt-in, for a layout that asks for them by id. They answer
+questions worth asking rather than alarms worth interrupting for, so they stay out of the
+default view:
 
-`--plain` drops the emoji and colour.
+| widget | shows |
+| --- | --- |
+| `pigeon.monitor` | `monitor live`, `deaf` or `dead` for this session |
+| `pigeon.peers` | how many other live sessions share this namespace |
+
+`pigeon.detail` is a group covering all three, so a layout can ask for one id instead of
+three.
 
 ### Private namespaces
 

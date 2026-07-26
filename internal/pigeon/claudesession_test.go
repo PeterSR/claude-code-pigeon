@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	wb "github.com/PeterSR/claude-code-weaverbird/provider"
 )
 
 // writeClaudeIndex plants a Claude Code session index at a throwaway config dir
@@ -81,30 +83,38 @@ func TestClaudeSessionAgeUnknownWhenAbsent(t *testing.T) {
 	}
 }
 
-// A monitor takes a beat to arm, and Claude Code renders (and caches) the
-// statusline before then. A just-started session with no entry is arming, not
+// A monitor takes a beat to arm, and the host renders (and caches) the status
+// line before then. A just-started session with no entry is arming, not
 // un-armed, so the alarm stays silent rather than sticking a false "not armed"
 // onto an idle bar.
-func TestStatuslineSilentWhileMonitorArming(t *testing.T) {
+func TestWidgetSilentWhileMonitorArming(t *testing.T) {
 	withHome(t)
 	sid := "eeee1111-2222-3333-4444-555555555555"
 	t.Setenv(EnvSessionID, sid)
 	startingSession(t, sid, 1*time.Second) // young, and no pigeon entry
 
-	if got := statusline(t, "", StatuslineOptions{Plain: true}); got != "" {
-		t.Errorf("a just-started session rendered %q, want nothing while arming", got)
+	vals, err := WeaverbirdValue(wb.Session{}, nil)
+	if err != nil {
+		t.Fatalf("WeaverbirdValue: %v", err)
+	}
+	if v, ok := valueByID(vals, "pigeon.wait"); ok {
+		t.Errorf("a just-started session rendered %+v, want nothing while arming", v)
 	}
 }
 
 // Past the grace window a missing entry is real: the monitor never armed.
-func TestStatuslineNotArmedOnceGracePasses(t *testing.T) {
+func TestWidgetNotArmedOnceGracePasses(t *testing.T) {
 	withHome(t)
 	sid := "eeee1111-2222-3333-4444-555555555555"
 	t.Setenv(EnvSessionID, sid)
 	startingSession(t, sid, armGrace+time.Minute) // old, still no entry
 
-	if got := statusline(t, "", StatuslineOptions{Plain: true}); !strings.Contains(got, "not armed") {
-		t.Errorf("got %q, want not armed once the grace window has passed", got)
+	vals, err := WeaverbirdValue(wb.Session{}, nil)
+	if err != nil {
+		t.Fatalf("WeaverbirdValue: %v", err)
+	}
+	if v, ok := valueByID(vals, "pigeon.wait"); !ok || v.Text != "not armed" {
+		t.Errorf("pigeon.wait = %+v, ok=%v, want not armed once the grace window has passed", v, ok)
 	}
 }
 

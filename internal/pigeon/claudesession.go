@@ -85,14 +85,14 @@ func LookupClaudeSession(pid int, sessionID string) ClaudeSession {
 
 // claudeSessionAge reports how long ago a session started, read from Claude
 // Code's session index, and whether that is known. The index is keyed by pid,
-// so this scans it for the matching session id -- the statusline holds the id
-// but not the pid.
+// so this scans it for the matching session id -- the status widget holds the
+// id but not the pid.
 //
-// It exists so the statusline can tell a monitor that is still arming (session
-// a second old, no entry yet) from one that never armed (session long up, still
-// no entry). Best-effort like everything that reads Claude Code's internals: a
-// missing file, unreadable JSON, or absent startedAt yields ok=false, and the
-// caller keeps its prior behaviour.
+// It exists so the status widget can tell a monitor that is still arming
+// (session a second old, no entry yet) from one that never armed (session long
+// up, still no entry). Best-effort like everything that reads Claude Code's
+// internals: a missing file, unreadable JSON, or absent startedAt yields
+// ok=false, and the caller keeps its prior behaviour.
 func claudeSessionAge(sessionID string, now time.Time) (age time.Duration, ok bool) {
 	if ValidSessionID(sessionID) != nil {
 		return 0, false

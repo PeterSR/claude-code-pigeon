@@ -44,15 +44,30 @@ All notable changes to this project are documented here. Format follows
   doctor` checks it and it degrades to empty rather than failing. A private session withholds
   it along with its cwd, because a derived name would leak the directory.
 - `pigeon ls` also shows a `PID` column, and `whoami` a `pid:` line.
+- `pigeon weaverbird spec|value`, which publishes pigeon's state to
+  [weaverbird](https://github.com/PeterSR/claude-code-weaverbird) rather than rendering a
+  status line itself. Same alarm as before, spoken to a host that owns the bar: `pigeon.wait`
+  is silent for a session that can receive, and says `not armed` or `N waiting` when it
+  cannot. Two opt-in widgets go further for a layout that asks for them by id --
+  `pigeon.monitor` (`live`/`deaf`/`dead`) and `pigeon.peers` (other live sessions in this
+  namespace) -- grouped as `pigeon.detail` so asking is one id instead of three.
+
+  `pigeon.wait` declares a 30s cache ceiling plus a file invalidation on this session's own
+  spool, so a message arriving relights the widget without waiting out the ttl.
+
+### Removed
+- `pigeon statusline`. weaverbird renders pigeon's status now, and two commands answering the
+  same question is how they drift apart. If you had it wired into `statusLine` in
+  `settings.json`, point that at weaverbird and register pigeon as a provider; the README says
+  how. Nothing else changes: the widget reports the same states from the same registry.
 
 ### Fixed
-- `pigeon statusline` no longer reports a freshly started session as `not armed`. Claude Code
-  renders the statusline at session start and caches it, re-running the command only on a real
-  turn, so the first render often lands before the monitor has registered and the false alarm
-  then sticks on an idle session's bar. The statusline now stays silent about a missing entry
-  for the session's first few seconds (`startedAt` from Claude Code's session index), during
-  which the monitor is still arming; past that window a missing entry is real and reported as
-  before.
+- A freshly started session is no longer reported as `not armed`. A host renders its status
+  line at session start and caches it, re-running the provider only on a real turn, so the
+  first render often lands before the monitor has registered and the false alarm then sticks
+  on an idle session's bar. A missing entry is now silent for the session's first few seconds
+  (`startedAt` from Claude Code's session index), during which the monitor is still arming;
+  past that window a missing entry is real and reported as before.
 
 ## [0.2.0] - 2026-07-23
 

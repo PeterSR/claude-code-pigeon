@@ -107,7 +107,7 @@ func CurrentSender() Sender {
 	// to every recipient. Missing the entry must fail closed.
 	s := Sender{Kind: "session", SessionID: sid, Namespace: ns.String()}
 	// locateSession falls back to every namespace, for the same reason the
-	// statusline needs it: this process may not resolve the one the monitor
+	// status widget needs it: this process may not resolve the one the monitor
 	// registered in.
 	_, e, err := locateSession(sid)
 	if err == nil {

@@ -63,6 +63,89 @@ func startingSession(t *testing.T, sid string, ago time.Duration) {
 	}
 }
 
+// clearedSession plants a Claude Code session index saying this test process
+// is now running sid, as Claude Code does after a session is cleared: same
+// pid, same process start time, a brand new session id, and the *original*
+// startedAt, which is what puts the session well past the arming grace.
+func clearedSession(t *testing.T, sid string, startedAgo time.Duration) {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv(EnvConfigDir, dir)
+	sdir := filepath.Join(dir, "sessions")
+	if err := os.MkdirAll(sdir, 0o700); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	pid := os.Getpid()
+	rec := map[string]any{
+		"pid":       pid,
+		"procStart": ProcStart(pid),
+		"sessionId": sid,
+		"startedAt": time.Now().Add(-startedAgo).UnixMilli(),
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("marshal index: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sdir, strconv.Itoa(pid)+".json"), b, 0o600); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+}
+
+// Clearing a session mints a new session id inside the same claude process,
+// but the monitor was spawned once when that process started and keeps the id
+// it armed with. The widget is handed the new id, finds no entry filed under
+// it, and -- since Claude Code keeps the original startedAt across the change
+// -- cannot fall back on the arming grace either. Matching the process is what
+// keeps it from crying "not armed" at a session that is draining mail fine.
+func TestWidgetFindsASessionWhoseIDWasReplaced(t *testing.T) {
+	withHome(t)
+	const armedWith = "aaaa1111-2222-3333-4444-555555555555"
+	const nowKnownAs = "ffff9999-8888-7777-6666-555555555555"
+
+	armed(t, armedWith, "alpha") // registered, listening, under the old id
+	t.Setenv(EnvSessionID, nowKnownAs)
+	clearedSession(t, nowKnownAs, armGrace+time.Hour)
+
+	vals, err := WeaverbirdValue(wb.Session{}, nil)
+	if err != nil {
+		t.Fatalf("WeaverbirdValue: %v", err)
+	}
+	if v, ok := valueByID(vals, "pigeon.wait"); ok {
+		t.Errorf("pigeon.wait = %+v, want silence: the monitor is live under %s", v, Short(armedWith))
+	}
+	if mv, ok := valueByID(vals, "pigeon.monitor"); !ok || mv.Text != "monitor live" {
+		t.Errorf("pigeon.monitor = %+v, ok=%v, want monitor live", mv, ok)
+	}
+}
+
+// The process match is exact, not a consolation prize: an entry belonging to
+// some other process must never stand in for this session's own. Otherwise a
+// session with no monitor at all would read as armed because an unrelated one
+// happens to be registered.
+func TestWidgetStillNotArmedWhenAnotherProcessOwnsTheEntry(t *testing.T) {
+	withHome(t)
+	const nowKnownAs = "ffff9999-8888-7777-6666-555555555555"
+
+	// A live, listening session belonging to a different claude process.
+	other := armed(t, "aaaa1111-2222-3333-4444-555555555555", "alpha")
+	other.PID = 999999
+	other.ProcStart = "1"
+	if err := WriteEntry(other); err != nil {
+		t.Fatalf("WriteEntry: %v", err)
+	}
+
+	t.Setenv(EnvSessionID, nowKnownAs)
+	clearedSession(t, nowKnownAs, armGrace+time.Hour)
+
+	vals, err := WeaverbirdValue(wb.Session{}, nil)
+	if err != nil {
+		t.Fatalf("WeaverbirdValue: %v", err)
+	}
+	if v, ok := valueByID(vals, "pigeon.wait"); !ok || v.Text != "not armed" {
+		t.Errorf("pigeon.wait = %+v, ok=%v, want not armed (no entry for this process)", v, ok)
+	}
+}
+
 func TestClaudeSessionAgeReadsStartedAt(t *testing.T) {
 	sid := "aaaa1111-2222-3333-4444-555555555555"
 	startingSession(t, sid, 3*time.Second)

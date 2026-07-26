@@ -62,6 +62,14 @@ All notable changes to this project are documented here. Format follows
   how. Nothing else changes: the widget reports the same states from the same registry.
 
 ### Fixed
+- A session that has been cleared is no longer reported as `not armed`. Clearing mints a fresh
+  session id inside the running claude process, but the monitor was spawned once when that
+  process started and keeps the id it armed with, along with the registry entry, spool and lock
+  it owns. The widget is handed the host's current id, finds nothing filed under it, and cannot
+  fall back on the arming grace either, since Claude Code keeps the original `startedAt` across
+  the change -- so a session that was alive and draining its mail read as never armed. A session
+  id that finds no entry is now also looked up by the claude process behind it (pid and process
+  start time, which name one process exactly), and the entry its monitor armed with is found.
 - A freshly started session is no longer reported as `not armed`. A host renders its status
   line at session start and caches it, re-running the provider only on a real turn, so the
   first render often lands before the monitor has registered and the false alarm then sticks

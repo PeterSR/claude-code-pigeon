@@ -262,15 +262,15 @@ func peersValue() *wb.Value {
 	}
 }
 
-// locateSession finds a session's entry in this namespace, or failing that in
-// any namespace.
+// locateSession finds a session's entry in this namespace, failing that in any
+// namespace, and failing that under whatever id its monitor armed with.
 //
 // The provider is spawned per render, with an environment and a working
 // directory that need not match the ones the monitor armed with, so resolving a
 // namespace here can land somewhere the session simply is not. Reporting "not
 // armed" for a healthy session is the false alarm this widget exists to avoid:
 // one wrong lit line and it becomes wallpaper. Searching by exact session id
-// cannot pick the wrong session, so the fallback costs nothing but a few globs
+// cannot pick the wrong session, so the fallbacks cost nothing but a few globs
 // in the case that is already an alarm.
 func locateSession(sid string) (Namespace, *Entry, error) {
 	ns := CurrentNamespace()
@@ -291,5 +291,56 @@ func locateSession(sid string) (Namespace, *Entry, error) {
 			return other, e, nil
 		}
 	}
+	if other, e, ok := sessionOfSameProcess(sid, spaces); ok {
+		return other, e, nil
+	}
 	return ns, nil, err
 }
+
+// sessionOfSameProcess finds the entry belonging to this session's claude
+// process, for a session whose id has changed underneath its monitor.
+//
+// Clearing a session mints a fresh session id inside the running claude
+// process. The monitor is spawned once, when that process starts, so it holds
+// the id it armed with for the life of the process -- and so do the registry
+// entry, the spool and the lock it owns. The widget, spawned per render, is
+// handed the host's *current* id instead, which no entry is filed under. The
+// arming grace cannot cover this: Claude Code keeps the original startedAt
+// across the change, so the session reads as hours old and the miss looks
+// real. Without this the widget cries "not armed" at a session that is alive,
+// heartbeating, and draining its mail perfectly well.
+//
+// The match is on the process rather than the id, since the process is the one
+// thing the two ids agree on. A pid plus its start time names exactly one
+// process and cannot be recycled into another, which is the same test
+// ProcessAlive makes before trusting any entry at all.
+func sessionOfSameProcess(sid string, spaces []NamespaceInfo) (Namespace, *Entry, bool) {
+	rec, ok := findClaudeSession(sid)
+	if !ok || rec.PID <= 0 {
+		return Namespace{}, nil, false
+	}
+	for _, info := range spaces {
+		ns, err := ParseNamespace(info.Name)
+		if err != nil {
+			continue
+		}
+		// Dead entries are excluded: they name a process that is gone, which
+		// is never the live one asking.
+		entries, err := ns.ListSessions(false, false)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.PID == rec.PID && sameProcess(e.ProcStart, rec.ProcStart) {
+				return ns, e, true
+			}
+		}
+	}
+	return Namespace{}, nil, false
+}
+
+// sameProcess compares two recorded process start times the way ProcessAlive
+// does. An empty value on either side means that platform could not read one,
+// which is a reason not to tell two processes apart rather than grounds to
+// call them different.
+func sameProcess(a, b string) bool { return a == "" || b == "" || a == b }

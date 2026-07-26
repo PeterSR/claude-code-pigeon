@@ -83,27 +83,32 @@ func LookupClaudeSession(pid int, sessionID string) ClaudeSession {
 	}
 }
 
-// claudeSessionAge reports how long ago a session started, read from Claude
-// Code's session index, and whether that is known. The index is keyed by pid,
-// so this scans it for the matching session id -- the status widget holds the
-// id but not the pid.
+// claudeIndexEntry is the rest of one Claude Code session-index record: when
+// the session started, and which process is running it.
+type claudeIndexEntry struct {
+	PID       int
+	ProcStart string
+	StartedAt int64
+}
+
+// findClaudeSession scans Claude Code's session index for the record naming
+// this session id, and reports whether one was found.
 //
-// It exists so the status widget can tell a monitor that is still arming
-// (session a second old, no entry yet) from one that never armed (session long
-// up, still no entry). Best-effort like everything that reads Claude Code's
-// internals: a missing file, unreadable JSON, or absent startedAt yields
-// ok=false, and the caller keeps its prior behaviour.
-func claudeSessionAge(sessionID string, now time.Time) (age time.Duration, ok bool) {
+// The index is keyed by the claude pid, and a caller here holds an id rather
+// than a pid, so this is a scan rather than a read. Best-effort like everything
+// that reads Claude Code's internals: a missing directory, unreadable JSON, or
+// no matching record yields ok=false, and the caller keeps its prior behaviour.
+func findClaudeSession(sessionID string) (claudeIndexEntry, bool) {
 	if ValidSessionID(sessionID) != nil {
-		return 0, false
+		return claudeIndexEntry{}, false
 	}
 	dir := claudeConfigDir()
 	if dir == "" {
-		return 0, false
+		return claudeIndexEntry{}, false
 	}
 	paths, err := filepath.Glob(filepath.Join(dir, "sessions", "*.json"))
 	if err != nil {
-		return 0, false
+		return claudeIndexEntry{}, false
 	}
 	for _, p := range paths {
 		b, err := os.ReadFile(p)
@@ -112,15 +117,30 @@ func claudeSessionAge(sessionID string, now time.Time) (age time.Duration, ok bo
 		}
 		var rec struct {
 			SessionID string `json:"sessionId"`
+			PID       int    `json:"pid"`
+			ProcStart string `json:"procStart"`
 			StartedAt int64  `json:"startedAt"`
 		}
 		if json.Unmarshal(b, &rec) != nil || rec.SessionID != sessionID {
 			continue
 		}
-		if rec.StartedAt <= 0 {
-			return 0, false
-		}
-		return now.Sub(time.UnixMilli(rec.StartedAt)), true
+		return claudeIndexEntry{PID: rec.PID, ProcStart: rec.ProcStart, StartedAt: rec.StartedAt}, true
 	}
-	return 0, false
+	return claudeIndexEntry{}, false
+}
+
+// claudeSessionAge reports how long ago a session started, read from Claude
+// Code's session index, and whether that is known.
+//
+// It exists so the status widget can tell a monitor that is still arming
+// (session a second old, no entry yet) from one that never armed (session long
+// up, still no entry). An absent startedAt is unknown rather than zero: a
+// session that appears to have started at the epoch would fail the grace check
+// for the wrong reason.
+func claudeSessionAge(sessionID string, now time.Time) (age time.Duration, ok bool) {
+	rec, found := findClaudeSession(sessionID)
+	if !found || rec.StartedAt <= 0 {
+		return 0, false
+	}
+	return now.Sub(time.UnixMilli(rec.StartedAt)), true
 }

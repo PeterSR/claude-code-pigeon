@@ -38,8 +38,11 @@ func Arm(w io.Writer) error {
 		return nil
 	}
 
-	if e, err := ReadEntry(sid); err == nil && e.Status == StatusLive {
-		fmt.Fprintf(w, "Already armed: a monitor is listening for session %s.\n", Short(sid))
+	// Self rather than ReadEntry(sid): after a clear this process holds a newer
+	// session id than the monitor armed with, and answering "no monitor here"
+	// would talk somebody into arming a second one for the same session.
+	if _, e, err := Self(); err == nil && e.Status == StatusLive {
+		fmt.Fprintf(w, "Already armed: a monitor is listening for session %s.\n", Short(e.SessionID))
 		fmt.Fprintf(w, "Address: %s\n", e.Addr())
 		return nil
 	}

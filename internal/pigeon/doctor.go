@@ -390,11 +390,15 @@ func unescapeDouble(s string) string {
 // checkRegistration is the payoff: whatever the configuration says, is this
 // session actually reachable right now?
 func checkRegistration() []Check {
-	sid := CurrentSessionID()
-	if sid == "" {
+	if CurrentSessionID() == "" {
 		return nil
 	}
-	e, err := ReadEntry(sid)
+	// Self, not ReadEntry: doctor answers "can this session receive", and a
+	// session that has been cleared is registered under the id its monitor
+	// armed with rather than the one this process was handed. Reporting an
+	// unreachable session that is in fact reachable sends you restarting a
+	// perfectly healthy monitor.
+	own, e, err := Self()
 	if err != nil {
 		return []Check{fail("this session", "not registered, so nothing can reach it",
 			"install the plugin and restart, or run `pigeon arm` to arm this session alone")}
@@ -412,7 +416,9 @@ func checkRegistration() []Check {
 			"run `pigeon prune`"))
 	}
 
-	if n := Pending(sid); n > 0 {
+	// Counted on the spool the entry actually names, which is not necessarily
+	// the one this process's own namespace and session id would point at.
+	if n := own.Pending(e.SessionID); n > 0 {
 		out = append(out, warn("queued mail",
 			fmt.Sprintf("%d message(s) waiting on this session's spool", n),
 			"a monitor for this same session id will read them; a new session gets a new id and will not"))
@@ -430,7 +436,7 @@ func checkPeers() Check {
 	if err != nil {
 		return warn("peers", "cannot read the registry: "+err.Error(), "")
 	}
-	me := CurrentSessionID()
+	me := SelfID()
 	live, deaf := 0, 0
 	for _, e := range entries {
 		if e.SessionID == me {

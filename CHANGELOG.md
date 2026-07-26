@@ -62,6 +62,21 @@ All notable changes to this project are documented here. Format follows
   how. Nothing else changes: the widget reports the same states from the same registry.
 
 ### Fixed
+- A session that has been cleared now identifies itself correctly to the CLI. Same root cause as
+  the `not armed` alarm below: after a clear, the monitor and the MCP server still hold the id
+  they started with, while `pigeon` run from a shell in that session is handed the new one, and
+  under that id nothing is registered. So `whoami` said "not registered", `doctor` failed the
+  session as unreachable, `arm` offered to arm a monitor that was already running -- which would
+  have put a second one on the same session -- and `send`/`publish` stamped a reply address that
+  resolved to no spool, which also defeated the guard that stops a session waking on its own
+  broadcast. Every "which session am I" lookup now goes through one resolver that answers from
+  the registry rather than the environment, so the CLI, the MCP server and the monitor cannot
+  disagree. A session whose monitor genuinely never armed is still reported exactly as before.
+
+  The monitor itself is deliberately not re-registered under the new id. Its identity is fixed
+  for its lifetime, like its namespace, and moving a live session's entry, lock, spool and
+  cursors mid-flight would race a sender already writing to the old spool -- losing mail to fix
+  a labelling problem.
 - A session that has been cleared is no longer reported as `not armed`. Clearing mints a fresh
   session id inside the running claude process, but the monitor was spawned once when that
   process started and keeps the id it armed with, along with the registry entry, spool and lock

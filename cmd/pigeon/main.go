@@ -515,11 +515,9 @@ func cmdTopics(args []string, w, stderr io.Writer) error {
 	// starred logs this session does not read and is not subscribed to, purely
 	// because the names matched.
 	mine := map[string]bool{}
-	if sid := pigeon.CurrentSessionID(); sid != "" && ns.Is(pigeon.CurrentNamespace()) {
-		if e, err := ns.ReadEntry(sid); err == nil {
-			for _, t := range e.Subscriptions {
-				mine[t] = true
-			}
+	if own, e, err := pigeon.Self(); err == nil && ns.Is(own) {
+		for _, t := range e.Subscriptions {
+			mine[t] = true
 		}
 	}
 
@@ -732,7 +730,7 @@ func cmdWhoami(w io.Writer) error {
 		fmt.Fprintf(w, "not inside a Claude Code session; sending as %s\n", pigeon.ShellIdentity())
 		return nil
 	}
-	e, err := pigeon.ReadEntry(sid)
+	_, e, err := pigeon.Self()
 	if err != nil {
 		fmt.Fprintf(w, "session:  %s\n", sid)
 		fmt.Fprintln(w, "not registered -- is the pigeon plugin installed and the session restarted?")
@@ -946,11 +944,10 @@ func humanBytes(n int64) string {
 }
 
 func ownEntry() (*pigeon.Entry, error) {
-	sid := pigeon.CurrentSessionID()
-	if sid == "" {
+	if pigeon.CurrentSessionID() == "" {
 		return nil, fmt.Errorf("not inside a Claude Code session")
 	}
-	e, err := pigeon.ReadEntry(sid)
+	_, e, err := pigeon.Self()
 	if err != nil {
 		return nil, fmt.Errorf("this session is not registered (install the plugin and restart)")
 	}

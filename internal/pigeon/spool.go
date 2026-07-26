@@ -106,11 +106,19 @@ func CurrentSender() Sender {
 	// directory in place -- exactly what `private` exists to prevent, published
 	// to every recipient. Missing the entry must fail closed.
 	s := Sender{Kind: "session", SessionID: sid, Namespace: ns.String()}
-	// locateSession falls back to every namespace, for the same reason the
-	// status widget needs it: this process may not resolve the one the monitor
-	// registered in.
-	_, e, err := locateSession(sid)
+	// Self falls back to every namespace, and then to this claude process, for
+	// the same reason: this process may not resolve the namespace the monitor
+	// registered in, and after a clear it does not even hold the id the monitor
+	// registered under.
+	found, e, err := Self()
 	if err == nil {
+		// Stamped from the entry rather than from this process's environment,
+		// because a reply is addressed to what this says. The environment's id
+		// is the one Claude Code minted most recently; the entry's is the one a
+		// monitor is actually listening on, and after a clear those differ. The
+		// namespace goes with it: an address is only an address in the
+		// namespace holding the spool it names.
+		s.SessionID, s.Namespace = e.SessionID, found.String()
 		s.Name = e.Name
 		if !e.Private {
 			if e.Cwd != "" {

@@ -270,6 +270,27 @@ func TestMonitorDeregistersOnShutdown(t *testing.T) {
 	}
 }
 
+// A session hard-killed before its monitor's deferred RemoveEntry runs leaves
+// a dead entry behind. The next monitor to register in the same namespace
+// sweeps it, so the namespace tidies itself without anyone running
+// `pigeon prune` by hand.
+func TestMonitorPrunesDeadEntriesOnRegister(t *testing.T) {
+	withHome(t)
+	if err := WriteEntry(&Entry{SessionID: "mon-dead-leftover", PID: 0}); err != nil {
+		t.Fatal(err)
+	}
+
+	const sid = "mon-register-prunes-1"
+	m := startMonitor(t, sid)
+
+	if _, err := ReadEntry("mon-dead-leftover"); err == nil {
+		t.Error("dead entry from an earlier session survived a new monitor's registration")
+	}
+	if !m.stderr.has("pruned 1 dead session entry") {
+		t.Errorf("no prune notice on stderr:\n%s", m.stderr.String())
+	}
+}
+
 // --- direct messages -------------------------------------------------------
 
 func TestMonitorEmitsDirectMessagesButNeverItsOwn(t *testing.T) {

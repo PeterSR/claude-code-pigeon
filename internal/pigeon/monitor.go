@@ -246,6 +246,14 @@ func manageSubscriptions(ns Namespace, sid string, out chan<- *Message, done <-c
 }
 
 func register(ns Namespace, sid string, logf func(string, ...any)) error {
+	// A session hard-killed before its monitor's deferred RemoveEntry runs
+	// leaves a dead entry behind -- otherwise only `pigeon prune` clears it.
+	// Sweeping here means the namespace tidies itself as sessions come and go,
+	// rather than accumulating garbage until someone runs prune by hand.
+	if pruned := ns.pruneDeadEntries(sid); pruned > 0 {
+		logf("pruned %d dead session entry/entries left by earlier sessions", pruned)
+	}
+
 	pid := CurrentClaudePID()
 	cwd := CurrentCwd()
 

@@ -304,6 +304,44 @@ func (n Namespace) ListSessions(includeDead, prune bool) ([]*Entry, error) {
 	return out, nil
 }
 
+// pruneDeadEntries removes registry entries whose owning process is gone,
+// except exceptSID -- its caller is registering that session right now, so by
+// definition it is not dead however its own status computes (a pid that
+// cannot be resolved yet reads as StatusDead, and re-registering must not
+// have that race away the very entry it is about to preserve).
+func (n Namespace) pruneDeadEntries(exceptSID string) int {
+	paths, err := filepath.Glob(filepath.Join(n.SessionsDir(), "*.json"))
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, p := range paths {
+		id := strings.TrimSuffix(filepath.Base(p), ".json")
+		if id == exceptSID {
+			continue
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var e Entry
+		if err := json.Unmarshal(b, &e); err != nil {
+			continue
+		}
+		// A planted entry file must not be able to steer this at a path
+		// outside the state tree, same guard as ListSessions.
+		if ValidSessionID(e.SessionID) != nil || filepath.Base(p) != e.SessionID+".json" {
+			continue
+		}
+		if e.status(n) != StatusDead {
+			continue
+		}
+		n.removeSessionFiles(e.SessionID, p)
+		count++
+	}
+	return count
+}
+
 // ListAllSessions returns every registered session on the machine, namespace by
 // namespace. Ordinary listing is per namespace on purpose; this is what
 // `--all-namespaces` asks for.

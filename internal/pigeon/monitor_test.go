@@ -291,6 +291,44 @@ func TestMonitorPrunesDeadEntriesOnRegister(t *testing.T) {
 	}
 }
 
+func TestRegisterSkipsPruningADeadLookingSessionWhoseLockIsHeld(t *testing.T) {
+	withHome(t)
+
+	ns := DefaultNamespace()
+	const heldSID = "mon-held-stale-1"
+	const newSID = "mon-register-held-1"
+
+	if err := WriteEntry(&Entry{SessionID: heldSID, PID: 0}); err != nil {
+		t.Fatalf("WriteEntry(%s): %v", heldSID, err)
+	}
+	if err := os.WriteFile(SpoolPath(heldSID), []byte("queued\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%s): %v", SpoolPath(heldSID), err)
+	}
+	if err := mutateCursors(heldSID, func(c map[string]int64) { c[inboxCursorKey] = 7 }); err != nil {
+		t.Fatalf("mutateCursors(%s): %v", heldSID, err)
+	}
+	holdSessionLock(t, heldSID)
+
+	if got := ns.pruneDeadEntries(newSID); got != 0 {
+		t.Fatalf("pruneDeadEntries() pruned %d entries, want 0 while %s lock is held", got, heldSID)
+	}
+
+	t.Setenv(EnvClaudePID, strconv.Itoa(os.Getpid()))
+	if err := register(ns, newSID, func(string, ...any) {}); err != nil {
+		t.Fatalf("register(%s): %v", newSID, err)
+	}
+
+	for _, path := range []string{
+		ns.entryPath(heldSID),
+		ns.SpoolPath(heldSID),
+		ns.cursorPath(heldSID),
+	} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("stat %s: %v; prune deleted files for a session whose lock was held", path, err)
+		}
+	}
+}
+
 // --- direct messages -------------------------------------------------------
 
 func TestMonitorEmitsDirectMessagesButNeverItsOwn(t *testing.T) {

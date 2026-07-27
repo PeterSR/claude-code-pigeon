@@ -336,7 +336,12 @@ func (n Namespace) pruneDeadEntries(exceptSID string) int {
 		if e.status(n) != StatusDead {
 			continue
 		}
+		lock, acquired, err := n.tryMonitorLock(e.SessionID)
+		if err != nil || !acquired {
+			continue
+		}
 		n.removeSessionFiles(e.SessionID, p)
+		_ = lock.Close()
 		count++
 	}
 	return count

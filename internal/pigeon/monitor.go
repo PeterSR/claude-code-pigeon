@@ -245,6 +245,13 @@ func manageSubscriptions(ns Namespace, sid string, out chan<- *Message, done <-c
 	}
 }
 
+// tryMonitorLock attempts to take the session's liveness lock without waiting.
+// A held lock means a monitor is registering or already running, so anything
+// pruning state for that session must stand down.
+func (n Namespace) tryMonitorLock(sessionID string) (io.Closer, bool, error) {
+	return tryExclusive(n.LockPath(sessionID))
+}
+
 func register(ns Namespace, sid string, logf func(string, ...any)) error {
 	// A session hard-killed before its monitor's deferred RemoveEntry runs
 	// leaves a dead entry behind -- otherwise only `pigeon prune` clears it.

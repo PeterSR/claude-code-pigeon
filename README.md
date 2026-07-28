@@ -47,7 +47,9 @@ $ pigeon doctor        # confirm this session can actually receive
 
 `pigeon install` scaffolds a plugin at `~/.claude/skills/pigeon`, which auto-loads as
 `pigeon@skills-dir`. There is no marketplace to add and nothing to clone. Every session
-from then on registers itself at startup.
+from then on registers itself at startup, and carries a bundled `pigeon-usage` skill --
+the MCP tool list, status meanings, known limitations -- so a session does not have to
+discover any of that on its own. See [Skills](#skills).
 
 Monitors cannot be rebound mid-session, so the restart is required.
 
@@ -314,12 +316,21 @@ alongside the literal fields, with the same context and functions as the project
 `list_sessions`, `send_message`, `publish`, `subscribe` and `unsubscribe` take an optional
 `namespace`; leaving it out means this session's own.
 
-### An example skill
+## Skills
 
-`skills/session-coordination/` teaches a session when to reach for these tools, and
-how to treat what arrives. It is **not** installed by `pigeon install` — skills change
-model behaviour, so opting in should be deliberate. Copy it to `~/.claude/skills/` if
-you want it. See [skills/README.md](skills/README.md).
+Two exist, treated differently on purpose.
+
+`pigeon-usage` is bundled by `pigeon install` itself: the MCP tool list, status
+meanings, and known platform limitations, such as a monitor that dies not being
+respawned mid-session. It carries no opinion about *when* to
+actually message another session, which is what makes it safe to install as a side
+effect of running a binary.
+
+`skills/pigeon-session-coordination/` does carry opinions -- when to reach for these
+tools, how to treat what arrives, conventions like short names and asking before
+broadcasting. It is **not** installed by `pigeon install`, precisely because those are
+opinions rather than facts and opting into someone else's should be deliberate. Copy it
+to `~/.claude/skills/` if you want it. See [skills/README.md](skills/README.md).
 
 ## Namespaces
 
@@ -586,13 +597,38 @@ Claude Code plugins can declare background monitors that the host starts at sess
 with no model involvement. Every line such a monitor prints to stdout is delivered to that
 session as a `<task_notification>`, which wakes it if idle.
 
-**This behaviour is shipped but undocumented.** That monitors are started at all, that
-`CLAUDE_CODE_SESSION_ID` is injected into them, and that their stdout becomes a
-notification are all observed, not promised. They were verified end to end against Claude Code
-2.1.218, and requiring 2.1.105 or newer for the session id. A future release could change
-any of it, and the failure would be silent. That is what `pigeon doctor` is for: it checks
-each assumption separately and warns when your Claude Code is newer than the version this
-was tested against.
+Monitors themselves are documented: Claude Code's [plugins
+reference](https://code.claude.com/docs/en/plugins-reference) describes declaring them, that
+each runs "for the lifetime of the session", and that every stdout line reaches the model as
+a notification. **The identity half is not.** That `CLAUDE_CODE_SESSION_ID` is injected into
+a monitor process appears nowhere in those docs, and pigeon's addressing rests entirely on
+it. It is observed, not promised: verified end to end against Claude Code 2.1.218, and
+requiring 2.1.105 or newer for the session id. A future release could drop it, and the
+failure would be silent. That is what `pigeon doctor` is for: it checks each assumption
+separately and warns when your Claude Code is newer than the version this was tested against.
+
+**A monitor that dies mid-session does not come back on its own.** Claude Code arms monitors
+at session start and on plugin reload. That is the documented list -- nothing supervises a
+monitor or respawns one whose process is gone. Two consequences, both observed in Claude Code
+2.1.220 on 2026-07-28, in two different projects, after the plugin's own "monitor stopped"
+notification fired:
+
+- **A session that crosses a restart gets a monitor, under a new address.** A relaunched or
+  resumed session is a new process hitting session start, so it arms correctly -- but
+  `--resume` mints a fresh session id rather than restoring the old one, so the new monitor
+  registers as a different session. Observed silently, mid-conversation: the transcript kept
+  going as one continuous conversation while the old id's registry entry disappeared, and
+  anyone still holding that address could no longer reach the session.
+- **A session that does not cross one stays deaf forever.** After an idle-then-cache-restore
+  (no `/clear`, no relaunch, no visible interruption) the session id never changed and no
+  monitor was ever rearmed. The session came back fully deaf, indistinguishable from a
+  healthy one until someone ran `pigeon doctor`.
+
+Neither case is announced anywhere in the conversation, and the status line's widgets
+describe whatever process is current, not necessarily the one you last knew the address of.
+Treat a resumed or previously-idle session's identity as unverified until `pigeon
+doctor`/`pigeon whoami` confirms it, especially before relying on it to receive. Restarting
+the session is the recovery that is known to work.
 
 The session name in `pigeon ls` leans on one more observation of the same kind: Claude Code
 writes a per-session index under its own config directory
@@ -632,6 +668,9 @@ are written to `payloads/` and the recipient gets a path instead.
   not arm plugin monitors there, so a Windows session cannot receive.
 - PID-reuse detection needs Linux `/proc`; elsewhere a recycled PID can make a dead
   session look alive until something prunes it.
+- A monitor that dies mid-session is not respawned. A session that restarts gets a new one
+  under a new address; one that only idles stays deaf. Silently, either way -- see
+  [How it works](#how-it-works).
 - `pigeon prune` does not compact topic logs on Windows. Compaction replaces a log by
   rename, which Windows refuses while any process still holds it open. Forgetting dead
   sessions still works; only the space reclaim is skipped.

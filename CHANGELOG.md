@@ -7,6 +7,14 @@ All notable changes to this project are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- A `pigeon-usage` skill, bundled automatically by `pigeon install` alongside the
+  monitor and MCP server. Unlike the example skill below, it is strictly
+  informational -- the MCP tool list, what `live`/`deaf`/`dead` mean, and a known
+  limitation where a monitor that dies is never respawned, so a session that restarts
+  comes back under a new address and one that only idles comes back deaf -- so it
+  carries no opinion about when to actually
+  message another session, which is what makes it safe to bundle without an explicit
+  opt-in.
 - `pigeon listen` receives messages in a plain shell, so automation outside Claude Code can
   subscribe to topics and react. It blocks, printing each message as it arrives, reusing the
   monitor's own follow loop, so it inherits the same compaction- and truncation-tolerance.
@@ -54,6 +62,12 @@ All notable changes to this project are documented here. Format follows
 
   `pigeon.wait` declares a 30s cache ceiling plus a file invalidation on this session's own
   spool, so a message arriving relights the widget without waiting out the ttl.
+
+### Changed
+- `skills/session-coordination` renamed to `skills/pigeon-session-coordination`, so its
+  name pairs with the new bundled `pigeon-usage` skill above rather than reading as a
+  generic term. Still an example, still not installed automatically; update the path if
+  you already copied it under the old name.
 
 ### Removed
 - `pigeon statusline`. weaverbird renders pigeon's status now, and two commands answering the

@@ -105,6 +105,18 @@ func TestInstallWritesTheWholePlugin(t *testing.T) {
 		t.Errorf("mcp args = %v, want [mcp]", srv.Args)
 	}
 
+	// Bundled automatically, unlike skills/pigeon-session-coordination: it is
+	// strictly informational, so it does not need the same opt-in as a skill
+	// carrying opinions about when to message another session.
+	skillPath := filepath.Join(plugin, "skills", "pigeon-usage", "SKILL.md")
+	skillBody, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", skillPath, err)
+	}
+	if !strings.Contains(string(skillBody), "name: pigeon-usage") {
+		t.Errorf("bundled skill frontmatter missing name: pigeon-usage:\n%s", skillBody)
+	}
+
 	// The state tree has to exist before the first session starts writing to it.
 	if fi, err := os.Stat(SessionsDir()); err != nil || !fi.IsDir() {
 		t.Errorf("state tree not created by Install: %v", err)

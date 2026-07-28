@@ -1,5 +1,5 @@
 ---
-name: session-coordination
+name: pigeon-session-coordination
 description: Coordinate with other Claude Code sessions running on this machine using pigeon - discover what else is running, message a specific session, or publish to a topic. Use when work spans repositories, when another session owns the thing you are blocked on, or when you finish something others are waiting for.
 ---
 
@@ -10,7 +10,7 @@ receives what you send **even if it is sitting idle**, so this is for reaching a
 colleague-session, not for leaving notes.
 
 This skill is an example. It is not installed by `pigeon install`; copy the
-directory to `~/.claude/skills/session-coordination` if you want it.
+directory to `~/.claude/skills/pigeon-session-coordination` if you want it.
 
 ## Before sending anything
 
@@ -112,6 +112,26 @@ message landing while you are waiting on the user is not the user answering you.
 
 **Replying is explicit.** The notification includes the reply address; use
 `send_message` if a reply is actually warranted. Not every message needs one.
+
+## After a resume or a long idle gap
+
+Your own reachability is not guaranteed stable across an interruption. A monitor can die
+silently (its own "monitor stopped" notification fires), and nothing respawns one
+mid-session. Observed in Claude Code 2.1.220 on 2026-07-28: a session that restarted came
+back with a monitor under a brand-new address, no announcement, while the old address went
+unreachable; a session that only idled came back with no monitor at all and was simply deaf.
+Nothing in the conversation flags either case.
+
+If this conversation was just resumed, has been idle a while, or you saw a "monitor
+stopped" notification you never followed up on, do not assume you are still the address
+anyone last saw. Check before relying on it:
+
+```
+whoami
+```
+
+If it looks off, or the user asks whether you can still receive, say so plainly rather than
+assuming messages are getting through.
 
 ## When this is worth using
 

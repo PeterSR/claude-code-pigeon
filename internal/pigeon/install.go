@@ -1,6 +1,7 @@
 package pigeon
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,16 @@ import (
 // projectURL is the canonical home of the project, surfaced in the generated
 // plugin manifest so an installed plugin says where it came from.
 const projectURL = "https://github.com/PeterSR/claude-code-pigeon"
+
+// pigeonUsageSkill is bundled into the plugin by Install. Unlike
+// skills/pigeon-session-coordination (an opt-in example carrying opinions
+// about when to message another session), this one is strictly informational
+// -- the tool list, status meanings, known platform limitations -- which is
+// what makes it safe to install as a side effect of running a binary. Edit
+// the source, not a copy under a plugin directory: it is never read back.
+//
+//go:embed pigeonusage/SKILL.md
+var pigeonUsageSkill []byte
 
 // Plugin install target. A plugin scaffolded under ~/.claude/skills/<name>
 // auto-loads on the next session as <name>@skills-dir, so there is no
@@ -66,6 +77,7 @@ func Install(version string, w io.Writer) error {
 	for _, d := range []string{
 		filepath.Join(dir, ".claude-plugin"),
 		filepath.Join(dir, "monitors"),
+		filepath.Join(dir, "skills", "pigeon-usage"),
 	} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return err
@@ -117,6 +129,12 @@ func Install(version string, w io.Writer) error {
 		return err
 	}
 
+	// Strictly informational -- see the doc comment on pigeonUsageSkill for why
+	// this one bundles automatically while pigeon-session-coordination does not.
+	if err := os.WriteFile(filepath.Join(dir, "skills", "pigeon-usage", "SKILL.md"), pigeonUsageSkill, 0o644); err != nil {
+		return err
+	}
+
 	if err := EnsureDirs(); err != nil {
 		return err
 	}
@@ -128,6 +146,7 @@ func Install(version string, w io.Writer) error {
 	fmt.Fprintf(w, "  state:   %s\n", Home())
 	fmt.Fprintf(w, "  ns:      %s (from %s)\n", ns, origin)
 	fmt.Fprintf(w, "  mcp:     pigeon (%d tools)\n", len(tools()))
+	fmt.Fprintf(w, "  skill:   pigeon-usage (bundled)\n")
 	fmt.Fprintf(w, "\nloads as pigeon@skills-dir on the NEXT session start.\n")
 	fmt.Fprintf(w, "monitors cannot be rebound mid-session, so restart Claude Code.\n")
 	return nil

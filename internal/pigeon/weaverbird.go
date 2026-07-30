@@ -75,10 +75,11 @@ func BuildWeaverbirdSpec() wb.Spec {
 		Provider: "pigeon",
 		Icon:     "🕊",
 		Widgets: []wb.Widget{
-			{ID: "pigeon.wait", Title: "Messages", Priority: 50, Cache: cache},
+			{ID: "pigeon.wait", Title: "Messages", Kind: wb.KindText, Priority: 50, Cache: cache},
 			{
 				ID:       "pigeon.monitor",
 				Title:    "Monitor",
+				Kind:     wb.KindText,
 				Priority: 20,
 				Row:      1,
 				Default:  wb.OptIn(),
@@ -87,6 +88,7 @@ func BuildWeaverbirdSpec() wb.Spec {
 			{
 				ID:       "pigeon.peers",
 				Title:    "Peers",
+				Kind:     wb.KindText,
 				Priority: 10,
 				Row:      1,
 				Default:  wb.OptIn(),
@@ -182,13 +184,13 @@ func sessionIDFromWeaverbird(sess wb.Session) string {
 // than a misleading "0 waiting".
 func waitingValue(n int) wb.Value {
 	if n <= 0 {
-		return wb.Value{ID: "pigeon.wait", Text: "waiting", Short: "waiting", Class: wb.ClassWarn}
+		return wb.Value{ID: "pigeon.wait", FullText: "waiting", ShortText: "waiting", Class: wb.ClassWarn}
 	}
 	return wb.Value{
-		ID:    "pigeon.wait",
-		Text:  fmt.Sprintf("%d waiting", n),
-		Short: strconv.Itoa(n),
-		Class: wb.ClassWarn,
+		ID:        "pigeon.wait",
+		FullText:  fmt.Sprintf("%d waiting", n),
+		ShortText: strconv.Itoa(n),
+		Class:     wb.ClassWarn,
 	}
 }
 
@@ -198,7 +200,7 @@ func waitingValue(n int) wb.Value {
 // dead monitor with mail piling up -- the two states cannot receive for
 // different reasons, and the fix for each is different.
 func notArmedValue() wb.Value {
-	return wb.Value{ID: "pigeon.wait", Text: "not armed", Short: "not armed", Class: wb.ClassWarn}
+	return wb.Value{ID: "pigeon.wait", FullText: "not armed", ShortText: "not armed", Class: wb.ClassWarn}
 }
 
 // monitorValue renders pigeon.monitor's one value record from a resolved
@@ -214,11 +216,11 @@ func notArmedValue() wb.Value {
 func monitorValue(e *Entry) wb.Value {
 	switch e.Status {
 	case StatusLive:
-		return wb.Value{ID: "pigeon.monitor", Text: "monitor live", Short: "live", Class: wb.ClassOK}
+		return wb.Value{ID: "pigeon.monitor", FullText: "monitor live", ShortText: "live", Class: wb.ClassOK}
 	case StatusDeaf:
-		return wb.Value{ID: "pigeon.monitor", Text: "monitor deaf", Short: "deaf", Class: wb.ClassWarn}
+		return wb.Value{ID: "pigeon.monitor", FullText: "monitor deaf", ShortText: "deaf", Class: wb.ClassWarn}
 	default: // StatusDead
-		return wb.Value{ID: "pigeon.monitor", Text: "monitor dead", Short: "dead", Class: wb.ClassDanger}
+		return wb.Value{ID: "pigeon.monitor", FullText: "monitor dead", ShortText: "dead", Class: wb.ClassDanger}
 	}
 }
 
@@ -255,9 +257,9 @@ func peersValue() *wb.Value {
 		return nil
 	}
 	return &wb.Value{
-		ID:    "pigeon.peers",
-		Text:  fmt.Sprintf("%d peers", n),
-		Short: strconv.Itoa(n),
-		Class: wb.ClassNeutral,
+		ID:        "pigeon.peers",
+		FullText:  fmt.Sprintf("%d peers", n),
+		ShortText: strconv.Itoa(n),
+		Class:     wb.ClassNeutral,
 	}
 }

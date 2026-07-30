@@ -158,7 +158,7 @@ func TestWeaverbirdValue_SilentWhenLive(t *testing.T) {
 	if _, ok := valueByID(vals, "pigeon.wait"); ok {
 		t.Errorf("vals = %+v, want no pigeon.wait record (live session)", vals)
 	}
-	if mv, ok := valueByID(vals, "pigeon.monitor"); !ok || mv.Text != "monitor live" || mv.Short != "live" || mv.Class != wb.ClassOK {
+	if mv, ok := valueByID(vals, "pigeon.monitor"); !ok || mv.FullText != "monitor live" || mv.ShortText != "live" || mv.Class != wb.ClassOK {
 		t.Errorf("pigeon.monitor = %+v, ok=%v, want monitor live/ok", mv, ok)
 	}
 	if _, ok := valueByID(vals, "pigeon.peers"); ok {
@@ -189,11 +189,11 @@ func TestWeaverbirdValue_DeafWithWaitingCount(t *testing.T) {
 		t.Fatalf("vals = %+v, want pigeon.wait and pigeon.monitor only", vals)
 	}
 	v, ok := valueByID(vals, "pigeon.wait")
-	if !ok || v.Class != wb.ClassWarn || v.Text != "3 waiting" || v.Short != "3" {
+	if !ok || v.Class != wb.ClassWarn || v.FullText != "3 waiting" || v.ShortText != "3" {
 		t.Errorf("pigeon.wait = %+v, ok=%v, want warn/\"3 waiting\"/\"3\"", v, ok)
 	}
 	mv, ok := valueByID(vals, "pigeon.monitor")
-	if !ok || mv.Text != "monitor deaf" || mv.Short != "deaf" || mv.Class != wb.ClassWarn {
+	if !ok || mv.FullText != "monitor deaf" || mv.ShortText != "deaf" || mv.Class != wb.ClassWarn {
 		t.Errorf("pigeon.monitor = %+v, ok=%v, want monitor deaf/warn", mv, ok)
 	}
 }
@@ -213,7 +213,7 @@ func TestWeaverbirdValue_DeafWithNoCountWhenSpoolIsEmpty(t *testing.T) {
 		t.Fatalf("vals = %+v, want pigeon.wait and pigeon.monitor only", vals)
 	}
 	v, ok := valueByID(vals, "pigeon.wait")
-	if !ok || v.Class != wb.ClassWarn || v.Text != "waiting" || v.Short != "waiting" {
+	if !ok || v.Class != wb.ClassWarn || v.FullText != "waiting" || v.ShortText != "waiting" {
 		t.Errorf("pigeon.wait = %+v, ok=%v, want warn/\"waiting\"/\"waiting\"", v, ok)
 	}
 }
@@ -234,11 +234,11 @@ func TestWeaverbirdValue_NotArmed(t *testing.T) {
 		t.Fatalf("vals = %+v, want exactly one record", vals)
 	}
 	v := vals[0]
-	if v.Class != wb.ClassWarn || v.Text != "not armed" || v.Short != "not armed" {
+	if v.Class != wb.ClassWarn || v.FullText != "not armed" || v.ShortText != "not armed" {
 		t.Errorf("v = %+v, want pigeon.wait/warn/\"not armed\", not the waiting-count wording", v)
 	}
-	if v.Text == "waiting" {
-		t.Errorf("v.Text = %q, not-armed must not reuse the deaf/dead waiting text", v.Text)
+	if v.FullText == "waiting" {
+		t.Errorf("v.FullText = %q, not-armed must not reuse the deaf/dead waiting text", v.FullText)
 	}
 }
 
@@ -288,7 +288,7 @@ func TestWeaverbirdValue_SessionBeatsEnvironment(t *testing.T) {
 		t.Fatalf("WeaverbirdValue: %v", err)
 	}
 	v, ok := valueByID(vals, "pigeon.wait")
-	if !ok || v.Text != "waiting" {
+	if !ok || v.FullText != "waiting" {
 		t.Errorf("vals = %+v, want the stdin session's deaf/no-count record", vals)
 	}
 }
@@ -306,7 +306,7 @@ func TestWeaverbirdValue_FallsBackToEnvOnEmptySession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WeaverbirdValue: %v", err)
 	}
-	if v, ok := valueByID(vals, "pigeon.wait"); !ok || v.Text != "waiting" {
+	if v, ok := valueByID(vals, "pigeon.wait"); !ok || v.FullText != "waiting" {
 		t.Errorf("vals = %+v, want the env session's deaf record", vals)
 	}
 }
@@ -344,7 +344,7 @@ func TestWeaverbirdValue_FindsASessionInAnotherNamespace(t *testing.T) {
 		t.Fatalf("WeaverbirdValue: %v", err)
 	}
 	v, ok := valueByID(vals, "pigeon.wait")
-	if !ok || v.Text != "waiting" {
+	if !ok || v.FullText != "waiting" {
 		t.Errorf("vals = %+v, want its real deaf state, not \"not armed\"", vals)
 	}
 
@@ -356,7 +356,7 @@ func TestWeaverbirdValue_FindsASessionInAnotherNamespace(t *testing.T) {
 		t.Fatalf("WeaverbirdValue: %v", err)
 	}
 	v, ok = valueByID(vals, "pigeon.wait")
-	if !ok || v.Text != "1 waiting" {
+	if !ok || v.FullText != "1 waiting" {
 		t.Errorf("vals = %+v, want the waiting message counted", vals)
 	}
 }
@@ -378,7 +378,7 @@ func TestWeaverbirdValue_MonitorDead(t *testing.T) {
 		t.Fatalf("WeaverbirdValue: %v", err)
 	}
 	mv, ok := valueByID(vals, "pigeon.monitor")
-	if !ok || mv.Text != "monitor dead" || mv.Short != "dead" || mv.Class != wb.ClassDanger {
+	if !ok || mv.FullText != "monitor dead" || mv.ShortText != "dead" || mv.Class != wb.ClassDanger {
 		t.Errorf("pigeon.monitor = %+v, ok=%v, want monitor dead/danger", mv, ok)
 	}
 	// A dead session is drained the same way a deaf one is: pigeon.wait
@@ -420,7 +420,7 @@ func TestWeaverbirdValue_PeersCountsOtherLiveSessions(t *testing.T) {
 		t.Fatalf("WeaverbirdValue: %v", err)
 	}
 	pv, ok := valueByID(vals, "pigeon.peers")
-	if !ok || pv.Text != "2 peers" || pv.Short != "2" || pv.Class != wb.ClassNeutral {
+	if !ok || pv.FullText != "2 peers" || pv.ShortText != "2" || pv.Class != wb.ClassNeutral {
 		t.Errorf("pigeon.peers = %+v, ok=%v, want \"2 peers\"/\"2\"/neutral", pv, ok)
 	}
 }

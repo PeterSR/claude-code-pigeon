@@ -77,13 +77,13 @@ func TestWeaverbirdCommand_ValueReportsWaitingCount(t *testing.T) {
 	}
 	byID := parseValueNDJSON(t, r.stdout)
 	v, ok := byID["pigeon.wait"]
-	if !ok || v.Class != wb.ClassWarn || v.Text != "2 waiting" || v.Short != "2" {
+	if !ok || v.Class != wb.ClassWarn || v.FullText != "2 waiting" || v.ShortText != "2" {
 		t.Errorf("pigeon.wait = %+v, ok=%v, want warn/\"2 waiting\"/\"2\"", v, ok)
 	}
 	// register (see cmd/pigeon/main_test.go) sets up a deaf entry the
 	// same way liveEntry does elsewhere: alive pid, no monitor lock held.
 	mv, ok := byID["pigeon.monitor"]
-	if !ok || mv.Text != "monitor deaf" || mv.Short != "deaf" || mv.Class != wb.ClassWarn {
+	if !ok || mv.FullText != "monitor deaf" || mv.ShortText != "deaf" || mv.Class != wb.ClassWarn {
 		t.Errorf("pigeon.monitor = %+v, ok=%v, want monitor deaf/warn", mv, ok)
 	}
 }

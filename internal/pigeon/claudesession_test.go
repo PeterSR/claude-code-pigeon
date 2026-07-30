@@ -113,7 +113,7 @@ func TestWidgetFindsASessionWhoseIDWasReplaced(t *testing.T) {
 	if v, ok := valueByID(vals, "pigeon.wait"); ok {
 		t.Errorf("pigeon.wait = %+v, want silence: the monitor is live under %s", v, Short(armedWith))
 	}
-	if mv, ok := valueByID(vals, "pigeon.monitor"); !ok || mv.Text != "monitor live" {
+	if mv, ok := valueByID(vals, "pigeon.monitor"); !ok || mv.FullText != "monitor live" {
 		t.Errorf("pigeon.monitor = %+v, ok=%v, want monitor live", mv, ok)
 	}
 }
@@ -141,7 +141,7 @@ func TestWidgetStillNotArmedWhenAnotherProcessOwnsTheEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WeaverbirdValue: %v", err)
 	}
-	if v, ok := valueByID(vals, "pigeon.wait"); !ok || v.Text != "not armed" {
+	if v, ok := valueByID(vals, "pigeon.wait"); !ok || v.FullText != "not armed" {
 		t.Errorf("pigeon.wait = %+v, ok=%v, want not armed (no entry for this process)", v, ok)
 	}
 }
@@ -196,7 +196,7 @@ func TestWidgetNotArmedOnceGracePasses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WeaverbirdValue: %v", err)
 	}
-	if v, ok := valueByID(vals, "pigeon.wait"); !ok || v.Text != "not armed" {
+	if v, ok := valueByID(vals, "pigeon.wait"); !ok || v.FullText != "not armed" {
 		t.Errorf("pigeon.wait = %+v, ok=%v, want not armed once the grace window has passed", v, ok)
 	}
 }

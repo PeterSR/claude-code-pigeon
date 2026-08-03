@@ -1,0 +1,16 @@
+{
+  "$schema": "https://raw.githubusercontent.com/PeterSR/claude-code-weaverbird/main/schema/manifest.schema.json",
+  "v": 1,
+  "name": "pigeon",
+  "requires": {
+    "pigeon": { "hint": "go install github.com/PeterSR/claude-code-pigeon/cmd/pigeon@latest" }
+  },
+  "providers": [
+    {
+      "name": "pigeon",
+      "order": 30,
+      "spec": { "exec": ["pigeon", "weaverbird", "spec"] },
+      "value": { "exec": ["pigeon", "weaverbird", "value"] }
+    }
+  ]
+}

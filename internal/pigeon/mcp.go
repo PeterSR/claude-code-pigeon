@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
 
 // A minimal MCP server over stdio (JSON-RPC 2.0). Stdlib only.
@@ -343,6 +344,60 @@ func tools() []toolDef {
 				}),
 			}),
 		},
+		{
+			Name: "ask",
+			Description: "Ask a question and WAIT for the answers. Blocks until everyone asked " +
+				"has answered or the deadline passes, then reports the tally -- including who " +
+				"did not answer, which is never the same as agreement. Use before doing " +
+				"something irreversible that a peer might be in the middle of.",
+			InputSchema: obj(map[string]any{
+				"type": "object",
+				"properties": obj(map[string]any{
+					"topic": obj(map[string]any{
+						"type": "string",
+						"description": "Topic to ask on. Its live subscribers, besides you, are " +
+							"who this waits for.",
+					}),
+					"text": obj(map[string]any{"type": "string", "description": "The question."}),
+					"subject": obj(map[string]any{
+						"type":        "string",
+						"description": "One line: what you are about to do if nobody objects. Max 120 characters.",
+					}),
+					"deadline_sec": obj(map[string]any{
+						"type": "integer",
+						"description": "How long to wait, in seconds. Default 30, maximum 300. " +
+							"A wait longer than that belongs in a published message someone " +
+							"checks back on, not in this blocking call.",
+					}),
+				}),
+				"required": []string{"topic", "text"},
+			}),
+		},
+		{
+			Name: "answer",
+			Description: "Answer a pending ask (the id and how to answer are in its " +
+				"notification). ok agrees, object disagrees and should say why, blocked " +
+				"reports a concrete reason you cannot let it proceed. One answer per ask; " +
+				"answering again replaces your previous verdict rather than adding to it.",
+			InputSchema: obj(map[string]any{
+				"type": "object",
+				"properties": obj(map[string]any{
+					"ask": obj(map[string]any{
+						"type":        "string",
+						"description": "The ask id from the notification, e.g. m_9f2c1a2b3c4d.",
+					}),
+					"verdict": obj(map[string]any{
+						"type": "string",
+						"enum": []string{VerdictOK, VerdictObject, VerdictBlocked},
+					}),
+					"note": obj(map[string]any{
+						"type":        "string",
+						"description": "Why, especially for object or blocked. Max 300 characters.",
+					}),
+				}),
+				"required": []string{"ask", "verdict"},
+			}),
+		},
 	}
 }
 
@@ -559,6 +614,23 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		}
 		_ = json.Unmarshal(raw, &a)
 		return mcpSetIdentity(a.Name, a.Description, a.NameTemplate, a.DescriptionTemplate)
+	case "ask":
+		var a struct {
+			Topic       string `json:"topic"`
+			Text        string `json:"text"`
+			Subject     string `json:"subject"`
+			DeadlineSec int    `json:"deadline_sec"`
+		}
+		_ = json.Unmarshal(raw, &a)
+		return mcpAsk(a.Topic, a.Text, a.Subject, a.DeadlineSec)
+	case "answer":
+		var a struct {
+			Ask     string `json:"ask"`
+			Verdict string `json:"verdict"`
+			Note    string `json:"note"`
+		}
+		_ = json.Unmarshal(raw, &a)
+		return mcpAnswer(a.Ask, a.Verdict, a.Note)
 	}
 	return "", fmt.Errorf("unknown tool %q", name)
 }
@@ -701,6 +773,34 @@ func mcpPublish(ns Namespace, topic, text, subject, brief, priority string, forN
 	}
 	out += SubjectNudge(msg)
 	return out, nil
+}
+
+// mcpAsk asks in the caller's own namespace, blocking until the tally is
+// ready. There is no namespace argument, unlike publish/subscribe: an ask is
+// tied to this session's own identity for the whole time it blocks, in a way
+// a one-shot publish is not, so letting it act on behalf of a namespace this
+// process is not actually running in would need everything Self resolves --
+// which the caller's own environment already gives it.
+func mcpAsk(topic, text, subject string, deadlineSec int) (string, error) {
+	if strings.TrimSpace(topic) == "" || strings.TrimSpace(text) == "" {
+		return "", fmt.Errorf("both 'topic' and 'text' are required")
+	}
+	deadline := time.Duration(deadlineSec) * time.Second
+	res, err := CurrentNamespace().Ask(topic, Draft{Text: text, Subject: subject}, CurrentSender(), deadline)
+	if err != nil {
+		return "", err
+	}
+	return RenderAskResult(res), nil
+}
+
+func mcpAnswer(askID, verdict, note string) (string, error) {
+	if strings.TrimSpace(askID) == "" {
+		return "", fmt.Errorf("'ask' is required")
+	}
+	if err := CurrentNamespace().Answer(askID, CurrentSender(), verdict, note); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Recorded %s on %s.", verdict, askID), nil
 }
 
 // selfEntry resolves the session this process belongs to the way every write

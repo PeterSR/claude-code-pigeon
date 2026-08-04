@@ -323,6 +323,10 @@ func (n Namespace) Publish(topic string, d Draft, from Sender) (*Message, error)
 	if err != nil {
 		return nil, err
 	}
+	askID, err := validateAskID(d.AskID)
+	if err != nil {
+		return nil, err
+	}
 
 	msg := &Message{
 		ID:       id,
@@ -333,6 +337,7 @@ func (n Namespace) Publish(topic string, d Draft, from Sender) (*Message, error)
 		Subject:  subject,
 		Brief:    brief,
 		Priority: d.Priority,
+		AskID:    askID,
 		// Stored as the sender typed it, not resolved to a session id here.
 		// A name is only unique among sessions live *right now*; the same
 		// name read back later -- a catch-up pull, a --all browse, another
@@ -830,6 +835,9 @@ type PruneResult struct {
 	// wants to know who was abandoned can compare a session's own cursors
 	// before and after.
 	AbandonedCursors int
+	// AsksRemoved counts ask records (and their answer logs) whose deadline
+	// passed more than askRetention ago -- see PruneAsks.
+	AsksRemoved int
 }
 
 // Add folds one pass into another, so a caller sweeping several namespaces
@@ -840,6 +848,7 @@ func (r *PruneResult) Add(o PruneResult) {
 	r.PayloadsRemoved += o.PayloadsRemoved
 	r.BytesReclaimed += o.BytesReclaimed
 	r.AbandonedCursors += o.AbandonedCursors
+	r.AsksRemoved += o.AsksRemoved
 }
 
 // PruneTopics reclaims space in this namespace's topic logs.

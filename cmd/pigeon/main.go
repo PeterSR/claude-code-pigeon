@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/PeterSR/claude-code-pigeon/internal/pigeon"
 )
@@ -44,6 +45,8 @@ const usage = `pigeon -- message passing between live Claude Code sessions
   pigeon ls [--all] [--json]     list registered sessions
   pigeon send <target> <text>    send a message to one session
   pigeon publish <topic> <text>  publish to a topic (everyone subscribed)
+  pigeon ask [--deadline 30s] <topic> <text>  ask and BLOCK for the answers
+  pigeon answer <id> <ok|object|blocked> [note]  answer a pending ask
   pigeon subscribe <topic>       start receiving a topic in this session
   pigeon unsubscribe <topic>     stop receiving it
   pigeon delivery [<topic> <push|digest|quiet>]  set or list per-topic delivery modes
@@ -100,6 +103,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		err = cmdSend(rest, stdout, stderr)
 	case "publish", "pub":
 		err = cmdPublish(rest, stdout, stderr)
+	case "ask":
+		err = cmdAsk(rest, stdout, stderr)
+	case "answer":
+		err = cmdAnswer(rest, stdout, stderr)
 	case "subscribe", "sub":
 		err = cmdSubscribe(rest, stdout)
 	case "unsubscribe", "unsub":
@@ -439,7 +446,7 @@ func misplacedFlag(rest []string) error {
 			name = name[:i]
 		}
 		switch name {
-		case "subject", "brief", "alert", "for", "supersedes", "n", "namespace", "as":
+		case "subject", "brief", "alert", "for", "supersedes", "n", "namespace", "as", "deadline":
 			return fmt.Errorf("%q came after a positional argument, so it was read as message text rather than as a flag; put flags before the target and the body", a)
 		}
 	}
@@ -508,6 +515,72 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	if nudge := pigeon.SubjectNudge(msg); nudge != "" {
 		fmt.Fprintln(w, nudge)
 	}
+	return nil
+}
+
+// cmdAsk is the CLI half of the ask primitive: it publishes the question and
+// then BLOCKS this process -- not just this session -- until the tally is
+// ready, exactly like the MCP tool blocks the model. See ask.go's doc comment
+// for why blocking is the fix, not a shortcut around one.
+func cmdAsk(args []string, w, stderr io.Writer) error {
+	fs := flags("ask", stderr)
+	var nsName, asName, subject string
+	var deadline time.Duration
+	nsFlag(fs, &nsName)
+	asFlag(fs, &asName)
+	fs.StringVar(&subject, "subject", "", "one-line subject, max 120 characters")
+	fs.DurationVar(&deadline, "deadline", 0, "how long to wait, e.g. 30s or 2m (default 30s, max 5m)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := checkAs(asName); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) < 2 {
+		return fmt.Errorf("usage: pigeon ask [-n <namespace>] [--as <name>] [--subject <text>] [--deadline <dur>] <topic> <text>")
+	}
+	if err := misplacedFlag(rest[1:]); err != nil {
+		return err
+	}
+	topic, text := rest[0], strings.Join(rest[1:], " ")
+
+	ns, err := namespaceOf(nsName)
+	if err != nil {
+		return err
+	}
+	res, err := ns.Ask(topic, pigeon.Draft{Text: text, Subject: subject}, pigeon.ActingSender(asName), deadline)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(w, pigeon.RenderAskResult(res))
+	return nil
+}
+
+// cmdAnswer records one reply to a pending ask. The id and how to answer are
+// carried in the ask's own notification (see Render's askHint), so this takes
+// them as plain positional arguments rather than flags.
+func cmdAnswer(args []string, w, stderr io.Writer) error {
+	fs := flags("answer", stderr)
+	var asName string
+	asFlag(fs, &asName)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := checkAs(asName); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) < 2 {
+		return fmt.Errorf("usage: pigeon answer [--as <name>] <id> <ok|object|blocked> [note...]")
+	}
+	id, verdict := rest[0], rest[1]
+	note := strings.Join(rest[2:], " ")
+
+	if err := pigeon.CurrentNamespace().Answer(id, pigeon.ActingSender(asName), verdict, note); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "recorded %s on %s\n", verdict, id)
 	return nil
 }
 
@@ -1107,6 +1180,15 @@ func cmdPrune(args []string, w, stderr io.Writer) error {
 			return err
 		}
 		res.Add(got)
+
+		// An ask blocks until its own deadline, so once that has passed it is
+		// guaranteed closed -- there is nothing still-open a sweep could cut
+		// out from under a caller mid-wait.
+		asksRemoved, err := space.PruneAsks()
+		if err != nil {
+			return err
+		}
+		res.AsksRemoved += asksRemoved
 	}
 	// The global logs are swept once, counting subscribers in every namespace:
 	// cutting a prefix that only a session next door has yet to read would drop
@@ -1116,12 +1198,18 @@ func cmdPrune(args []string, w, stderr io.Writer) error {
 		return err
 	}
 	res.Add(shared)
+	sharedAsks, err := pigeon.PruneSharedAsks()
+	if err != nil {
+		return err
+	}
+	res.AsksRemoved += sharedAsks
 
 	fmt.Fprintf(w, "pruned %d dead session(s)\n", dead)
 	fmt.Fprintf(w, "removed %d orphaned state file(s)\n", orphans)
 	fmt.Fprintf(w, "removed %d unsubscribed topic log(s), compacted %d, "+
 		"reclaimed %d payload file(s), freed %s\n",
 		res.TopicsRemoved, res.TopicsCompacted, res.PayloadsRemoved, humanBytes(res.BytesReclaimed))
+	fmt.Fprintf(w, "removed %d closed ask(s)\n", res.AsksRemoved)
 	if *allNS {
 		fmt.Fprintf(w, "swept %d namespace(s)\n", len(spaces))
 	}

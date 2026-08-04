@@ -146,6 +146,13 @@ func SharedDir() string         { return filepath.Join(Home(), "shared") }
 func SharedTopicsDir() string   { return filepath.Join(SharedDir(), "topics") }
 func SharedPayloadsDir() string { return filepath.Join(SharedDir(), "payloads") }
 
+// SharedAsksDir holds the question and answer files for an ask published on a
+// machine-wide "@" topic. It has to live outside every namespace for the same
+// reason SharedTopicsDir does: an ask's audience can span namespaces, and a
+// peer answering from one of them has to find the record without knowing
+// which namespace the asker happened to be in.
+func SharedAsksDir() string { return filepath.Join(SharedDir(), "asks") }
+
 // sharedLocksDir guards the global topic logs. The lock has to be outside every
 // namespace too: two namespaces compacting one shared log under their own locks
 // would rewrite it from under each other.
@@ -159,6 +166,12 @@ func (n Namespace) PayloadsDir() string { return filepath.Join(n.Root(), "payloa
 func (n Namespace) LocksDir() string    { return filepath.Join(n.Root(), "locks") }
 func (n Namespace) TopicsDir() string   { return filepath.Join(n.Root(), "topics") }
 func (n Namespace) CursorsDir() string  { return filepath.Join(n.Root(), "cursors") }
+
+// AsksDir holds this namespace's ask records and answer logs: asks/<id>.json
+// for the question, asker and audience snapshot, asks/<id>.ndjson for the
+// answers appended to it. A namespaced topic's ask lives here; a machine-wide
+// "@" topic's lives in SharedAsksDir instead, mirroring TopicsDir/SharedTopicsDir.
+func (n Namespace) AsksDir() string { return filepath.Join(n.Root(), "asks") }
 
 // The package-level forms address the caller's own namespace, which is what
 // almost every caller means. Each resolves the namespace once and hands it
@@ -191,8 +204,8 @@ func (n Namespace) EnsureDirs() error {
 	}
 	for _, d := range []string{
 		NamespacesDir(), n.Root(),
-		n.SessionsDir(), n.InboxDir(), n.PayloadsDir(), n.LocksDir(), n.TopicsDir(), n.CursorsDir(),
-		SharedDir(), SharedTopicsDir(), SharedPayloadsDir(), sharedLocksDir(),
+		n.SessionsDir(), n.InboxDir(), n.PayloadsDir(), n.LocksDir(), n.TopicsDir(), n.CursorsDir(), n.AsksDir(),
+		SharedDir(), SharedTopicsDir(), SharedPayloadsDir(), sharedLocksDir(), SharedAsksDir(),
 	} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return fmt.Errorf("create %s: %w", d, err)

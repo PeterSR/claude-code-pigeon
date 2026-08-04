@@ -145,6 +145,13 @@ type Message struct {
 	Supersedes string `json:"supersedes,omitempty"`
 	Payload    string `json:"payload,omitempty"`
 	ReplyTo    string `json:"replyTo,omitempty"`
+	// AskID marks a message as the question half of a blocking ask (see
+	// ask.go's Ask). Set only by Ask itself, never by an ordinary sender --
+	// Send rejects a non-empty one outright, the same way it rejects For --
+	// because it is what tells Render to print the "how to answer" hint, and
+	// a hand-typed one would let a message forge that hint for an ask that
+	// does not exist.
+	AskID string `json:"askId,omitempty"`
 }
 
 // Draft is a message being composed. Text is required; everything else is
@@ -157,6 +164,8 @@ type Draft struct {
 	For        []string
 	Supersedes string
 	ReplyTo    string
+	// AskID is set only by Ask (see ask.go); see Message.AskID for why.
+	AskID string
 }
 
 // IsFor reports whether a topic message is addressed to e: true when m.For is
@@ -413,6 +422,21 @@ func validateSubject(s string) (string, error) { return validateBounded("subject
 
 func validateBrief(s string) (string, error) { return validateBounded("brief", s, BriefLimit) }
 
+// validateAskID checks that a draft's AskID, if given, is shaped like a real
+// id -- the same defence-in-depth as validateSupersedes, not a trust boundary
+// Ask itself relies on: Ask generates the id and the draft it publishes in the
+// same call, so this only ever rejects a caller other than Ask setting the
+// field, which Send and mcpPublish already refuse to accept in the first place.
+func validateAskID(id string) (string, error) {
+	if id == "" {
+		return "", nil
+	}
+	if !messageIDRe.MatchString(id) {
+		return "", fmt.Errorf("askId %q does not look like a valid id (want m_ followed by 12 lowercase hex digits)", id)
+	}
+	return id, nil
+}
+
 // SubjectNudge returns a hint to append to a send/publish confirmation when
 // the message left with no subject and a body long enough that the recipient
 // only ever sees a truncated prefix of it. Without this the sender has no way
@@ -459,6 +483,11 @@ func (n Namespace) Send(to *Entry, d Draft, from Sender) (*Message, error) {
 	// whichever one a reader believed would sometimes be wrong.
 	if len(d.For) > 0 {
 		return nil, fmt.Errorf("for is only valid on a topic publish, not a direct send: a direct message already has exactly one recipient")
+	}
+	// An ask needs a topic's live-subscriber list to know its audience, which
+	// a direct send has no equivalent of -- there is nobody to snapshot.
+	if d.AskID != "" {
+		return nil, fmt.Errorf("askId is only valid on a topic publish, not a direct send")
 	}
 
 	id := newMessageID()
@@ -640,6 +669,23 @@ func (n Namespace) Render(m *Message, self *Entry) string {
 	if m.Topic != "" {
 		topicHint = " [topic: pigeon publish " + truncate(Sanitize(m.Topic), maxTopic) + "]"
 	}
+	// askHint is how a recipient discovers that this notification is a
+	// question the asker is actually blocked waiting on, and exactly what to
+	// type back. This is the fix for the failure that motivated Ask at all:
+	// a question with no visible way to answer gets read, sits unanswered,
+	// and the asker cannot tell a real "nobody objects" from "nobody saw it
+	// in time" -- so the hint is never dropped, the same discipline the
+	// payload pointer gets, rather than being one more thing the give-up
+	// ladder below may shed under budget pressure.
+	//
+	// m.AskID is checked against the same shape validateAskID enforces at
+	// publish time, because a spool line can be hand-written: an unshaped
+	// value must not be able to forge an "answer this" hint for an ask that
+	// was never actually asked.
+	var askHint string
+	if messageIDRe.MatchString(m.AskID) {
+		askHint = " [ask: pigeon answer " + m.AskID + " ok|object|blocked]"
+	}
 	// Only ever point at a payload directory this session already knows: its
 	// own, or the shared one a global topic spills to. A hand-written spool line
 	// could otherwise name any path and have it read back as trustworthy.
@@ -682,7 +728,7 @@ func (n Namespace) Render(m *Message, self *Entry) string {
 	} {
 		give()
 		head := prefix + where + nsTag
-		room := RenderBudget - len([]rune(head)) - len([]rune(payload+reply+topicHint)) - 4
+		room := RenderBudget - len([]rune(head)) - len([]rune(payload+askHint+reply+topicHint)) - 4
 		if subject != "" {
 			// Reserved unconditionally, unlike the body's speculative 4
 			// characters above: the subject is never dropped, so this
@@ -701,13 +747,13 @@ func (n Namespace) Render(m *Message, self *Entry) string {
 		body := truncate(Sanitize(m.Text), room)
 		switch {
 		case body == "" && subject == "":
-			return head + payload + reply + topicHint
+			return head + payload + askHint + reply + topicHint
 		case body == "":
-			return head + " :: " + subject + payload + reply + topicHint
+			return head + " :: " + subject + payload + askHint + reply + topicHint
 		case subject == "":
-			return head + " :: " + body + payload + reply + topicHint
+			return head + " :: " + body + payload + askHint + reply + topicHint
 		default:
-			return head + " :: " + subject + " :: " + body + payload + reply + topicHint
+			return head + " :: " + subject + " :: " + body + payload + askHint + reply + topicHint
 		}
 	}
 
@@ -721,9 +767,20 @@ func (n Namespace) Render(m *Message, self *Entry) string {
 	// supplies, and by then there may be no room for anything else. Keep the
 	// subject where it still fits -- a line saying who sent it and what it
 	// says beats one saying only who sent it -- but never at the pointer's
-	// expense, because the pointer is the only part with no substitute.
+	// expense, because the pointer is the only part with no substitute. The ask
+	// hint rides along wherever it still fits, but -- unlike above -- it is the
+	// first thing given up here: this path only exists because the payload
+	// pointer alone is already close to the budget, and losing the message
+	// entirely is worse than losing the one bracket telling the recipient how
+	// to reply.
+	if subject != "" && len([]rune(prefix+" :: "+subject+payload+askHint)) <= RenderBudget {
+		return prefix + " :: " + subject + payload + askHint
+	}
 	if subject != "" && len([]rune(prefix+" :: "+subject+payload)) <= RenderBudget {
 		return prefix + " :: " + subject + payload
+	}
+	if len([]rune(prefix+payload+askHint)) <= RenderBudget {
+		return prefix + payload + askHint
 	}
 	if len([]rune(prefix+payload)) <= RenderBudget {
 		return prefix + payload

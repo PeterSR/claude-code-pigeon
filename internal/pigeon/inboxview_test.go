@@ -21,18 +21,18 @@ func TestRenderInboxMarksAnItemAddressedToTheViewer(t *testing.T) {
 	items := []InboxItem{{Message: m, Source: "deploys"}}
 
 	addressed := &Entry{SessionID: "bbbb2222", Name: "beta"}
-	got := RenderInbox(items, 0, true, "brief", "--all", addressed)
+	got := RenderInbox(items, 0, true, "brief", "--all", addressed, Namespace{})
 	if !strings.Contains(got, "-> you") {
 		t.Errorf("RenderInbox for the addressed session did not show the marker:\n%s", got)
 	}
 
 	notNamed := &Entry{SessionID: "cccc3333", Name: "gamma"}
-	gotUnaddressed := RenderInbox(items, 0, true, "brief", "--all", notNamed)
+	gotUnaddressed := RenderInbox(items, 0, true, "brief", "--all", notNamed, Namespace{})
 	if strings.Contains(gotUnaddressed, "-> you") {
 		t.Errorf("RenderInbox showed the marker to a session the message does not name:\n%s", gotUnaddressed)
 	}
 
-	gotUnknown := RenderInbox(items, 0, true, "brief", "--all", nil)
+	gotUnknown := RenderInbox(items, 0, true, "brief", "--all", nil, Namespace{})
 	if strings.Contains(gotUnknown, "-> you") {
 		t.Errorf("RenderInbox showed the marker for an unknown viewer:\n%s", gotUnknown)
 	}
@@ -54,7 +54,7 @@ func TestRenderInboxShowsNoMarkerWhenForIsEmpty(t *testing.T) {
 	}
 	items := []InboxItem{{Message: m, Source: "deploys"}}
 	self := &Entry{SessionID: "bbbb2222", Name: "beta"}
-	if got := RenderInbox(items, 0, true, "brief", "--all", self); strings.Contains(got, "-> you") {
+	if got := RenderInbox(items, 0, true, "brief", "--all", self, Namespace{}); strings.Contains(got, "-> you") {
 		t.Errorf("RenderInbox showed the marker for a message with no For:\n%s", got)
 	}
 }
@@ -71,7 +71,7 @@ func TestRenderInboxNeverMarksADirectMessage(t *testing.T) {
 	}
 	items := []InboxItem{{Message: m}}
 	self := &Entry{SessionID: "bbbb2222", Name: "beta"}
-	if got := RenderInbox(items, 0, true, "brief", "--all", self); strings.Contains(got, "-> you") {
+	if got := RenderInbox(items, 0, true, "brief", "--all", self, Namespace{}); strings.Contains(got, "-> you") {
 		t.Errorf("RenderInbox marked a direct message as addressed:\n%s", got)
 	}
 }
@@ -88,7 +88,7 @@ func TestRenderInboxMarksBothSidesOfASupersedeWithinTheBatch(t *testing.T) {
 	corr := &Message{ID: "m_corr00001a", TS: nowRFC3339(), From: from, Topic: "alerts", Text: "false alarm", Supersedes: orig.ID}
 	items := []InboxItem{{Message: orig, Source: "alerts"}, {Message: corr, Source: "alerts"}}
 
-	got := RenderInbox(items, 0, true, "brief", "--all", nil)
+	got := RenderInbox(items, 0, true, "brief", "--all", nil, Namespace{})
 	if !strings.Contains(got, "[SUPERSEDED by "+corr.ID+"]") {
 		t.Errorf("the superseded message was not marked:\n%s", got)
 	}
@@ -108,7 +108,7 @@ func TestRenderInboxDoesNotLinkASupersedeFromADifferentSenderWithinTheBatch(t *t
 	fake := &Message{ID: "m_fake00002a", TS: nowRFC3339(), From: impostor, Topic: "alerts", Text: "false alarm", Supersedes: orig.ID}
 	items := []InboxItem{{Message: orig, Source: "alerts"}, {Message: fake, Source: "alerts"}}
 
-	got := RenderInbox(items, 0, true, "brief", "--all", nil)
+	got := RenderInbox(items, 0, true, "brief", "--all", nil, Namespace{})
 	if strings.Contains(got, "SUPERSEDED") || strings.Contains(got, "correction of") {
 		t.Errorf("a cross-sender supersede claim was honoured within the batch:\n%s", got)
 	}
@@ -123,7 +123,7 @@ func TestRenderInboxIgnoresASupersedeNamingAnIDOutsideTheBatch(t *testing.T) {
 	m := &Message{ID: "m_corr00003a", TS: nowRFC3339(), From: from, Topic: "alerts", Text: "false alarm", Supersedes: "m_notinbatch1"}
 	items := []InboxItem{{Message: m, Source: "alerts"}}
 
-	got := RenderInbox(items, 0, true, "brief", "--all", nil)
+	got := RenderInbox(items, 0, true, "brief", "--all", nil, Namespace{})
 	if strings.Contains(got, "correction of") {
 		t.Errorf("supersedeLinks matched an id outside the batch:\n%s", got)
 	}

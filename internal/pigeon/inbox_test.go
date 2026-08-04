@@ -413,7 +413,7 @@ func TestReadInboxStillSeesWhatTheMonitorHasAlreadyIngested(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ns.seedCursor(me.SessionID, ref); err != nil {
+	if _, err := ns.seedCursor(me.SessionID, ref, ""); err != nil {
 		t.Fatal(err)
 	}
 

@@ -487,6 +487,11 @@ func (n Namespace) referencedPayloads() map[string]bool {
 	return refs
 }
 
+// collectPayloadRefs records every payload path a log's messages still point
+// at -- the body-overflow file named by Payload, and every file named by
+// Attach. Both spill to the same payload directory (see attachFiles), so both
+// have to be counted here or the second one is exactly what a live message
+// still points at that this scan would otherwise call garbage.
 func collectPayloadRefs(logPath string, into map[string]bool) {
 	f, err := os.Open(logPath)
 	if err != nil {
@@ -497,10 +502,17 @@ func collectPayloadRefs(logPath string, into map[string]bool) {
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {
 		m, err := ParseMessage(strings.TrimSpace(sc.Text()))
-		if err != nil || m.Payload == "" {
+		if err != nil {
 			continue
 		}
-		into[m.Payload] = true
+		if m.Payload != "" {
+			into[m.Payload] = true
+		}
+		for _, p := range m.Attach {
+			if p != "" {
+				into[p] = true
+			}
+		}
 	}
 }
 

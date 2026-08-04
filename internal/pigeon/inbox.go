@@ -249,6 +249,104 @@ func (n Namespace) ReadInbox(sessionID string, q InboxQuery) ([]InboxItem, int, 
 	return items, more, nil
 }
 
+// ReadThread reconstructs one conversation end to end from the logs this
+// session can see -- its own spool and every topic it subscribes to -- by
+// following ReplyTo links out from id in both directions. It is a read, not a
+// subscription: no cursor is touched and nothing is marked as read.
+//
+// Membership is decided by walking ReplyTo directly, not by matching the
+// Thread field: Thread is stamped once at send time and, absent a bounded
+// parent lookup Send has no way to perform (see its comment), it only ever
+// holds the immediate parent's id -- exactly what ReplyTo already holds.
+// Walking ReplyTo recovers the whole chain regardless of how many hops it
+// runs; matching Thread values alone would not, past the first hop.
+func (n Namespace) ReadThread(sessionID, id string) ([]InboxItem, error) {
+	if !messageIDRe.MatchString(id) {
+		return nil, fmt.Errorf("%q does not look like a message id (want m_ followed by 12 lowercase hex digits)", id)
+	}
+	e, err := n.ReadEntry(sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("session %s is not registered in namespace %q", Short(sessionID), n)
+	}
+
+	type source struct {
+		path      string
+		extSource string
+	}
+	sources := []source{{path: n.SpoolPath(sessionID), extSource: ""}}
+	for _, t := range e.Subscriptions {
+		ref, err := ParseTopicRef(t)
+		if err != nil {
+			continue
+		}
+		if ref.Global && n.IsPrivate() {
+			continue
+		}
+		sources = append(sources, source{path: ref.path(n), extSource: ref.String()})
+	}
+
+	byID := map[string]InboxItem{}
+	for _, s := range sources {
+		msgs, err := readSourceFrom(s.path, 0)
+		if err != nil {
+			return nil, err
+		}
+		for _, pm := range msgs {
+			// A message lives on exactly one log; the first source to see an id
+			// wins, which only ever matters for a hand-written duplicate.
+			if _, ok := byID[pm.msg.ID]; !ok {
+				byID[pm.msg.ID] = InboxItem{Message: pm.msg, Source: s.extSource}
+			}
+		}
+	}
+
+	if _, ok := byID[id]; !ok {
+		return nil, fmt.Errorf("message %s is not in any log this session can see", id)
+	}
+
+	// The connected component of the ReplyTo graph containing id: every
+	// visible message chained to it, whether by replying to it (directly or
+	// transitively) or by being what it replies to.
+	children := map[string][]string{}
+	for mid, it := range byID {
+		if it.Message.ReplyTo != "" {
+			children[it.Message.ReplyTo] = append(children[it.Message.ReplyTo], mid)
+		}
+	}
+	seen := map[string]bool{id: true}
+	queue := []string{id}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		if parent := byID[cur].Message.ReplyTo; parent != "" && !seen[parent] {
+			if _, ok := byID[parent]; ok {
+				seen[parent] = true
+				queue = append(queue, parent)
+			}
+		}
+		for _, child := range children[cur] {
+			if !seen[child] {
+				seen[child] = true
+				queue = append(queue, child)
+			}
+		}
+	}
+
+	now := time.Now()
+	items := make([]InboxItem, 0, len(seen))
+	for mid := range seen {
+		it := byID[mid]
+		if t, terr := time.Parse(time.RFC3339, it.Message.TS); terr == nil {
+			it.Age = now.Sub(t)
+		}
+		items = append(items, it)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].Message.TS < items[j].Message.TS
+	})
+	return items, nil
+}
+
 // positionedMessage pairs a parsed message with the logical offset just past
 // it, so a caller that truncates a batch can still work out, per source,
 // exactly how far that source's cursor may advance.

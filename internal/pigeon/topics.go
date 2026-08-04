@@ -327,6 +327,10 @@ func (n Namespace) Publish(topic string, d Draft, from Sender) (*Message, error)
 	if err != nil {
 		return nil, err
 	}
+	replyTo, err := validateReplyTo(d.ReplyTo, id)
+	if err != nil {
+		return nil, err
+	}
 
 	msg := &Message{
 		ID:       id,
@@ -350,12 +354,25 @@ func (n Namespace) Publish(topic string, d Draft, from Sender) (*Message, error)
 		// the set of live sessions changes underneath the log.
 		For:        for_,
 		Supersedes: supersedes,
+		ReplyTo:    replyTo,
+	}
+	// See Send's comment on Thread: Publish has the same draft-only view, so
+	// this is the same one-hop-short approximation, not a resolved root id.
+	if replyTo != "" {
+		msg.Thread = replyTo
 	}
 	if len([]rune(body)) > BodyBudget {
 		p := filepath.Join(ref.payloadsDir(n), msg.ID+".txt")
 		if err := os.WriteFile(p, []byte(d.Text), 0o600); err == nil {
 			msg.Payload = p
 		}
+	}
+	if len(d.Attach) > 0 {
+		stored, err := attachFiles(ref.payloadsDir(n), msg.ID, d.Attach)
+		if err != nil {
+			return nil, err
+		}
+		msg.Attach = stored
 	}
 
 	line, err := json.Marshal(msg)
@@ -383,20 +400,37 @@ func (n Namespace) Publish(topic string, d Draft, from Sender) (*Message, error)
 // Subscribe adds a topic to a session's subscription list. The running monitor
 // notices within about a second and starts following it -- no restart.
 func Subscribe(sessionID, topic string) error {
-	return CurrentNamespace().Subscribe(sessionID, topic)
+	_, err := SubscribeCatchup(sessionID, topic, "")
+	return err
 }
 
 func (n Namespace) Subscribe(sessionID, topic string) error {
+	_, err := n.SubscribeCatchup(sessionID, topic, "")
+	return err
+}
+
+// SubscribeCatchup is Subscribe with an optional catch-up window. catchup is
+// "" for none, a count ("20", the last N messages) or a Go duration ("30m",
+// everything published within that long); see seedCursor for exactly what it
+// plants. It returns how many messages the window currently holds, so a
+// caller can report it in the same breath as the subscribe confirmation.
+func SubscribeCatchup(sessionID, topic, catchup string) (int, error) {
+	return CurrentNamespace().SubscribeCatchup(sessionID, topic, catchup)
+}
+
+func (n Namespace) SubscribeCatchup(sessionID, topic, catchup string) (int, error) {
 	ref, err := ParseTopicRef(topic)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	// Start at the end so subscribing does not replay the topic's history
-	// into the session as a burst of notifications.
-	if err := n.seedCursor(sessionID, ref); err != nil {
-		return err
+	// Start at the end so subscribing does not replay the topic's history as a
+	// burst of notifications; catchup, if given, only ever moves the separate
+	// consumption cursor further back (see seedCursor).
+	waiting, err := n.seedCursor(sessionID, ref, catchup)
+	if err != nil {
+		return 0, err
 	}
-	return n.MutateEntry(sessionID, func(e *Entry) error {
+	err = n.MutateEntry(sessionID, func(e *Entry) error {
 		for _, t := range e.Subscriptions {
 			if t == ref.String() {
 				return nil
@@ -406,6 +440,22 @@ func (n Namespace) Subscribe(sessionID, topic string) error {
 		sort.Strings(e.Subscriptions)
 		return nil
 	})
+	return waiting, err
+}
+
+// CatchupNote renders how many messages a catch-up window found, in the one
+// phrasing `pigeon subscribe --catchup` and the subscribe MCP tool both use,
+// so the confirmation itself says something is waiting rather than leaving
+// that to be discovered on the next inbox pull.
+func CatchupNote(waiting int, spec string) string {
+	noun, verb := "messages", "are"
+	if waiting == 1 {
+		noun, verb = "message", "is"
+	}
+	if n, err := strconv.Atoi(spec); err == nil {
+		return fmt.Sprintf(" %d of the last %d %s %s waiting in your inbox.", waiting, n, noun, verb)
+	}
+	return fmt.Sprintf(" %d %s from the last %s %s waiting in your inbox.", waiting, noun, spec, verb)
 }
 
 func Unsubscribe(sessionID, topic string) error {
@@ -611,14 +661,38 @@ func (n Namespace) mutateCursors(sessionID string, fn func(map[string]int64)) er
 // seedCursor starts a new subscription at the end of the log, so joining a
 // topic does not replay its history as a burst of notifications. The offset is
 // logical, so it stays correct across every later compaction.
-func (n Namespace) seedCursor(sessionID string, ref TopicRef) error {
+//
+// catchup optionally plants the CONSUMPTION cursor further back than the log's
+// end -- see catchupWindow for what a count or a duration spec resolves to.
+// The MONITOR cursor above is seeded at the end regardless, catchup or not:
+// this is the one place the two cursor families this file's comment block
+// describes could be conflated by mistake, and doing so would turn "let me
+// see what I missed" into a burst of notifications for history nobody asked
+// to be pushed. Catch-up fills the inbox; it never touches what the monitor
+// pushes.
+//
+// It returns how many messages the requested window currently holds (0 when
+// catchup is ""), so a caller can report it alongside the subscribe
+// confirmation.
+func (n Namespace) seedCursor(sessionID string, ref TopicRef, catchup string) (int, error) {
 	path := ref.path(n)
 	var size int64
 	if fi, err := os.Stat(path); err == nil {
 		size = fi.Size()
 	}
-	end := readBase(path) + size
-	return n.mutateCursors(sessionID, func(m map[string]int64) {
+	base := readBase(path)
+	end := base + size
+
+	readStart, waiting := end, 0
+	if catchup != "" {
+		start, count, err := catchupWindow(path, base, end, catchup)
+		if err != nil {
+			return 0, err
+		}
+		readStart, waiting = start, count
+	}
+
+	err := n.mutateCursors(sessionID, func(m map[string]int64) {
 		// Only ever seed. Subscribe is not guarded against being called for a
 		// topic this session already follows, and re-seeding to the end there
 		// would skip whatever arrived since -- silently, and for a deaf session
@@ -626,7 +700,9 @@ func (n Namespace) seedCursor(sessionID string, ref TopicRef) error {
 		if _, seen := m[ref.String()]; !seen {
 			m[ref.String()] = end
 		}
-		// Seed the consumption cursor to the same place, and only here.
+		// Seed the consumption cursor, and only here. Absent a catch-up
+		// request this lands at the same place as the monitor cursor above;
+		// with one, it lands wherever catchupWindow says the window starts.
 		//
 		// It cannot be left absent to fall back on the monitor's cursor at read
 		// time, because the monitor advances its own within about 200ms of a
@@ -637,18 +713,73 @@ func (n Namespace) seedCursor(sessionID string, ref TopicRef) error {
 		//
 		// Seeded together and then left alone, the two say different true
 		// things: the monitor's is how far notifications have got, and this one
-		// is how far the session has actually read.
-		// readat is deliberately NOT set here. It is written only when
-		// ReadInbox actually advances this cursor, so its absence means "this
-		// session has never pulled" -- and compaction treats a never-pulled
-		// cursor as abandoned rather than letting every session that only ever
-		// takes notifications hold its topic logs open for the staleness
-		// window. Pulling once opts a session into that protection; never
-		// pulling costs the fleet nothing.
+		// is how far the session has actually read (or, for a catch-up window,
+		// how far back it has asked to see).
 		if _, seen := m[readCursorKey(ref.String())]; !seen {
-			m[readCursorKey(ref.String())] = end
+			m[readCursorKey(ref.String())] = readStart
 		}
+		// readat is deliberately NOT set here, catch-up or not. It is written
+		// only when ReadInbox actually advances this cursor, so its absence
+		// means "this session has never pulled" -- and compaction treats a
+		// never-pulled cursor as abandoned rather than letting every session
+		// that only ever takes notifications hold its topic logs open for the
+		// staleness window. A catch-up window plants where a pull would start;
+		// it is not itself a pull, so it must not look like one to prune.
 	})
+	return waiting, err
+}
+
+// catchupWindow works out where a subscribe's consumption cursor should be
+// planted for a requested catch-up window, and how many messages currently sit
+// in it. spec is either a plain positive integer ("20", the last N messages)
+// or a Go duration ("30m", everything published within that long). Anything
+// else is rejected outright, the same as every other bounded field in this
+// package: silently falling back to no catch-up would leave a caller believing
+// history was replayed when it was not.
+func catchupWindow(path string, base, end int64, spec string) (start int64, waiting int, err error) {
+	msgs, err := readSourceFrom(path, base)
+	if err != nil {
+		return end, 0, err
+	}
+	if count, cerr := strconv.Atoi(spec); cerr == nil {
+		if count <= 0 {
+			return end, 0, fmt.Errorf("catchup count must be positive, got %d", count)
+		}
+		if count >= len(msgs) {
+			return base, len(msgs), nil
+		}
+		// The offset just past the (len-count)'th message -- i.e. just before
+		// the last `count` messages start.
+		return msgs[len(msgs)-count-1].end, count, nil
+	}
+	d, derr := time.ParseDuration(spec)
+	if derr != nil {
+		return end, 0, fmt.Errorf("catchup %q is neither a count (e.g. \"20\") nor a duration (e.g. \"30m\")", spec)
+	}
+	if d <= 0 {
+		return end, 0, fmt.Errorf("catchup duration must be positive, got %s", d)
+	}
+	cutoff := time.Now().Add(-d)
+	idx := len(msgs) // first message inside the window; len(msgs) means none is
+	for i, pm := range msgs {
+		ts, terr := time.Parse(time.RFC3339, pm.msg.TS)
+		if terr != nil {
+			// A hand-written or corrupt timestamp: skip it rather than let it
+			// decide the window boundary on nothing.
+			continue
+		}
+		if !ts.Before(cutoff) {
+			idx = i
+			break
+		}
+	}
+	if idx == len(msgs) {
+		return end, 0, nil
+	}
+	if idx == 0 {
+		return base, len(msgs), nil
+	}
+	return msgs[idx-1].end, len(msgs) - idx, nil
 }
 
 // ListTopics reports every topic reachable from this namespace -- its own logs

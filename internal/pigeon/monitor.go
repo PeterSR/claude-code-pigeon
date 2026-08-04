@@ -739,7 +739,7 @@ func register(ns Namespace, sid string, logf func(string, ...any)) error {
 			continue
 		}
 		if ref, err := ParseTopicRef(t); err == nil {
-			_ = ns.seedCursor(sid, ref)
+			_, _ = ns.seedCursor(sid, ref, "")
 		}
 	}
 

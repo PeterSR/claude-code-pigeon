@@ -1,6 +1,7 @@
 package pigeon
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -372,6 +373,96 @@ func TestOversizeBodySpillsToPayload(t *testing.T) {
 	// The notification itself must stay within the ~512 char clip.
 	if n := len([]rune(Render(msg))); n > 512 {
 		t.Errorf("rendered notification is %d chars, over the 512 clip", n)
+	}
+}
+
+// --- attachments -------------------------------------------------------------
+
+func writeTempFile(t *testing.T, name string, size int) string {
+	t.Helper()
+	dir := t.TempDir()
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, bytes.Repeat([]byte("x"), size), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return p
+}
+
+// A message may carry up to 5 attachments; the 6th is rejected outright
+// rather than silently dropped, and nothing from the draft is sent.
+func TestAttachRejectsMoreThanFiveFiles(t *testing.T) {
+	withHome(t)
+	to := liveEntry(t, "eeee5555-6666", "", "/tmp/v")
+	var paths []string
+	for i := 0; i < 6; i++ {
+		paths = append(paths, writeTempFile(t, fmt.Sprintf("f%d.txt", i), 10))
+	}
+	if _, err := Send(to, Draft{Text: "see attached", Attach: paths}, Sender{Kind: "shell", Name: "sh"}); err == nil {
+		t.Error("Send accepted 6 attachments; the limit is 5")
+	}
+}
+
+// A single attachment over the 256 KiB cap is rejected with a clear error,
+// not truncated or silently skipped.
+func TestAttachRejectsAnOversizeFile(t *testing.T) {
+	withHome(t)
+	to := liveEntry(t, "eeee5555-6666", "", "/tmp/v")
+	big := writeTempFile(t, "big.txt", maxAttachmentBytes+1)
+	_, err := Send(to, Draft{Text: "see attached", Attach: []string{big}}, Sender{Kind: "shell", Name: "sh"})
+	if err == nil {
+		t.Fatal("Send accepted an attachment over the size limit")
+	}
+	if !strings.Contains(err.Error(), "256") && !strings.Contains(err.Error(), fmt.Sprint(maxAttachmentBytes)) {
+		t.Errorf("error does not mention the size limit: %v", err)
+	}
+}
+
+// An attachment within the limits is copied into the recipient's payload
+// directory, named <id>-<basename>, and Render never mentions it.
+func TestAttachCopiesFileAndKeepsItOutOfRender(t *testing.T) {
+	withHome(t)
+	to := liveEntry(t, "eeee5555-6666", "", "/tmp/v")
+	src := writeTempFile(t, "stage-hunk.sh", 20)
+	msg, err := Send(to, Draft{Text: "see attached", Attach: []string{src}}, Sender{Kind: "shell", Name: "sh"})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if len(msg.Attach) != 1 {
+		t.Fatalf("Attach = %v, want exactly one stored path", msg.Attach)
+	}
+	if got, want := filepath.Base(msg.Attach[0]), msg.ID+"-stage-hunk.sh"; got != want {
+		t.Errorf("stored attachment basename = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(msg.Attach[0]); err != nil {
+		t.Fatalf("stored attachment missing: %v", err)
+	}
+	if strings.Contains(Render(msg), "stage-hunk.sh") {
+		t.Errorf("Render mentioned the attachment; the notification budget has no room for it:\n%s", Render(msg))
+	}
+}
+
+// pruning must never delete an attachment a message still points at.
+// collectPayloadRefs has to walk Attach as well as Payload, or a compaction
+// pass reclaims a file the log is still naming.
+func TestPruneKeepsALiveAttachment(t *testing.T) {
+	withHome(t)
+	to := liveEntry(t, "eeee5555-6666", "", "/tmp/v")
+	src := writeTempFile(t, "notes.txt", 20)
+	msg, err := Send(to, Draft{Text: "see attached", Attach: []string{src}}, Sender{Kind: "shell", Name: "sh"})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	attachPath := msg.Attach[0]
+	if _, err := os.Stat(attachPath); err != nil {
+		t.Fatalf("attachment missing before prune: %v", err)
+	}
+
+	removed, _ := CurrentNamespace().reclaimPayloads()
+	if removed != 0 {
+		t.Errorf("reclaimPayloads removed %d file(s), want 0: the attachment is still referenced", removed)
+	}
+	if _, err := os.Stat(attachPath); err != nil {
+		t.Fatalf("prune deleted a live attachment: %v", err)
 	}
 }
 
@@ -758,6 +849,86 @@ func TestSubscribeStartsAtEndOfLog(t *testing.T) {
 	}
 	if got := readCursors("aaaa1111-2222")["deploys"]; got != fi.Size() {
 		t.Errorf("cursor = %d, want end of log %d", got, fi.Size())
+	}
+}
+
+// A catch-up window plants the CONSUMPTION cursor (read:deploys) somewhere
+// short of the log's end, but the MONITOR cursor (deploys) still lands
+// exactly at the end -- unchanged from the no-catchup case above. Getting
+// this backwards would fire a burst of notifications for history nobody
+// asked to be pushed; this pins both cursors so a regression there fails
+// loudly.
+func TestSubscribeCatchupPlantsOnlyTheConsumptionCursor(t *testing.T) {
+	withHome(t)
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+	from := Sender{Kind: "shell", Name: "sh"}
+	for i := 0; i < 5; i++ {
+		if _, err := Publish("deploys", Draft{Text: fmt.Sprintf("msg-%d", i)}, from); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fi, err := os.Stat(TopicPath("deploys"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	logEnd := fi.Size()
+
+	waiting, err := CurrentNamespace().SubscribeCatchup("aaaa1111-2222", "deploys", "3")
+	if err != nil {
+		t.Fatalf("SubscribeCatchup: %v", err)
+	}
+	if waiting != 3 {
+		t.Errorf("waiting = %d, want 3", waiting)
+	}
+
+	cursors := readCursors("aaaa1111-2222")
+	if got := cursors["deploys"]; got != logEnd {
+		t.Errorf("monitor cursor = %d, want the log end %d: catch-up must never move it", got, logEnd)
+	}
+	if got := cursors[readCursorKey("deploys")]; got == logEnd {
+		t.Errorf("consumption cursor = %d, want somewhere short of the log end %d: catch-up did not plant it back", got, logEnd)
+	}
+
+	// The planted cursor must make exactly those 3 messages available as
+	// unread, no more and no fewer.
+	items, _, err := CurrentNamespace().ReadInbox("aaaa1111-2222", InboxQuery{UnreadOnly: true, MarkRead: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("ReadInbox after catch-up returned %d items, want 3: %+v", len(items), items)
+	}
+
+	// readat must stay unset: a catch-up window is not itself a pull, and its
+	// absence is what stops a session that only ever takes notifications from
+	// pinning a topic log open (see seedCursor's comment).
+	if _, ok := cursors[readAtCursorKey("deploys")]; ok {
+		t.Errorf("readat was set by catch-up alone; it must be set only by an actual ReadInbox pull")
+	}
+}
+
+// A duration-based catch-up window only counts what falls inside it.
+func TestSubscribeCatchupByDurationOnlyCountsRecentMessages(t *testing.T) {
+	withHome(t)
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+	topic := TopicPath("stale")
+	// A message older than the window, hand-timestamped so the test does not
+	// depend on real elapsed time.
+	appendRawMessage(t, topic, &Message{
+		ID: "m_old0000001a", TS: "2000-01-01T00:00:00Z", Topic: "stale",
+		From: Sender{Kind: "shell", Name: "sh"}, Text: "ancient history",
+	})
+	// One message inside the window.
+	if _, err := Publish("stale", Draft{Text: "fresh"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	waiting, err := CurrentNamespace().SubscribeCatchup("aaaa1111-2222", "stale", "30m")
+	if err != nil {
+		t.Fatalf("SubscribeCatchup: %v", err)
+	}
+	if waiting != 1 {
+		t.Errorf("waiting = %d, want 1 (only the message inside the 30m window)", waiting)
 	}
 }
 

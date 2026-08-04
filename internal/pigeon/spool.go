@@ -145,6 +145,21 @@ type Message struct {
 	Supersedes string `json:"supersedes,omitempty"`
 	Payload    string `json:"payload,omitempty"`
 	ReplyTo    string `json:"replyTo,omitempty"`
+	// Thread names the conversation this message belongs to. Derived at send
+	// time from ReplyTo, never supplied by a caller directly (see Send's
+	// comment on why it can only ever be set to the parent's own id, not the
+	// parent's own Thread): empty for a message that neither replies to
+	// anything nor -- so far -- has been replied to.
+	Thread string `json:"thread,omitempty"`
+	// Attach lists the stored paths of files this message carries, each
+	// copied at send time into the payload directory the body overflow
+	// already spills to, named <id>-<basename> (see attachFiles). Like
+	// Payload, Render never points at these -- the notification budget has no
+	// room for them -- but the `inbox` pull path lists them, under the same
+	// "only ever point at a payload directory this session already knows"
+	// rule Render applies to Payload (see writeInboxItem). An attachment's
+	// bytes are untrusted input from a peer: read them, never execute them.
+	Attach []string `json:"attach,omitempty"`
 	// AskID marks a message as the question half of a blocking ask (see
 	// ask.go's Ask). Set only by Ask itself, never by an ordinary sender --
 	// Send rejects a non-empty one outright, the same way it rejects For --
@@ -166,6 +181,11 @@ type Draft struct {
 	ReplyTo    string
 	// AskID is set only by Ask (see ask.go); see Message.AskID for why.
 	AskID string
+	// Attach lists local file paths to copy into the recipient's payload
+	// directory at send time (see attachFiles); Message.Attach then names
+	// where each one landed. Never reaches Render -- see the note on
+	// Message.Attach.
+	Attach []string
 }
 
 // IsFor reports whether a topic message is addressed to e: true when m.For is
@@ -345,6 +365,80 @@ func validateSupersedes(id, ownID string) (string, error) {
 	return id, nil
 }
 
+// validateReplyTo checks that a draft's ReplyTo, if given, is shaped like a
+// real message id -- the same defence Send and Publish already apply to
+// Supersedes (see validateSupersedes above): neither holds the delivery
+// history to confirm the named id was ever actually sent, so shape is all
+// that can be checked at this point.
+func validateReplyTo(id, ownID string) (string, error) {
+	if id == "" {
+		return "", nil
+	}
+	if !messageIDRe.MatchString(id) {
+		return "", fmt.Errorf("replyTo %q does not look like a message id (want m_ followed by 12 lowercase hex digits)", id)
+	}
+	if id == ownID {
+		return "", fmt.Errorf("a message may not reply to itself")
+	}
+	return id, nil
+}
+
+// maxAttachments caps how many files one message may attach. Five is enough
+// for "here are the changed files" without turning a message into a batch
+// upload, which the notification budget was never built to carry -- not that
+// it has to: attachments never reach Render at all (see Message.Attach).
+const maxAttachments = 5
+
+// maxAttachmentBytes caps each attached file's size. 256 KiB keeps a
+// message's whole attachment set a rounding error next to what the state
+// directory already holds, while still fitting a real diff or log excerpt.
+const maxAttachmentBytes = 256 * 1024
+
+// attachFiles copies each of paths into dir, named "<msgID>-<basename>" so two
+// senders attaching a same-named file (stage-hunk.sh) cannot collide, and
+// returns the stored paths in the order given. It copies rather than keeping
+// the sender's own path, because a pointer this package hands out has to
+// survive after the source file changes or disappears -- the same promise the
+// body-overflow payload file already makes.
+func attachFiles(dir, msgID string, paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	if len(paths) > maxAttachments {
+		return nil, fmt.Errorf("%d attachments given; the limit is %d", len(paths), maxAttachments)
+	}
+	stored := make([]string, 0, len(paths))
+	used := map[string]bool{}
+	for _, p := range paths {
+		fi, err := os.Stat(p)
+		if err != nil {
+			return nil, fmt.Errorf("attach %q: %w", p, err)
+		}
+		if fi.IsDir() {
+			return nil, fmt.Errorf("attach %q: is a directory, not a file", p)
+		}
+		if fi.Size() > maxAttachmentBytes {
+			return nil, fmt.Errorf("attach %q is %d bytes; the limit is %d (%d KiB)",
+				p, fi.Size(), maxAttachmentBytes, maxAttachmentBytes/1024)
+		}
+		name := msgID + "-" + filepath.Base(p)
+		if used[name] {
+			return nil, fmt.Errorf("attach %q: another attachment already uses the basename %q", p, filepath.Base(p))
+		}
+		used[name] = true
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil, fmt.Errorf("attach %q: %w", p, err)
+		}
+		dest := filepath.Join(dir, name)
+		if err := os.WriteFile(dest, data, 0o600); err != nil {
+			return nil, fmt.Errorf("attach %q: %w", p, err)
+		}
+		stored = append(stored, dest)
+	}
+	return stored, nil
+}
+
 // Sanitize flattens text to a single safe line.
 //
 // The notification line is a prompt-injection surface: a sender who can emit
@@ -495,6 +589,10 @@ func (n Namespace) Send(to *Entry, d Draft, from Sender) (*Message, error) {
 	if err != nil {
 		return nil, err
 	}
+	replyTo, err := validateReplyTo(d.ReplyTo, id)
+	if err != nil {
+		return nil, err
+	}
 
 	msg := &Message{
 		ID:         id,
@@ -506,7 +604,20 @@ func (n Namespace) Send(to *Entry, d Draft, from Sender) (*Message, error) {
 		Brief:      brief,
 		Priority:   d.Priority,
 		Supersedes: supersedes,
-		ReplyTo:    d.ReplyTo,
+		ReplyTo:    replyTo,
+	}
+	// Thread groups a reply with its parent's conversation. Send never sees
+	// more of the log than the one draft it was handed -- unlike
+	// resolveSupersede, which runs inside the monitor's own follow loop and so
+	// can check a claim against messages it has itself streamed past -- so
+	// there is no bounded lookup available here to find the parent's own
+	// Thread. The parent's id is there is: Thread is set to ReplyTo itself,
+	// which is exactly right for a reply to a root message and one hop short
+	// for a reply to a reply. `pigeon thread` and the inbox grouper both
+	// account for that by walking ReplyTo directly rather than trusting this
+	// field to already be resolved to a single root id.
+	if replyTo != "" {
+		msg.Thread = replyTo
 	}
 
 	// Overflow goes to a file the recipient can Read on demand, in the
@@ -517,6 +628,13 @@ func (n Namespace) Send(to *Entry, d Draft, from Sender) (*Message, error) {
 		if err := os.WriteFile(p, []byte(d.Text), 0o600); err == nil {
 			msg.Payload = p
 		}
+	}
+	if len(d.Attach) > 0 {
+		stored, err := attachFiles(n.PayloadsDir(), msg.ID, d.Attach)
+		if err != nil {
+			return nil, err
+		}
+		msg.Attach = stored
 	}
 
 	line, err := json.Marshal(msg)

@@ -306,7 +306,7 @@ func registerEphemeral(ns Namespace, sid, name string, topics []TopicRef, replay
 			base := readBase(ref.path(ns))
 			_ = ns.mutateCursors(sid, func(m map[string]int64) { m[ref.String()] = base })
 		} else {
-			_ = ns.seedCursor(sid, ref)
+			_, _ = ns.seedCursor(sid, ref, "")
 		}
 	}
 	return nil

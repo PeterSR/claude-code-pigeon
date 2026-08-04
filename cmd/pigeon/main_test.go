@@ -280,6 +280,89 @@ func TestSendSpillsLongBodyToAPayloadFile(t *testing.T) {
 	wantContains(t, r, "stdout", "full text at")
 }
 
+// --reply-to threads a reply, and `pigeon thread` walks it back.
+func TestSendReplyToAndThreadCommand(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+	register(t, "bbbb2222-0000-0000-0000-000000000000", "beta")
+
+	r := invoke(t, "send", "beta", "kicking off the release")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	spool, err := os.ReadFile(pigeon.SpoolPath("bbbb2222-0000-0000-0000-000000000000"))
+	if err != nil {
+		t.Fatalf("read spool: %v", err)
+	}
+	var rootID string
+	if i := strings.Index(string(spool), `"id":"`); i >= 0 {
+		rest := string(spool)[i+len(`"id":"`):]
+		rootID = rest[:strings.IndexByte(rest, '"')]
+	}
+	if rootID == "" {
+		t.Fatalf("could not find the root message id in the spool: %s", spool)
+	}
+
+	r = invoke(t, "send", "--reply-to", rootID, "beta", "sounds good")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+
+	// Both messages landed on beta's spool, not alpha's -- `pigeon thread`
+	// reads from the caller's own logs, so read it back as beta.
+	t.Setenv(pigeon.EnvSessionID, "bbbb2222-0000-0000-0000-000000000000")
+	r = invoke(t, "thread", rootID)
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", "kicking off the release")
+	wantContains(t, r, "stdout", "sounds good")
+}
+
+// --attach copies the file and reports the count; the CLI must not silently
+// drop an attachment that exceeds the limits.
+func TestSendAttachCopiesFileAndRejectsTooMany(t *testing.T) {
+	withHome(t)
+	register(t, "bbbb2222-0000-0000-0000-000000000000", "beta")
+	dir := t.TempDir()
+	f := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(f, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	r := invoke(t, "send", "--attach", f, "beta", "see attached")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", "attached 1 file(s)")
+
+	args := []string{"send"}
+	for i := 0; i < 6; i++ {
+		args = append(args, "--attach", f)
+	}
+	args = append(args, "beta", "too many")
+	if r := invoke(t, args...); r.code == 0 {
+		t.Errorf("send with 6 attachments should have been rejected: %s", r)
+	}
+}
+
+// --catchup plants a window into the inbox and the confirmation says so.
+func TestSubscribeCatchupReportsWhatIsWaiting(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+	for i := 0; i < 3; i++ {
+		if _, err := pigeon.Publish("deploys", pigeon.Draft{Text: strings.Repeat("x", 1)}, pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+	}
+	r := invoke(t, "subscribe", "--catchup", "2", "deploys")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", "subscribed to #deploys")
+	wantContains(t, r, "stdout", "2 of the last 2 messages")
+}
+
 func TestPublishReportsSubscriberCountExcludingSelf(t *testing.T) {
 	withHome(t)
 	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")

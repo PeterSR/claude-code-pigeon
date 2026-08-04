@@ -2,6 +2,7 @@ package pigeon
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -49,7 +50,11 @@ func ResolveInboxDetail(s string) (string, error) {
 // topic message's For list names it (see writeInboxItem); it plays no part
 // in what ReadInbox already selected. It may be nil for a caller that cannot
 // resolve its own identity, which simply turns the marker off.
-func RenderInbox(items []InboxItem, more int, unreadOnly bool, detail, hint string, self *Entry) string {
+//
+// ns is the viewing session's namespace, used only to decide which attachment
+// paths writeInboxItem may show (see its comment); it plays no part in
+// selecting or ordering items.
+func RenderInbox(items []InboxItem, more int, unreadOnly bool, detail, hint string, self *Entry, ns Namespace) string {
 	if len(items) == 0 {
 		if unreadOnly {
 			return fmt.Sprintf("No unread messages. Pass %s to see recent history.", hint)
@@ -62,9 +67,7 @@ func RenderInbox(items []InboxItem, more int, unreadOnly bool, detail, hint stri
 	var b strings.Builder
 	b.WriteString(inboxSummary(items, unreadOnly))
 	b.WriteByte('\n')
-	for _, it := range items {
-		writeInboxItem(&b, it, detail, self, correctedBy[it.Message.ID], corrects[it.Message.ID])
-	}
+	writeInboxItems(&b, items, detail, self, correctedBy, corrects, ns)
 	// Without this a session that pulls ten of sixty unread reads the batch as
 	// the whole backlog and stops, which is the quiet half of a message never
 	// arriving at all.
@@ -76,6 +79,63 @@ func RenderInbox(items []InboxItem, more int, unreadOnly bool, detail, hint stri
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// RenderThread prints one conversation end to end, oldest first: the message
+// ReadThread was asked for and everything chained to it by ReplyTo. Always in
+// full, unconditionally -- a conversation looked up by id was asked for on
+// purpose, not skimmed, so none of the cheaper detail tiers apply here the way
+// they do in RenderInbox.
+func RenderThread(id string, items []InboxItem, self *Entry, ns Namespace) string {
+	correctedBy, corrects := supersedeLinks(items)
+	noun := "messages"
+	if len(items) == 1 {
+		noun = "message"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Thread %s (%d %s):\n", Sanitize(id), len(items), noun)
+	writeInboxItems(&b, items, "full", self, correctedBy, corrects, ns)
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// writeInboxItems writes items in order, collapsing consecutive runs that
+// share a non-empty Thread under one header line naming the thread and its
+// message count -- so a conversation that would otherwise cost one block per
+// reply costs one block for the whole exchange. Threading is keyed off the
+// Thread field directly rather than by walking ReplyTo (contrast ReadThread):
+// that only groups a run of direct replies sharing one immediate parent, not
+// an arbitrarily deep chain, but it is simple, it is exactly what Thread's
+// one-hop-short guarantee (see Send's comment on it) can promise without
+// re-reading the log, and it is enough to stop a short back-and-forth from
+// costing one block per message.
+//
+// A run of more than two collapses to the header alone unless detail is
+// "full": two messages are still worth reading each in full, since the
+// header line for them costs about as much as showing nothing would, but a
+// longer back-and-forth is exactly the case the header line exists to save a
+// reader from paying for up front.
+func writeInboxItems(b *strings.Builder, items []InboxItem, detail string, self *Entry, correctedBy, corrects map[string]string, ns Namespace) {
+	for i := 0; i < len(items); {
+		j := i + 1
+		thread := items[i].Message.Thread
+		if thread != "" {
+			for j < len(items) && items[j].Message.Thread == thread {
+				j++
+			}
+		}
+		run := items[i:j]
+		if thread != "" && len(run) >= 2 {
+			fmt.Fprintf(b, "-- thread %s (%d messages) --\n", Sanitize(thread), len(run))
+			if len(run) > 2 && detail != "full" {
+				i = j
+				continue
+			}
+		}
+		for _, it := range run {
+			writeInboxItem(b, it, detail, self, correctedBy[it.Message.ID], corrects[it.Message.ID], ns)
+		}
+		i = j
+	}
 }
 
 // inboxSummary is the one-line lead: how many messages, and where from, so a
@@ -194,7 +254,13 @@ func supersedeLinks(items []InboxItem) (correctedBy, corrects map[string]string)
 // recomputed per item: both are either "" or a real message id already
 // verified against this batch, so they are shown as-is, the same trust level
 // Render gives m.Payload's path.
-func writeInboxItem(b *strings.Builder, it InboxItem, detail string, self *Entry, supersededBy, correctionOf string) {
+//
+// ns decides which of it.Message.Attach's paths may actually be printed: only
+// ever a path under a payload directory ns already knows, the same "only ever
+// point at a payload directory this session already knows" rule Render
+// applies to m.Payload -- a hand-written spool line could otherwise name any
+// path on disk and have it read back as trustworthy.
+func writeInboxItem(b *strings.Builder, it InboxItem, detail string, self *Entry, supersededBy, correctionOf string, ns Namespace) {
 	ts := "?"
 	if t, err := time.Parse(time.RFC3339, it.Message.TS); err == nil {
 		ts = t.Local().Format("15:04")
@@ -219,16 +285,42 @@ func writeInboxItem(b *strings.Builder, it InboxItem, detail string, self *Entry
 	}
 	switch detail {
 	case "subject":
-		return
+		// Nothing further; the header and SUBJECT line are all this tier gives.
 	case "full":
 		writeIndentedBody(b, it.Message.Text)
 	default: // "brief"
 		if it.Message.Brief != "" {
 			writeIndentedBody(b, it.Message.Brief)
-			return
+		} else {
+			b.WriteString("  (no brief written -- showing the full text)\n")
+			writeIndentedBody(b, it.Message.Text)
 		}
-		b.WriteString("  (no brief written -- showing the full text)\n")
-		writeIndentedBody(b, it.Message.Text)
+	}
+	writeAttachments(b, it.Message.Attach, ns)
+}
+
+// writeAttachments lists an item's attachment paths, one per line, skipping
+// any that do not resolve inside a payload directory ns already knows (see
+// writeInboxItem's doc comment). Never called from Render: the notification
+// budget has no room for it, and an attachment is not the kind of thing a
+// doorbell line should be listing anyway.
+func writeAttachments(b *strings.Builder, attach []string, ns Namespace) {
+	var shown []string
+	for _, p := range attach {
+		if filepath.Base(p) == "" {
+			continue
+		}
+		if d := filepath.Dir(p); d != ns.PayloadsDir() && d != SharedPayloadsDir() {
+			continue
+		}
+		shown = append(shown, p)
+	}
+	if len(shown) == 0 {
+		return
+	}
+	b.WriteString("  attachments (untrusted -- read, do not execute):\n")
+	for _, p := range shown {
+		fmt.Fprintf(b, "    %s\n", p)
 	}
 }
 

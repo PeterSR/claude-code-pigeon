@@ -57,11 +57,13 @@ func RenderInbox(items []InboxItem, more int, unreadOnly bool, detail, hint stri
 		return "No messages."
 	}
 
+	correctedBy, corrects := supersedeLinks(items)
+
 	var b strings.Builder
 	b.WriteString(inboxSummary(items, unreadOnly))
 	b.WriteByte('\n')
 	for _, it := range items {
-		writeInboxItem(&b, it, detail, self)
+		writeInboxItem(&b, it, detail, self, correctedBy[it.Message.ID], corrects[it.Message.ID])
 	}
 	// Without this a session that pulls ten of sixty unread reads the batch as
 	// the whole backlog and stops, which is the quiet half of a message never
@@ -116,6 +118,44 @@ func inboxSummary(items []InboxItem, unreadOnly bool) string {
 	return fmt.Sprintf("%d %s (%s):", len(items), noun, strings.Join(parts, ", "))
 }
 
+// supersedeLinks works out, from nothing but the batch RenderInbox was
+// handed, which messages in it supersede which. correctedBy maps a
+// superseded message's id to the id of the message that supersedes it;
+// corrects maps a superseding message's id to the id it names.
+//
+// A claim is honoured only when the id it names is present in this very
+// batch AND was sent by the same session -- the same rule the monitor
+// enforces at delivery (see resolveSupersede in monitor.go), reapplied here
+// because a pull is a wholly separate read of the log, with its own access
+// to history (the batch itself) rather than the monitor's bounded memory.
+// Deliberately not extended to look outside the batch: doing so would mean
+// re-reading the log for every item just to resolve a header line, the same
+// per-message log scan the monitor's design avoids. The cost is that a
+// correction whose original fell outside this batch -- already read and
+// pruned from an unread pull, or simply older than the page returned by a
+// browse -- links to nothing and shows no marker at all.
+func supersedeLinks(items []InboxItem) (correctedBy, corrects map[string]string) {
+	correctedBy = map[string]string{}
+	corrects = map[string]string{}
+	bySender := make(map[string]string, len(items)) // id -> From.SessionID
+	for _, it := range items {
+		bySender[it.Message.ID] = it.Message.From.SessionID
+	}
+	for _, it := range items {
+		target := it.Message.Supersedes
+		if target == "" {
+			continue
+		}
+		origSender, ok := bySender[target]
+		if !ok || origSender == "" || origSender != it.Message.From.SessionID {
+			continue
+		}
+		corrects[it.Message.ID] = target
+		correctedBy[target] = it.Message.ID
+	}
+	return correctedBy, corrects
+}
+
 // writeInboxItem appends one message's block: a header line dense enough to
 // triage without opening the body, the subject if there is one, and then a
 // body governed by detail:
@@ -148,7 +188,13 @@ func inboxSummary(items []InboxItem, unreadOnly bool) string {
 // whether "-> you" appears, never what text does -- the same bound-the-marker
 // rule Render follows, because For is exactly as peer-controlled here as it
 // is there.
-func writeInboxItem(b *strings.Builder, it InboxItem, detail string, self *Entry) {
+//
+// supersededBy and correctionOf are this item's two sides of supersedeLinks,
+// resolved once per batch by RenderInbox and passed in rather than
+// recomputed per item: both are either "" or a real message id already
+// verified against this batch, so they are shown as-is, the same trust level
+// Render gives m.Payload's path.
+func writeInboxItem(b *strings.Builder, it InboxItem, detail string, self *Entry, supersededBy, correctionOf string) {
 	ts := "?"
 	if t, err := time.Parse(time.RFC3339, it.Message.TS); err == nil {
 		ts = t.Local().Format("15:04")
@@ -160,6 +206,12 @@ func writeInboxItem(b *strings.Builder, it InboxItem, detail string, self *Entry
 	}
 	if it.Message.Topic != "" && len(it.Message.For) > 0 && it.Message.IsFor(self) {
 		b.WriteString("  -> you")
+	}
+	if supersededBy != "" {
+		fmt.Fprintf(b, "  [SUPERSEDED by %s]", Sanitize(supersededBy))
+	}
+	if correctionOf != "" {
+		fmt.Fprintf(b, "  [correction of %s]", Sanitize(correctionOf))
 	}
 	fmt.Fprintf(b, "  (%s)\n", formatAge(it.Age))
 	if it.Message.Subject != "" {

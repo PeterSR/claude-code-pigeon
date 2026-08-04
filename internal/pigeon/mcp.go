@@ -77,6 +77,19 @@ func priorityArg() map[string]any {
 	})
 }
 
+// supersedesArg is the optional input shared by send_message and publish. Its
+// description states the two consequences up front -- correction framing, or
+// silent drop -- since a model deciding whether to use this needs to know
+// both before it can predict what the recipient actually sees.
+func supersedesArg() map[string]any {
+	return obj(map[string]any{
+		"type": "string",
+		"description": "Message id this replaces, from a message you sent. The recipient is " +
+			"told it is a correction, and if they have not seen the original yet it is " +
+			"dropped instead of shown. Only the original sender can supersede a message.",
+	})
+}
+
 func tools() []toolDef {
 	return []toolDef{
 		{
@@ -128,8 +141,9 @@ func tools() []toolDef {
 							"decide whether to read the rest. Max 600 characters. Readers see " +
 							"this by default, so write it as if it is all they will read.",
 					}),
-					"priority":  priorityArg(),
-					"namespace": namespaceArg("resolve the target in"),
+					"priority":   priorityArg(),
+					"supersedes": supersedesArg(),
+					"namespace":  namespaceArg("resolve the target in"),
 				}),
 				"required": []string{"to", "text"},
 			}),
@@ -171,7 +185,8 @@ func tools() []toolDef {
 							"who should act on it, and later lets everyone else keep it out of " +
 							"their notifications. Omit when it genuinely concerns everybody.",
 					}),
-					"namespace": namespaceArg("publish into"),
+					"supersedes": supersedesArg(),
+					"namespace":  namespaceArg("publish into"),
 				}),
 				"required": []string{"topic", "text"},
 			}),
@@ -470,12 +485,13 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		return mcpList(ns)
 	case "send_message":
 		var a struct {
-			To        string `json:"to"`
-			Text      string `json:"text"`
-			Subject   string `json:"subject"`
-			Brief     string `json:"brief"`
-			Priority  string `json:"priority"`
-			Namespace string `json:"namespace"`
+			To         string `json:"to"`
+			Text       string `json:"text"`
+			Subject    string `json:"subject"`
+			Brief      string `json:"brief"`
+			Priority   string `json:"priority"`
+			Supersedes string `json:"supersedes"`
+			Namespace  string `json:"namespace"`
 		}
 		_ = json.Unmarshal(raw, &a)
 		ns, err := mcpNamespace(a.Namespace)
@@ -486,16 +502,17 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return mcpSend(ns, a.To, a.Text, a.Subject, a.Brief, priority)
+		return mcpSend(ns, a.To, a.Text, a.Subject, a.Brief, priority, a.Supersedes)
 	case "publish":
 		var a struct {
-			Topic     string   `json:"topic"`
-			Text      string   `json:"text"`
-			Subject   string   `json:"subject"`
-			Brief     string   `json:"brief"`
-			Priority  string   `json:"priority"`
-			For       []string `json:"for"`
-			Namespace string   `json:"namespace"`
+			Topic      string   `json:"topic"`
+			Text       string   `json:"text"`
+			Subject    string   `json:"subject"`
+			Brief      string   `json:"brief"`
+			Priority   string   `json:"priority"`
+			For        []string `json:"for"`
+			Supersedes string   `json:"supersedes"`
+			Namespace  string   `json:"namespace"`
 		}
 		_ = json.Unmarshal(raw, &a)
 		ns, err := mcpNamespace(a.Namespace)
@@ -506,7 +523,7 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return mcpPublish(ns, a.Topic, a.Text, a.Subject, a.Brief, priority, a.For)
+		return mcpPublish(ns, a.Topic, a.Text, a.Subject, a.Brief, priority, a.For, a.Supersedes)
 	case "subscribe", "unsubscribe":
 		var a struct {
 			Topic     string `json:"topic"`
@@ -630,7 +647,7 @@ func mcpPriority(p string) (string, error) {
 	return "", fmt.Errorf("priority %q is not valid; use \"normal\" or \"alert\"", p)
 }
 
-func mcpSend(ns Namespace, to, text, subject, brief, priority string) (string, error) {
+func mcpSend(ns Namespace, to, text, subject, brief, priority, supersedes string) (string, error) {
 	if strings.TrimSpace(to) == "" || strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("both 'to' and 'text' are required")
 	}
@@ -638,7 +655,7 @@ func mcpSend(ns Namespace, to, text, subject, brief, priority string) (string, e
 	if err != nil {
 		return "", err
 	}
-	msg, err := ns.Send(target, Draft{Text: text, Subject: subject, Brief: brief, Priority: priority}, CurrentSender())
+	msg, err := ns.Send(target, Draft{Text: text, Subject: subject, Brief: brief, Priority: priority, Supersedes: supersedes}, CurrentSender())
 	if err != nil {
 		return "", err
 	}
@@ -655,11 +672,11 @@ func mcpSend(ns Namespace, to, text, subject, brief, priority string) (string, e
 	return b.String(), nil
 }
 
-func mcpPublish(ns Namespace, topic, text, subject, brief, priority string, forNames []string) (string, error) {
+func mcpPublish(ns Namespace, topic, text, subject, brief, priority string, forNames []string, supersedes string) (string, error) {
 	if strings.TrimSpace(topic) == "" || strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("both 'topic' and 'text' are required")
 	}
-	msg, err := ns.Publish(topic, Draft{Text: text, Subject: subject, Brief: brief, Priority: priority, For: forNames}, CurrentSender())
+	msg, err := ns.Publish(topic, Draft{Text: text, Subject: subject, Brief: brief, Priority: priority, For: forNames, Supersedes: supersedes}, CurrentSender())
 	if err != nil {
 		return "", err
 	}

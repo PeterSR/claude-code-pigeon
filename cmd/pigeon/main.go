@@ -361,13 +361,14 @@ func cmdList(args []string, w, stderr io.Writer) error {
 
 func cmdSend(args []string, w, stderr io.Writer) error {
 	fs := flags("send", stderr)
-	var nsName, asName, subject, brief string
+	var nsName, asName, subject, brief, supersedes string
 	var alert bool
 	nsFlag(fs, &nsName)
 	asFlag(fs, &asName)
 	fs.StringVar(&subject, "subject", "", "one-line subject, max 120 characters; the only part guaranteed to arrive")
 	fs.StringVar(&brief, "brief", "", "a short summary, max 600 characters; what `pigeon inbox` shows by default")
 	fs.BoolVar(&alert, "alert", false, "mark this urgent: it interrupts work in progress and bypasses a digest. Use it to stop people, not to inform them")
+	fs.StringVar(&supersedes, "supersedes", "", "message id this replaces, from a message you sent; the recipient is told it is a correction, and if they have not seen the original yet it is dropped instead of shown; only the original sender can supersede a message")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -376,7 +377,7 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf("usage: pigeon send [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] [--alert] <target> <text>")
+		return fmt.Errorf("usage: pigeon send [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] [--alert] [--supersedes <id>] <target> <text>")
 	}
 	if err := misplacedFlag(rest[1:]); err != nil {
 		return err
@@ -399,7 +400,7 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	msg, err := ns.Send(to, pigeon.Draft{Text: text, Subject: subject, Brief: brief, Priority: priority}, pigeon.ActingSender(asName))
+	msg, err := ns.Send(to, pigeon.Draft{Text: text, Subject: subject, Brief: brief, Priority: priority, Supersedes: supersedes}, pigeon.ActingSender(asName))
 	if err != nil {
 		return err
 	}
@@ -438,7 +439,7 @@ func misplacedFlag(rest []string) error {
 			name = name[:i]
 		}
 		switch name {
-		case "subject", "brief", "alert", "for", "n", "namespace", "as":
+		case "subject", "brief", "alert", "for", "supersedes", "n", "namespace", "as":
 			return fmt.Errorf("%q came after a positional argument, so it was read as message text rather than as a flag; put flags before the target and the body", a)
 		}
 	}
@@ -447,7 +448,7 @@ func misplacedFlag(rest []string) error {
 
 func cmdPublish(args []string, w, stderr io.Writer) error {
 	fs := flags("publish", stderr)
-	var nsName, asName, subject, brief string
+	var nsName, asName, subject, brief, supersedes string
 	var alert bool
 	var forNames repeatableFlag
 	nsFlag(fs, &nsName)
@@ -456,6 +457,7 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	fs.StringVar(&brief, "brief", "", "a short summary, max 600 characters; what `pigeon inbox` shows by default")
 	fs.BoolVar(&alert, "alert", false, "mark this urgent: it interrupts work in progress and bypasses a digest. Use it to stop people, not to inform them")
 	fs.Var(&forNames, "for", "session name this message is actually for (repeatable); everyone still receives it, this only marks who should act on it")
+	fs.StringVar(&supersedes, "supersedes", "", "message id this replaces, from a message you sent; the recipient is told it is a correction, and if they have not seen the original yet it is dropped instead of shown; only the original sender can supersede a message")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -464,7 +466,7 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf("usage: pigeon publish [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] [--alert] [--for <name>]... <topic> <text>")
+		return fmt.Errorf("usage: pigeon publish [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] [--alert] [--for <name>]... [--supersedes <id>] <topic> <text>")
 	}
 	if err := misplacedFlag(rest[1:]); err != nil {
 		return err
@@ -480,7 +482,7 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	msg, err := ns.Publish(topic, pigeon.Draft{Text: text, Subject: subject, Brief: brief, Priority: priority, For: forNames}, pigeon.ActingSender(asName))
+	msg, err := ns.Publish(topic, pigeon.Draft{Text: text, Subject: subject, Brief: brief, Priority: priority, For: forNames, Supersedes: supersedes}, pigeon.ActingSender(asName))
 	if err != nil {
 		return err
 	}

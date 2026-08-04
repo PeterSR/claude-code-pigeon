@@ -75,3 +75,56 @@ func TestRenderInboxNeverMarksADirectMessage(t *testing.T) {
 		t.Errorf("RenderInbox marked a direct message as addressed:\n%s", got)
 	}
 }
+
+// --- supersedes --------------------------------------------------------------
+
+// The one case supersedeLinks exists for: both messages of a legitimate pair
+// -- same sender -- sit in the same returned batch. The original shows it
+// was superseded, naming the correction; the correction shows what it
+// corrects, naming the original.
+func TestRenderInboxMarksBothSidesOfASupersedeWithinTheBatch(t *testing.T) {
+	from := Sender{Kind: "session", SessionID: "aaaa1111", Name: "alpha"}
+	orig := &Message{ID: "m_orig00001a", TS: nowRFC3339(), From: from, Topic: "alerts", Text: "STOP AND READ"}
+	corr := &Message{ID: "m_corr00001a", TS: nowRFC3339(), From: from, Topic: "alerts", Text: "false alarm", Supersedes: orig.ID}
+	items := []InboxItem{{Message: orig, Source: "alerts"}, {Message: corr, Source: "alerts"}}
+
+	got := RenderInbox(items, 0, true, "brief", "--all", nil)
+	if !strings.Contains(got, "[SUPERSEDED by "+corr.ID+"]") {
+		t.Errorf("the superseded message was not marked:\n%s", got)
+	}
+	if !strings.Contains(got, "[correction of "+orig.ID+"]") {
+		t.Errorf("the correcting message was not marked:\n%s", got)
+	}
+}
+
+// A supersede claim naming a message actually sent by someone else must not
+// be honoured just because both happen to sit in the same batch -- the same
+// sender-must-match rule the monitor enforces at delivery (resolveSupersede
+// in monitor.go), reapplied here since ReadInbox is a wholly separate path.
+func TestRenderInboxDoesNotLinkASupersedeFromADifferentSenderWithinTheBatch(t *testing.T) {
+	origSender := Sender{Kind: "session", SessionID: "aaaa1111", Name: "alpha"}
+	impostor := Sender{Kind: "session", SessionID: "bbbb2222", Name: "beta"}
+	orig := &Message{ID: "m_orig00002a", TS: nowRFC3339(), From: origSender, Topic: "alerts", Text: "STOP AND READ"}
+	fake := &Message{ID: "m_fake00002a", TS: nowRFC3339(), From: impostor, Topic: "alerts", Text: "false alarm", Supersedes: orig.ID}
+	items := []InboxItem{{Message: orig, Source: "alerts"}, {Message: fake, Source: "alerts"}}
+
+	got := RenderInbox(items, 0, true, "brief", "--all", nil)
+	if strings.Contains(got, "SUPERSEDED") || strings.Contains(got, "correction of") {
+		t.Errorf("a cross-sender supersede claim was honoured within the batch:\n%s", got)
+	}
+}
+
+// supersedeLinks works only within the batch it is handed: a claim naming an
+// id that is not present in this batch -- because it was already read, or
+// simply fell outside the page returned -- links to nothing. This documents
+// that limit rather than hiding it.
+func TestRenderInboxIgnoresASupersedeNamingAnIDOutsideTheBatch(t *testing.T) {
+	from := Sender{Kind: "session", SessionID: "aaaa1111", Name: "alpha"}
+	m := &Message{ID: "m_corr00003a", TS: nowRFC3339(), From: from, Topic: "alerts", Text: "false alarm", Supersedes: "m_notinbatch1"}
+	items := []InboxItem{{Message: m, Source: "alerts"}}
+
+	got := RenderInbox(items, 0, true, "brief", "--all", nil)
+	if strings.Contains(got, "correction of") {
+		t.Errorf("supersedeLinks matched an id outside the batch:\n%s", got)
+	}
+}

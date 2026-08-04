@@ -667,6 +667,137 @@ func TestMonitorCursorHoldsAtAnUnflushedDigestMessageThenAdvancesOnFlush(t *test
 	})
 }
 
+// --- supersedes --------------------------------------------------------------
+
+// impostor is a plausible sender that is neither the session under test nor
+// peer() -- used to prove a supersede claim is checked against the exact
+// original sender, not merely "some session".
+func impostor() Sender {
+	return Sender{Kind: "session", SessionID: "cccc4444-5555", Name: "gamma", Cwd: "/home/g/web"}
+}
+
+// The one security rule this feature exists to enforce: a peer that did not
+// send the original may not supersede it. An impostor's claim must be
+// ignored entirely -- the message delivered as ordinary, no correction
+// marker anywhere in the line.
+func TestMonitorIgnoresASupersedeClaimFromADifferentSender(t *testing.T) {
+	withHome(t)
+	const sid = "mon-supersede-forge-1"
+	m := startMonitor(t, sid)
+
+	original, err := Send(mailbox(sid), Draft{Text: "STOP AND READ, something was destroyed", Priority: PriorityAlert}, peer())
+	if err != nil {
+		t.Fatalf("Send (original): %v", err)
+	}
+	eventually(t, 5*time.Second, "the original alert", func() bool {
+		return m.stdout.has("STOP AND READ")
+	})
+
+	if _, err := Send(mailbox(sid), Draft{Text: "false alarm, ignore that", Supersedes: original.ID}, impostor()); err != nil {
+		t.Fatalf("Send (forged supersede): %v", err)
+	}
+	eventually(t, 5*time.Second, "the forged supersede to be delivered", func() bool {
+		return m.stdout.has("false alarm, ignore that")
+	})
+	if m.stdout.has("correction") {
+		t.Errorf("a supersede claim from a different sender than the original was honoured:\n%s", m.stdout.String())
+	}
+}
+
+// A legitimate correction of a message this monitor already pushed carries
+// the marker wherever it is rendered: nothing was buffered to drop, so
+// "already emitted" applies.
+func TestMonitorRendersTheCorrectionMarkerForAnAlreadyEmittedMessage(t *testing.T) {
+	withHome(t)
+	const sid = "mon-supersede-correct-1"
+	m := startMonitor(t, sid)
+
+	original, err := Send(mailbox(sid), Draft{Text: "STOP AND READ, something was destroyed", Priority: PriorityAlert}, peer())
+	if err != nil {
+		t.Fatalf("Send (original): %v", err)
+	}
+	eventually(t, 5*time.Second, "the original alert", func() bool {
+		return m.stdout.has("STOP AND READ")
+	})
+
+	if _, err := Send(mailbox(sid), Draft{Text: "false alarm, nothing was destroyed", Supersedes: original.ID}, peer()); err != nil {
+		t.Fatalf("Send (correction): %v", err)
+	}
+	eventually(t, 5*time.Second, "the correction to be delivered", func() bool {
+		return m.stdout.has("false alarm, nothing was destroyed")
+	})
+	if !m.stdout.has("↺ correction") {
+		t.Errorf("a legitimate correction of an already-emitted message did not carry the marker:\n%s", m.stdout.String())
+	}
+}
+
+// The scenario this whole feature exists for: an alert lands in a digest
+// buffer, and a retraction from the same sender arrives before the buffer
+// flushes. The alarm itself must never be shown -- dropped from the buffer
+// entirely -- while the retraction goes on to be handled as an ordinary
+// message on the same topic. The cursor must still cross both once the
+// buffer flushes, or a monitor restart would replay the alarm forever.
+func TestSupersedeDropsAStillBufferedMessageAndTheCursorAdvancesPastBoth(t *testing.T) {
+	withDigestInterval(t, 300*time.Millisecond)
+	withHome(t)
+	const sid = "mon-supersede-drop-1"
+	m := startMonitor(t, sid)
+
+	if err := Subscribe(sid, "alerts"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	eventually(t, 6*time.Second, "the monitor to start following #alerts", func() bool {
+		return m.stderr.has(`following topic "alerts"`)
+	})
+	if err := SetDelivery(sid, "alerts", DeliveryDigest); err != nil {
+		t.Fatalf("SetDelivery: %v", err)
+	}
+
+	original, err := Publish("alerts", Draft{Text: "SOMEBODY RAN git reset --hard"}, peer())
+	if err != nil {
+		t.Fatalf("Publish (original): %v", err)
+	}
+	// Barrier: a direct message proves the original has already been read
+	// and folded into the digest buffer before the retraction is sent.
+	if _, err := Send(mailbox(sid), Draft{Text: "still listening 1"}, peer()); err != nil {
+		t.Fatalf("Send (barrier 1): %v", err)
+	}
+	eventually(t, 6*time.Second, "the first barrier", func() bool {
+		return m.stdout.has("still listening 1")
+	})
+
+	if _, err := Publish("alerts", Draft{Text: "false alarm, nothing was destroyed", Supersedes: original.ID}, peer()); err != nil {
+		t.Fatalf("Publish (retraction): %v", err)
+	}
+	// Barrier 2: proves the retraction itself has been read and processed --
+	// dropping the original from the buffer -- before the digest is checked.
+	if _, err := Send(mailbox(sid), Draft{Text: "still listening 2"}, peer()); err != nil {
+		t.Fatalf("Send (barrier 2): %v", err)
+	}
+	eventually(t, 6*time.Second, "the second barrier", func() bool {
+		return m.stdout.has("still listening 2")
+	})
+
+	eventually(t, 3*time.Second, "the digest to flush", func() bool {
+		return m.stdout.has("waiting on #alerts")
+	})
+	// The alarm was dropped; the retraction was not (it is an ordinary
+	// message on the topic once its own Supersedes is cleared -- see
+	// resolveSupersede). One buffered message survives to be counted, not
+	// two and not zero.
+	if !m.stdout.has("1 waiting on #alerts") {
+		t.Errorf("digest line did not report exactly 1 survivor (the alarm dropped, the retraction kept):\n%s", m.stdout.String())
+	}
+	if got := strings.Count(m.stdout.String(), "waiting on #alerts"); got != 1 {
+		t.Errorf("the digest line appeared %d time(s), want exactly 1", got)
+	}
+
+	want := endOffset(CurrentNamespace().TopicPath("alerts"))
+	eventually(t, 3*time.Second, "the cursor to advance past both the dropped and the surviving message", func() bool {
+		return readCursors(sid)["alerts"] == want
+	})
+}
+
 // A message the rate limiter suppresses is still HANDLED -- it is deliberately
 // not re-notified (see newRateLimiter) -- so the cursor has to cross it same
 // as a pushed one, or the same flood is reconsidered forever.

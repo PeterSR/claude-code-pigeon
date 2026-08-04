@@ -318,9 +318,14 @@ func (n Namespace) Publish(topic string, d Draft, from Sender) (*Message, error)
 	if err != nil {
 		return nil, err
 	}
+	id := newMessageID()
+	supersedes, err := validateSupersedes(d.Supersedes, id)
+	if err != nil {
+		return nil, err
+	}
 
 	msg := &Message{
-		ID:       newMessageID(),
+		ID:       id,
 		TS:       nowRFC3339(),
 		From:     from,
 		Topic:    ref.String(),
@@ -338,7 +343,8 @@ func (n Namespace) Publish(topic string, d Draft, from Sender) (*Message, error)
 		// the typed name against each reader at the moment they look (see
 		// Message.IsFor) is the only version of this that stays honest as
 		// the set of live sessions changes underneath the log.
-		For: for_,
+		For:        for_,
+		Supersedes: supersedes,
 	}
 	if len([]rune(body)) > BodyBudget {
 		p := filepath.Join(ref.payloadsDir(n), msg.ID+".txt")

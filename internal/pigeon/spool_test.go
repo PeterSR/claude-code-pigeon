@@ -362,3 +362,87 @@ func TestRenderBoundsAHostileForEntry(t *testing.T) {
 		t.Errorf("Render(hostile For alongside a real match) = %q, want %q", got, want)
 	}
 }
+
+// --- supersedes ------------------------------------------------------------
+
+// Anything that does not look like a real message id -- wrong prefix, wrong
+// length, uppercase, or simply made up -- must be rejected at send time, on
+// both paths, the same as an invalid priority.
+func TestSupersedesRejectsAnythingThatDoesNotLookLikeAMessageID(t *testing.T) {
+	withHome(t)
+	beta := liveEntry(t, "bbbb2222", "beta", "/tmp/work")
+	from := Sender{Kind: "shell", Name: "test"}
+
+	for _, bad := range []string{"not-an-id", "m_", "m_deadbeef", "m_DEADBEEF1234", "m_deadbeef123", " m_deadbeef1234", "msg_deadbeef1234"} {
+		if _, err := Send(beta, Draft{Text: "hi", Supersedes: bad}, from); err == nil {
+			t.Errorf("Send with supersedes %q should have been rejected", bad)
+		}
+		if _, err := Publish("deploys", Draft{Text: "hi", Supersedes: bad}, from); err == nil {
+			t.Errorf("Publish with supersedes %q should have been rejected", bad)
+		}
+	}
+
+	// A well-formed id -- the exact shape newMessageID produces -- must be
+	// accepted, on both paths.
+	const ok = "m_deadbeef1234"
+	if _, err := Send(beta, Draft{Text: "hi", Supersedes: ok}, from); err != nil {
+		t.Errorf("Send with a well-formed supersedes id was rejected: %v", err)
+	}
+	if _, err := Publish("deploys", Draft{Text: "hi", Supersedes: ok}, from); err != nil {
+		t.Errorf("Publish with a well-formed supersedes id was rejected: %v", err)
+	}
+}
+
+// A message may not name itself as the one it replaces. It cannot happen by
+// accident -- the id is minted after the draft is validated -- but
+// validateSupersedes is exercised directly here since Send/Publish can never
+// produce the collision themselves.
+func TestSupersedesRejectsSelfReference(t *testing.T) {
+	if _, err := validateSupersedes("m_deadbeef1234", "m_deadbeef1234"); err == nil {
+		t.Error("validateSupersedes accepted a message naming itself")
+	}
+	if got, err := validateSupersedes("m_deadbeef1234", "m_someother123"); err != nil || got != "m_deadbeef1234" {
+		t.Errorf("validateSupersedes(distinct ids) = (%q, %v), want (\"m_deadbeef1234\", nil)", got, err)
+	}
+	if got, err := validateSupersedes("", "m_someother123"); err != nil || got != "" {
+		t.Errorf("validateSupersedes(\"\") = (%q, %v), want (\"\", nil)", got, err)
+	}
+}
+
+// Render shows the correction marker whenever Supersedes is set -- the
+// authenticity check happens earlier, at delivery time (see
+// resolveSupersede in monitor.go), so by the time a message reaches Render
+// its Supersedes field is already trustworthy. This pins the exact marker
+// text and its combination with the alert marker for both a direct and a
+// topic message.
+func TestRenderShowsTheCorrectionMarker(t *testing.T) {
+	withHome(t)
+	ns := CurrentNamespace()
+	from := Sender{Kind: "session", SessionID: "aaaa1111", Name: "peer", Namespace: ns.String()}
+
+	direct := &Message{ID: "m_c1", From: from, Text: "actually the build is fine", Supersedes: "m_original1234"}
+	want := "[pigeon ↺ correction] message from peer :: actually the build is fine [reply: pigeon send peer]"
+	if got := ns.Render(direct, nil); got != want {
+		t.Errorf("Render(direct correction) = %q, want %q", got, want)
+	}
+
+	topic := &Message{ID: "m_c2", From: from, Topic: "deploys", Text: "nothing was destroyed", Supersedes: "m_original1234"}
+	want = "[pigeon #deploys ↺ correction] from peer :: nothing was destroyed [reply: pigeon send peer] [topic: pigeon publish deploys]"
+	if got := ns.Render(topic, nil); got != want {
+		t.Errorf("Render(topic correction) = %q, want %q", got, want)
+	}
+
+	alertCorrection := &Message{ID: "m_c3", From: from, Text: "STAND DOWN", Supersedes: "m_original1234", Priority: PriorityAlert}
+	want = "[pigeon ! ↺ correction] message from peer :: STAND DOWN [reply: pigeon send peer]"
+	if got := ns.Render(alertCorrection, nil); got != want {
+		t.Errorf("Render(alert correction) = %q, want %q", got, want)
+	}
+
+	// No Supersedes at all must render exactly as before -- nothing here
+	// leaks into a message that never claimed to correct anything.
+	plain := &Message{ID: "m_c4", From: from, Text: "an ordinary message"}
+	want = "[pigeon] message from peer :: an ordinary message [reply: pigeon send peer]"
+	if got := ns.Render(plain, nil); got != want {
+		t.Errorf("Render(no supersedes) = %q, want %q", got, want)
+	}
+}

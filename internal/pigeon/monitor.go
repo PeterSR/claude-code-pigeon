@@ -181,22 +181,32 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	// message arrival and the flush tick run through the select loop below --
 	// so it needs no lock. A key's presence in the map, not merely its count,
 	// is what advanceCursor below treats as "something on this topic is still
-	// unflushed": bufferDigest never leaves a zero-count entry behind, so the
-	// two conditions are the same thing asked two ways.
+	// unflushed": a topic whose only buffered message was just dropped by a
+	// supersede (see dropSuperseded) stays present with a zero count, so the
+	// two conditions are no longer always the same thing -- presence is the
+	// one that is load-bearing.
 	digests := map[string]*digestState{}
 	flushDigests := func() {
 		for topic, st := range digests {
-			if st.count == 0 {
-				continue
+			if n := st.count(); n > 0 {
+				fmt.Fprintln(stdout, renderDigestLine(topic, n, st.senderNames()))
 			}
-			fmt.Fprintln(stdout, renderDigestLine(topic, st.count, st.senders))
-			// The buffer's highest offset is safe to persist only now: the
-			// digest line naming it has actually reached the session.
+			// Persisted even when every buffered message was dropped by a
+			// supersede: dropping one still counts as handling it (see
+			// resolveSupersede), and this is the only place a digest topic's
+			// cursor moves at all.
 			persistCursor(topic, st.maxOffset)
 		}
 		clear(digests)
 	}
 	defer flushDigests()
+
+	// senders remembers which session sent each message id this monitor has
+	// itself followed off a log, in a bounded window -- the minimum state
+	// resolveSupersede needs to check a "supersedes" claim's sender against
+	// the original's, without holding or re-reading a whole log for it (see
+	// resolveSupersede's doc comment).
+	senders := newSenderMemory()
 
 	// advanceCursor persists a handled message's offset, UNLESS an earlier
 	// message on the same topic is still sitting in an unflushed digest
@@ -283,6 +293,11 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 		case <-digestTicker.C:
 			flushDigests()
 		case fm := <-lines:
+			// Recorded before anything else so a later message on the same
+			// log -- however it is delivered -- can still find this one's
+			// sender to check a "supersedes" claim against.
+			senders.remember(fm.msg.ID, fm.msg.From.SessionID)
+			resolveSupersede(digests, senders, fm.msg)
 			// Never wake a session with its own broadcast, but it has still
 			// been handled: advance the cursor or the same message is
 			// reconsidered forever.
@@ -307,31 +322,185 @@ type followedMessage struct {
 }
 
 // digestState buffers what a digest or quiet topic has accumulated since its
-// last flush: how many messages, who sent them (in the order first seen, for
-// a reproducible line), and how far the cursor may move once this buffer is
-// actually flushed -- never before, or a monitor that dies with messages
-// still sitting here would resume past them and they would never be seen.
+// last flush, and how far the cursor may move once this buffer is actually
+// flushed -- never before, or a monitor that dies with messages still
+// sitting here would resume past them and they would never be seen.
+//
+// Individual messages are kept, in arrival order, rather than folded straight
+// into a running count and sender list: a supersede arriving inside the same
+// window has to be able to find and drop the exact entry it names (see
+// dropSuperseded), and count/senderNames below are derived from what
+// survives that, computed fresh each time rather than kept incrementally, so
+// a drop can never leave them out of sync with the messages that back them.
 type digestState struct {
-	count      int
-	senders    []string
-	seenSender map[string]bool
-	maxOffset  int64
+	messages []bufferedDigestMessage
+	// maxOffset is the furthest cursor position anything ever folded into
+	// this buffer reached, dropped entries included: dropping a buffered
+	// message still counts as handling it, so its offset must still be
+	// crossed once this buffer flushes (see flushDigests).
+	maxOffset int64
+}
+
+// bufferedDigestMessage is one entry in a digest buffer. dropped marks an
+// entry a later supersede has removed from what will actually be shown --
+// left in place rather than spliced out, so arrival order among whatever
+// survives is never disturbed and dropping is idempotent to look up twice.
+type bufferedDigestMessage struct {
+	fm      followedMessage
+	dropped bool
 }
 
 // bufferDigest folds fm into topic's digest buffer, creating it on first use.
 func bufferDigest(digests map[string]*digestState, topic string, fm followedMessage) {
 	st, ok := digests[topic]
 	if !ok {
-		st = &digestState{seenSender: map[string]bool{}}
+		st = &digestState{}
 		digests[topic] = st
 	}
-	st.count++
-	if name := fm.msg.From.Display(); !st.seenSender[name] {
-		st.seenSender[name] = true
-		st.senders = append(st.senders, name)
-	}
+	st.messages = append(st.messages, bufferedDigestMessage{fm: fm})
 	if fm.offset > st.maxOffset {
 		st.maxOffset = fm.offset
+	}
+}
+
+// count reports how many buffered messages are still due to be shown.
+func (st *digestState) count() int {
+	n := 0
+	for _, bm := range st.messages {
+		if !bm.dropped {
+			n++
+		}
+	}
+	return n
+}
+
+// senderNames lists who sent each surviving buffered message, in the order
+// first seen, deduplicated -- recomputed from st.messages every call rather
+// than tracked incrementally, so a drop can never leave a name behind whose
+// only message is gone.
+func (st *digestState) senderNames() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, bm := range st.messages {
+		if bm.dropped {
+			continue
+		}
+		name := bm.fm.msg.From.Display()
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// dropSuperseded removes id's entry from whichever topic's digest buffer
+// still holds it un-flushed, wherever it is -- a supersede is not required to
+// name a message on its own topic, so every buffer is checked, not just the
+// one for m.Topic. It reports whether id was found: a caller that gets false
+// has nothing buffered to drop, so the "already emitted" behaviour applies
+// instead (see resolveSupersede).
+func dropSuperseded(digests map[string]*digestState, id string) bool {
+	for _, st := range digests {
+		for i := range st.messages {
+			if st.messages[i].dropped || st.messages[i].fm.msg.ID != id {
+				continue
+			}
+			st.messages[i].dropped = true
+			return true
+		}
+	}
+	return false
+}
+
+// supersedeMemory caps how many recent message ids senderMemory remembers a
+// sender for. Bounded rather than unbounded because a monitor runs for a
+// whole session's life: the two things a "supersedes" claim is ever checked
+// against -- a message this monitor already pushed, or one still sitting in
+// its own digest buffer -- both concern messages this session has itself
+// seen recently, never a log's full history, so remembering forever would
+// grow this map for no case that actually needs it.
+const supersedeMemory = 512
+
+// senderMemory remembers, for a bounded trailing window of message ids this
+// monitor has followed off a log, who sent each one. It is the minimum state
+// resolveSupersede needs to check a "supersedes" claim's sender against the
+// original's without holding, or re-reading, a whole log to answer one
+// question (see RunMonitor's doc comment on why not: the delivery loop sees
+// messages once, streaming past, and Send/Publish already reject anything
+// that is not shaped like a real id at the point a message is sent -- see
+// validateSupersedes -- so what is left to check here is only ever "did the
+// same sender send both", which this is enough for).
+//
+// Eviction only ever weakens a supersede claim, never strengthens one: an id
+// that ages out of memory is treated as unverifiable and the claim naming it
+// is dropped (see resolveSupersede), the same safe-by-default outcome as a
+// claim naming an id this monitor never saw at all.
+type senderMemory struct {
+	sender map[string]string // message id -> From.SessionID
+	order  []string          // insertion order, oldest first, for eviction
+}
+
+func newSenderMemory() *senderMemory {
+	return &senderMemory{sender: map[string]string{}}
+}
+
+// remember records who sent id, the first time it is seen. Touched only from
+// RunMonitor's own goroutine, so it needs no lock, the same as digests.
+func (s *senderMemory) remember(id, sessionID string) {
+	if id == "" {
+		return
+	}
+	if _, exists := s.sender[id]; exists {
+		return
+	}
+	if len(s.order) >= supersedeMemory {
+		oldest := s.order[0]
+		s.order = s.order[1:]
+		delete(s.sender, oldest)
+	}
+	s.sender[id] = sessionID
+	s.order = append(s.order, id)
+}
+
+// senderOf reports who sent id, and whether this monitor has seen it at all.
+func (s *senderMemory) senderOf(id string) (sessionID string, seen bool) {
+	sessionID, seen = s.sender[id]
+	return sessionID, seen
+}
+
+// resolveSupersede decides, once and for the rest of a message's delivery,
+// whether its Supersedes claim is real -- and mutates m in place, because
+// everything downstream (Render, bufferDigest, renderDigestLine) simply
+// trusts m.Supersedes from this point on and none of it has the history to
+// check it again. Real means: the named id is one this monitor has itself
+// seen, sent by the exact same session that is sending this message. Render
+// has no log to check that against, which is why this runs here, once, at
+// the moment a message comes off the log, rather than wherever it ends up
+// being shown.
+//
+// An unverifiable or cross-sender claim is wiped so the message behaves
+// exactly like an ordinary one that carries none: accepting it instead is a
+// peer silently cancelling, or relabelling, somebody else's message.
+//
+// A verified claim against a message still sitting in a digest buffer drops
+// that entry outright (see dropSuperseded) and is then wiped too: there is
+// nothing left in the recipient's view to call this message a correction OF
+// -- the original was never shown -- so it is delivered as an ordinary
+// message rather than framed as one. A verified claim against anything else
+// (already pushed, or already flushed out of a digest) is left alone, so
+// Render's correction marker fires wherever this message is actually shown.
+func resolveSupersede(digests map[string]*digestState, mem *senderMemory, m *Message) {
+	if m.Supersedes == "" {
+		return
+	}
+	origSender, seen := mem.senderOf(m.Supersedes)
+	if !seen || origSender == "" || origSender != m.From.SessionID {
+		m.Supersedes = ""
+		return
+	}
+	if dropSuperseded(digests, m.Supersedes) {
+		m.Supersedes = ""
 	}
 }
 

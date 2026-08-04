@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -134,20 +135,28 @@ type Message struct {
 	// Deliberately not resolved to session ids at send time; see the comment
 	// on that in Publish. It is matched against a viewing session at read
 	// time instead, by IsFor.
-	For     []string `json:"for,omitempty"`
-	Payload string   `json:"payload,omitempty"`
-	ReplyTo string   `json:"replyTo,omitempty"`
+	For []string `json:"for,omitempty"`
+	// Supersedes names the id of a message this one replaces. It is honoured
+	// only for messages this monitor has itself seen sent by the same
+	// sender (see resolveSupersede in monitor.go) -- Send and Publish check
+	// only that it is shaped like a real id and not self-referential, since
+	// neither has the delivery-side history needed to check who sent the
+	// original.
+	Supersedes string `json:"supersedes,omitempty"`
+	Payload    string `json:"payload,omitempty"`
+	ReplyTo    string `json:"replyTo,omitempty"`
 }
 
 // Draft is a message being composed. Text is required; everything else is
 // optional and validated before it reaches a spool.
 type Draft struct {
-	Text     string
-	Subject  string
-	Brief    string
-	Priority string
-	For      []string
-	ReplyTo  string
+	Text       string
+	Subject    string
+	Brief      string
+	Priority   string
+	For        []string
+	Supersedes string
+	ReplyTo    string
 }
 
 // IsFor reports whether a topic message is addressed to e: true when m.For is
@@ -299,6 +308,34 @@ func newMessageID() string {
 	return "m_" + hex.EncodeToString(b[:])
 }
 
+// messageIDRe matches exactly what newMessageID produces: "m_" plus 12
+// lowercase hex digits. The fallback branch above (clock-based, used only
+// when crypto/rand fails) does not match this and is deliberately not
+// accepted as a supersede target either -- accepting it would mean guessing
+// whether a caller's "m_..." string is a real id or typed-out text that
+// merely looks like one.
+var messageIDRe = regexp.MustCompile(`^m_[0-9a-f]{12}$`)
+
+// validateSupersedes checks that a draft's Supersedes value, if given, is
+// shaped like a real message id and does not name the message it is on. This
+// is everything Send and Publish can check: neither holds the history needed
+// to know who actually sent the named id, so the one check that matters most
+// -- that only the original sender may supersede a message -- happens later,
+// at delivery time (see resolveSupersede in monitor.go), against messages
+// the monitor has itself seen.
+func validateSupersedes(id, ownID string) (string, error) {
+	if id == "" {
+		return "", nil
+	}
+	if !messageIDRe.MatchString(id) {
+		return "", fmt.Errorf("supersedes %q does not look like a message id (want m_ followed by 12 lowercase hex digits)", id)
+	}
+	if id == ownID {
+		return "", fmt.Errorf("a message may not supersede itself")
+	}
+	return id, nil
+}
+
 // Sanitize flattens text to a single safe line.
 //
 // The notification line is a prompt-injection surface: a sender who can emit
@@ -424,16 +461,23 @@ func (n Namespace) Send(to *Entry, d Draft, from Sender) (*Message, error) {
 		return nil, fmt.Errorf("for is only valid on a topic publish, not a direct send: a direct message already has exactly one recipient")
 	}
 
+	id := newMessageID()
+	supersedes, err := validateSupersedes(d.Supersedes, id)
+	if err != nil {
+		return nil, err
+	}
+
 	msg := &Message{
-		ID:       newMessageID(),
-		TS:       time.Now().UTC().Format(time.RFC3339),
-		From:     from,
-		To:       to.SessionID,
-		Text:     body,
-		Subject:  subject,
-		Brief:    brief,
-		Priority: d.Priority,
-		ReplyTo:  d.ReplyTo,
+		ID:         id,
+		TS:         time.Now().UTC().Format(time.RFC3339),
+		From:       from,
+		To:         to.SessionID,
+		Text:       body,
+		Subject:    subject,
+		Brief:      brief,
+		Priority:   d.Priority,
+		Supersedes: supersedes,
+		ReplyTo:    d.ReplyTo,
 	}
 
 	// Overflow goes to a file the recipient can Read on demand, in the
@@ -525,6 +569,21 @@ func (n Namespace) Render(m *Message, self *Entry) string {
 		marker = " -> you"
 	}
 
+	// correction marks a message that legitimately supersedes another. By
+	// the time Render runs, that check has already happened: Render has no
+	// history to check a "supersedes" claim against, so RunMonitor's
+	// resolveSupersede clears m.Supersedes before this ever sees the message
+	// unless the claim verified. What is left here is trusted the same way
+	// the sentinel comparisons above are -- and the marker itself is a fixed
+	// string chosen by this boolean, never the target id: RenderInbox is the
+	// one place that names an id, because it verifies the claim itself
+	// rather than trusting an upstream mutation (see supersedeLinks).
+	correction := m.Supersedes != ""
+	corrTag := ""
+	if correction {
+		corrTag = " ↺ correction"
+	}
+
 	var prefix string
 	switch {
 	case m.Topic == "":
@@ -532,11 +591,11 @@ func (n Namespace) Render(m *Message, self *Entry) string {
 		if alert {
 			prefix += " !"
 		}
-		prefix += "] message from "
+		prefix += corrTag + "] message from "
 	case global:
-		prefix = "[pigeon " + bang + truncate(Sanitize(m.Topic), maxTopic) + marker + "] from "
+		prefix = "[pigeon " + bang + truncate(Sanitize(m.Topic), maxTopic) + marker + corrTag + "] from "
 	default:
-		prefix = "[pigeon " + bang + "#" + truncate(Sanitize(m.Topic), maxTopic) + marker + "] from "
+		prefix = "[pigeon " + bang + "#" + truncate(Sanitize(m.Topic), maxTopic) + marker + corrTag + "] from "
 	}
 	prefix += truncate(Sanitize(m.From.Display()), maxName)
 

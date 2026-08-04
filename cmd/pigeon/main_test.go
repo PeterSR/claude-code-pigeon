@@ -1103,6 +1103,69 @@ func TestPublishForFlagIsRepeatableAndReachesTheMessage(t *testing.T) {
 	wantContains(t, ir, "stdout", "-> you")
 }
 
+// --supersedes is subject to the same misplaced-flag trap as every other
+// named flag: written after the target/topic, Go's flag package files it
+// away as message text.
+func TestSendRejectsASupersedesFlagWrittenAfterThePositionalArgs(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := cmdSend([]string{"sometarget", "--supersedes", "m_deadbeef1234", "body"}, &out, &errOut)
+	if err == nil {
+		t.Fatal("expected an error for a misplaced --supersedes, got none")
+	}
+	if !strings.Contains(err.Error(), "came after a positional argument") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestPublishRejectsASupersedesFlagWrittenAfterThePositionalArgs(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := cmdPublish([]string{"testtopic", "--supersedes", "m_deadbeef1234", "body"}, &out, &errOut)
+	if err == nil {
+		t.Fatal("expected an error for a misplaced --supersedes, got none")
+	}
+	if !strings.Contains(err.Error(), "came after a positional argument") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// --supersedes reaches the message the same way --subject or --for does:
+// given correctly placed, before the target, it lands on the sent message.
+func TestSendSupersedesFlagReachesTheMessage(t *testing.T) {
+	withHome(t)
+	const alphaID = "aaaa1111-0000-0000-0000-000000000000"
+	asSession(t, alphaID, "alpha")
+	beta := register(t, "bbbb2222-0000-0000-0000-000000000000", "beta")
+
+	original, err := pigeon.Send(beta, pigeon.Draft{Text: "the deploy is stuck"},
+		pigeon.Sender{Kind: "session", SessionID: alphaID, Name: "alpha"})
+	if err != nil {
+		t.Fatalf("Send (original): %v", err)
+	}
+
+	r := invoke(t, "send", "--supersedes", original.ID, "beta", "false alarm, it recovered")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+
+	items, _, err := pigeon.CurrentNamespace().ReadInbox(beta.SessionID, pigeon.InboxQuery{UnreadOnly: false, Limit: 10})
+	if err != nil {
+		t.Fatalf("ReadInbox: %v", err)
+	}
+	var got string
+	found := false
+	for _, it := range items {
+		if it.Message.Text == "false alarm, it recovered" {
+			got, found = it.Message.Supersedes, true
+		}
+	}
+	if !found {
+		t.Fatalf("the sent message was not found in the recipient's inbox: %v", items)
+	}
+	if got != original.ID {
+		t.Errorf("Supersedes = %q, want %q", got, original.ID)
+	}
+}
+
 // --- inbox -------------------------------------------------------------
 
 // The CLI twin of the MCP inbox tool renders the same full body text a

@@ -308,7 +308,7 @@ func TestGlobalTopicsReachEveryNamespace(t *testing.T) {
 		t.Errorf("@ops lives at %q, not in the shared tree", acme.TopicPath("@ops"))
 	}
 
-	liveEntryIn(t, other, "bbbb2222", "beta", "/home/p/web")
+	armedIn(t, other, "bbbb2222", "beta")
 	if err := other.Subscribe("bbbb2222", "@ops"); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}

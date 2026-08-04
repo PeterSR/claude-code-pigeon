@@ -447,9 +447,22 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	num := ns.SubscriberCount(msg.Topic, pigeon.CurrentSessionID())
+	live, deaf := ns.SubscriberBreakdown(msg.Topic, pigeon.CurrentSessionID())
 	fmt.Fprintf(w, "published to %s (%d subscriber(s) besides you)\n",
-		pigeon.TopicLabel(msg.Topic), num)
+		pigeon.TopicLabel(msg.Topic), live)
+	if deaf > 0 {
+		fmt.Fprintf(w, "NOTE: %d subscriber(s) are deaf -- running but not listening. "+
+			"They will only see this if they resume under the same session id.\n", deaf)
+	}
+	if live == 0 {
+		if deaf > 0 {
+			fmt.Fprintln(w, "Nobody is listening right now. The message is on the log, but a "+
+				"claim or a question sent to an empty topic protects nothing.")
+		} else {
+			fmt.Fprintln(w, "Nobody is listening right now, but the message is on the log for "+
+				"anyone who subscribes later.")
+		}
+	}
 	if msg.Payload != "" {
 		fmt.Fprintf(w, "body exceeded %d chars; full text at %s\n", pigeon.BodyBudget, msg.Payload)
 	}

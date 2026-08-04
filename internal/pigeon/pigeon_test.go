@@ -102,6 +102,23 @@ func armed(t *testing.T, id, name string) *Entry {
 	return e
 }
 
+// armedIn is armed in a named namespace, for tests about a genuinely live
+// session outside the default namespace.
+func armedIn(t *testing.T, ns Namespace, id, name string) *Entry {
+	t.Helper()
+	e := liveEntryIn(t, ns, id, name, "/tmp/work")
+	e.HeartbeatAt = nowRFC3339()
+	if err := ns.WriteEntry(e); err != nil {
+		t.Fatalf("WriteEntry: %v", err)
+	}
+	lock, acquired, err := tryExclusive(ns.LockPath(id))
+	if err != nil || !acquired {
+		t.Fatalf("take monitor lock: acquired=%v err=%v", acquired, err)
+	}
+	t.Cleanup(func() { lock.Close() })
+	return e
+}
+
 // mustNS parses a namespace a test wrote itself, where a rejection is a bug in
 // the test rather than a case worth handling.
 func mustNS(t *testing.T, name string) Namespace {
@@ -679,6 +696,44 @@ func TestListTopicsCountsSubscribers(t *testing.T) {
 		}
 	}
 	t.Errorf("%q missing from ListTopics", PublicTopic)
+}
+
+func TestSubscriberCountUnchangedWhenEveryoneIsLive(t *testing.T) {
+	withHome(t)
+	armed(t, "aaaa1111-2222", "alpha")
+	armed(t, "bbbb2222-3333", "beta")
+	if err := Subscribe("aaaa1111-2222", "deploys"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe("bbbb2222-3333", "deploys"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := CurrentNamespace().SubscriberCount("deploys", ""); got != 2 {
+		t.Errorf("SubscriberCount(deploys) = %d, want 2 -- both subscribers are live", got)
+	}
+}
+
+func TestSubscriberBreakdownSeparatesLiveFromDeaf(t *testing.T) {
+	withHome(t)
+	armed(t, "aaaa1111-2222", "alpha")              // live: monitor holds the lock
+	liveEntry(t, "bbbb2222-3333", "beta", "/tmp/b") // deaf: no monitor lock held
+	if err := Subscribe("aaaa1111-2222", "deploys"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe("bbbb2222-3333", "deploys"); err != nil {
+		t.Fatal(err)
+	}
+
+	live, deaf := CurrentNamespace().SubscriberBreakdown("deploys", "")
+	if live != 1 || deaf != 1 {
+		t.Errorf("SubscriberBreakdown(deploys) = (%d, %d), want (1, 1)", live, deaf)
+	}
+	// SubscriberCount must agree with the live half of the breakdown: a deaf
+	// subscriber cannot be told "reached" by either call.
+	if got := CurrentNamespace().SubscriberCount("deploys", ""); got != live {
+		t.Errorf("SubscriberCount(deploys) = %d, want %d (the live count)", got, live)
+	}
 }
 
 // --- follower -------------------------------------------------------------

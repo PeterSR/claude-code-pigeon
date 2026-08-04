@@ -252,6 +252,58 @@ func TestPublishReportsNobodyListening(t *testing.T) {
 	}
 }
 
+// A deaf-only subscriber must not read as "reached": the live count has to
+// exclude it, the deaf note has to name it, and the no-one's-listening
+// wording has to be the accurate one rather than the reassuring one.
+func TestPublishNotesADeafOnlySubscriber(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "aaaa1111-2222")
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+	liveEntry(t, "bbbb2222-3333", "beta", "/tmp/b") // deaf: no monitor lock held
+	if err := Subscribe("bbbb2222-3333", "deploys"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "publish", map[string]any{"topic": "deploys", "text": "shipping"})
+	if !strings.Contains(got, "0 other live session(s)") {
+		t.Errorf("got %q, want the deaf subscriber excluded from the live count", got)
+	}
+	if !strings.Contains(got, "NOTE: 1 subscriber(s) are deaf") {
+		t.Errorf("got %q, want the deaf subscriber called out", got)
+	}
+	if !strings.Contains(got, "protects nothing") {
+		t.Errorf("got %q, want the accurate no-one's-listening wording, not the reassuring one", got)
+	}
+}
+
+// A mix of live and deaf subscribers: the live count and the deaf note both
+// have to show up, and the "nobody is listening" wording must not, since
+// someone genuinely is.
+func TestPublishNotesDeafSubscribersAlongsideLiveOnes(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "aaaa1111-2222")
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+	armed(t, "bbbb2222-3333", "beta")
+	liveEntry(t, "cccc3333-4444", "gamma", "/tmp/c") // deaf: no monitor lock held
+	if err := Subscribe("bbbb2222-3333", "deploys"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe("cccc3333-4444", "deploys"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "publish", map[string]any{"topic": "deploys", "text": "shipping"})
+	if !strings.Contains(got, "1 other live session(s)") {
+		t.Errorf("got %q, want the live subscriber counted", got)
+	}
+	if !strings.Contains(got, "NOTE: 1 subscriber(s) are deaf") {
+		t.Errorf("got %q, want the deaf subscriber called out even though a live one exists", got)
+	}
+	if strings.Contains(got, "Nobody is listening") {
+		t.Errorf("got %q, want no reassurance when a live subscriber exists", got)
+	}
+}
+
 func TestWhoamiOutsideASession(t *testing.T) {
 	withHome(t)
 	t.Setenv(EnvSessionID, "")
@@ -411,7 +463,7 @@ func TestPublishToAGlobalTopicViaMCP(t *testing.T) {
 	t.Setenv(EnvSessionID, "aaaa1111-2222")
 	liveEntryIn(t, mustNS(t, "acme"), "aaaa1111-2222", "alpha", "/home/p/api")
 	other := mustNS(t, "other")
-	liveEntryIn(t, other, "bbbb2222-3333", "beta", "/home/p/web")
+	armedIn(t, other, "bbbb2222-3333", "beta")
 	if err := other.Subscribe("bbbb2222-3333", "@ops"); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}

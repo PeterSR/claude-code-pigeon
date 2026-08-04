@@ -531,14 +531,21 @@ func mcpPublish(ns Namespace, topic, text, subject string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	num := ns.SubscriberCount(topic, CurrentSessionID())
+	live, deaf := ns.SubscriberBreakdown(topic, CurrentSessionID())
 	out := fmt.Sprintf("Published to %s. %d other live session(s) subscribe to it.",
-		TopicLabel(msg.Topic), num)
+		TopicLabel(msg.Topic), live)
 	if strings.HasPrefix(msg.Topic, GlobalPrefix) {
 		out += " That topic is machine-wide, so subscribers in every namespace received it."
 	}
-	if num == 0 {
-		out += " Nobody is listening right now, but the message is on the log for anyone who subscribes later."
+	if deaf > 0 {
+		out += fmt.Sprintf(" NOTE: %d subscriber(s) are deaf -- running but not listening. They will only see this if they resume under the same session id.", deaf)
+	}
+	if live == 0 {
+		if deaf > 0 {
+			out += " Nobody is listening right now. The message is on the log, but a claim or a question sent to an empty topic protects nothing."
+		} else {
+			out += " Nobody is listening right now, but the message is on the log for anyone who subscribes later."
+		}
 	}
 	if msg.Payload != "" {
 		out += fmt.Sprintf(" Body exceeded %d chars, so subscribers got a pointer to %s.", BodyBudget, msg.Payload)

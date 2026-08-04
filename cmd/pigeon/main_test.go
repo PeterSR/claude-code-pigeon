@@ -292,7 +292,11 @@ func TestPublishReportsSubscriberCountExcludingSelf(t *testing.T) {
 	}
 
 	r := invoke(t, "publish", "deploys", "shipping in 5")
-	wantContains(t, r, "stdout", "published to #deploys (1 subscriber(s) besides you)")
+	// beta is deaf (register holds no monitor lock), so it is not counted as
+	// live -- but it must still show up as one deaf subscriber, not two: self
+	// (also deaf, also subscribed) has to stay excluded from that count too.
+	wantContains(t, r, "stdout", "published to #deploys (0 subscriber(s) besides you)")
+	wantContains(t, r, "stdout", "NOTE: 1 subscriber(s) are deaf")
 }
 
 func TestPublishRequiresTopicAndText(t *testing.T) {
@@ -705,8 +709,10 @@ func TestPublishToAGlobalTopic(t *testing.T) {
 	}
 
 	// The subscriber is in another namespace, which is the whole point of "@".
+	// registerIn leaves it deaf, so it is reported as deaf rather than live.
 	r := invoke(t, "publish", "@ops", "all hands")
-	wantContains(t, r, "stdout", "published to @ops (1 subscriber(s) besides you)")
+	wantContains(t, r, "stdout", "published to @ops (0 subscriber(s) besides you)")
+	wantContains(t, r, "stdout", "NOTE: 1 subscriber(s) are deaf")
 
 	r = invoke(t, "topics")
 	wantContains(t, r, "stdout", "@ops")

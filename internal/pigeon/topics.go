@@ -475,32 +475,73 @@ func allSessions() []*Entry {
 	return kept
 }
 
-// SubscriberCount reports how many live sessions besides exceptSessionID would
-// receive a publish to this topic.
-func (n Namespace) SubscriberCount(topic, exceptSessionID string) int {
-	ref, err := ParseTopicRef(topic)
-	if err != nil {
-		return 0
-	}
+// matchingSubscribers returns every entry, besides exceptSessionID, that
+// subscribes to ref. It is the one place that walks the subscriber list, so
+// SubscriberCount and SubscriberBreakdown cannot drift on what counts as
+// "subscribed" -- only on what they do with the entries once found.
+func (n Namespace) matchingSubscribers(ref TopicRef, exceptSessionID string) []*Entry {
 	entries := []*Entry{}
 	if ref.Global {
 		entries = allSessions()
 	} else if got, err := n.ListSessions(false, false); err == nil {
 		entries = got
 	}
-	count := 0
+	var matched []*Entry
 	for _, e := range entries {
 		if e.SessionID == exceptSessionID {
 			continue
 		}
 		for _, t := range e.Subscriptions {
 			if t == ref.String() {
-				count++
+				matched = append(matched, e)
 				break
 			}
 		}
 	}
+	return matched
+}
+
+// SubscriberCount reports how many live sessions besides exceptSessionID would
+// receive a publish to this topic. A deaf one does not count here: its spool
+// still gets the message, but nothing is reading that spool, so it is not part
+// of the number a publisher checks to decide whether a topic is worth writing
+// to right now.
+func (n Namespace) SubscriberCount(topic, exceptSessionID string) int {
+	ref, err := ParseTopicRef(topic)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, e := range n.matchingSubscribers(ref, exceptSessionID) {
+		if e.Status == StatusLive {
+			count++
+		}
+	}
 	return count
+}
+
+// SubscriberBreakdown counts a topic's subscribers by whether they can
+// actually receive. A deaf session is not gone: its spool keeps every message
+// published while it stayed deaf, complete and in order. But nothing reads
+// that spool until the same session id comes back under `claude --resume`,
+// which might be in a minute or might be never -- so folding deaf in with live
+// tells a publisher "reached" about a session that has not actually seen
+// anything yet. Separating the two lets a claim or a question be judged by who
+// is really listening, not by who merely subscribed at some point.
+func (n Namespace) SubscriberBreakdown(topic, exceptSessionID string) (live, deaf int) {
+	ref, err := ParseTopicRef(topic)
+	if err != nil {
+		return 0, 0
+	}
+	for _, e := range n.matchingSubscribers(ref, exceptSessionID) {
+		switch e.Status {
+		case StatusLive:
+			live++
+		case StatusDeaf:
+			deaf++
+		}
+	}
+	return live, deaf
 }
 
 // TopicInfo is one row of `pigeon topics`.

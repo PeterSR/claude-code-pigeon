@@ -45,4 +45,14 @@ func mutateCursors(sessionID string, fn func(map[string]int64)) error {
 
 func TopicPath(topic string) string { return CurrentNamespace().TopicPath(topic) }
 
-func Render(m *Message) string { return CurrentNamespace().Render(m) }
+// Render is variadic in self only here, in the test shim: most callers render
+// generically and do not care who is viewing, and making every one of them
+// spell out a nil would be noise the production Namespace.Render (which does
+// take self as a required, non-variadic argument) does not have to carry.
+func Render(m *Message, self ...*Entry) string {
+	var e *Entry
+	if len(self) > 0 {
+		e = self[0]
+	}
+	return CurrentNamespace().Render(m, e)
+}

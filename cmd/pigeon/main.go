@@ -176,6 +176,17 @@ func checkAs(name string) error {
 	return pigeon.ValidName(name)
 }
 
+// repeatableFlag collects every occurrence of a flag given more than once,
+// e.g. `--for alice --for bob`, since flag.FlagSet has no built-in for that.
+type repeatableFlag []string
+
+func (r *repeatableFlag) String() string { return strings.Join(*r, ",") }
+
+func (r *repeatableFlag) Set(v string) error {
+	*r = append(*r, v)
+	return nil
+}
+
 // namespaceOf resolves a -n value, or this process's own namespace when the
 // flag was not given. A bad name is refused rather than replaced: silently
 // acting on "default" instead of the namespace someone typed is how a message
@@ -423,7 +434,7 @@ func misplacedFlag(rest []string) error {
 			name = name[:i]
 		}
 		switch name {
-		case "subject", "brief", "alert", "n", "namespace", "as":
+		case "subject", "brief", "alert", "for", "n", "namespace", "as":
 			return fmt.Errorf("%q came after a positional argument, so it was read as message text rather than as a flag; put flags before the target and the body", a)
 		}
 	}
@@ -434,11 +445,13 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	fs := flags("publish", stderr)
 	var nsName, asName, subject, brief string
 	var alert bool
+	var forNames repeatableFlag
 	nsFlag(fs, &nsName)
 	asFlag(fs, &asName)
 	fs.StringVar(&subject, "subject", "", "one-line subject, max 120 characters; the only part guaranteed to arrive")
 	fs.StringVar(&brief, "brief", "", "a short summary, max 600 characters; what `pigeon inbox` shows by default")
 	fs.BoolVar(&alert, "alert", false, "mark this urgent: it interrupts work in progress and bypasses a digest. Use it to stop people, not to inform them")
+	fs.Var(&forNames, "for", "session name this message is actually for (repeatable); everyone still receives it, this only marks who should act on it")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -447,7 +460,7 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf("usage: pigeon publish [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] [--alert] <topic> <text>")
+		return fmt.Errorf("usage: pigeon publish [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] [--alert] [--for <name>]... <topic> <text>")
 	}
 	if err := misplacedFlag(rest[1:]); err != nil {
 		return err
@@ -463,7 +476,7 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	msg, err := ns.Publish(topic, pigeon.Draft{Text: text, Subject: subject, Brief: brief, Priority: priority}, pigeon.ActingSender(asName))
+	msg, err := ns.Publish(topic, pigeon.Draft{Text: text, Subject: subject, Brief: brief, Priority: priority, For: forNames}, pigeon.ActingSender(asName))
 	if err != nil {
 		return err
 	}
@@ -630,7 +643,7 @@ func cmdInbox(args []string, w, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, pigeon.RenderInbox(items, more, unreadOnly, detail, "--all"))
+	fmt.Fprintln(w, pigeon.RenderInbox(items, more, unreadOnly, detail, "--all", e))
 	return nil
 }
 

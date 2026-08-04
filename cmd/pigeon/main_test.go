@@ -1023,6 +1023,43 @@ func TestPublishAllowsABodyThatLooksLikeAnUnknownFlag(t *testing.T) {
 	}
 }
 
+// --for is subject to the same misplaced-flag trap as every other named flag:
+// written after the topic, Go's flag package files it away as message text.
+func TestPublishRejectsAForFlagWrittenAfterThePositionalArgs(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := cmdPublish([]string{"testtopic", "--for", "beta", "body"}, &out, &errOut)
+	if err == nil {
+		t.Fatal("expected an error for a misplaced --for, got none")
+	}
+	if !strings.Contains(err.Error(), "came after a positional argument") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// --for is repeatable, and every name given reaches the published message: a
+// recipient the message names sees the "-> you" marker when it pulls its
+// inbox.
+func TestPublishForFlagIsRepeatableAndReachesTheMessage(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+	beta := register(t, "bbbb2222-0000-0000-0000-000000000000", "beta")
+	if err := pigeon.Subscribe(beta.SessionID, "deploys"); err != nil {
+		t.Fatal(err)
+	}
+
+	r := invoke(t, "publish", "--for", "beta", "--for", "gamma", "deploys", "ship it")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+
+	t.Setenv(pigeon.EnvSessionID, beta.SessionID)
+	ir := invoke(t, "inbox")
+	if ir.code != 0 {
+		t.Fatalf("%s", ir)
+	}
+	wantContains(t, ir, "stdout", "-> you")
+}
+
 // --- inbox -------------------------------------------------------------
 
 // The CLI twin of the MCP inbox tool renders the same full body text a
@@ -1042,6 +1079,28 @@ func TestInboxRendersFullBodyAndSubject(t *testing.T) {
 	}
 	wantContains(t, r, "stdout", long)
 	wantContains(t, r, "stdout", "SUBJECT: big one")
+}
+
+// A topic message naming other sessions, but not this one, must render
+// exactly as it always has -- no marker for a session it does not name.
+func TestInboxOmitsTheYouMarkerWhenNotAddressed(t *testing.T) {
+	withHome(t)
+	me := asSession(t, "cccc3333-0000-0000-0000-000000000000", "gamma")
+	if err := pigeon.Subscribe(me.SessionID, "deploys"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pigeon.DefaultNamespace().Publish("deploys",
+		pigeon.Draft{Text: "roll it back", For: []string{"beta"}}, pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	r := invoke(t, "inbox")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	if strings.Contains(r.stdout, "-> you") {
+		t.Errorf("inbox showed the marker for a session the message does not name:\n%s", r.stdout)
+	}
 }
 
 // --peek must not advance the read cursor: a second, default call sees the

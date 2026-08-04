@@ -221,7 +221,13 @@ func Listen(opts ListenOptions, stdout, stderr io.Writer) error {
 					return err
 				}
 			} else {
-				fmt.Fprintln(stdout, ns.Render(m))
+				// sid is "" for an anonymous tail, which has no entry of its own to
+				// match a For list against -- the same as any other unnamed viewer.
+				var self *Entry
+				if sid != "" {
+					self, _ = ns.ReadEntry(sid)
+				}
+				fmt.Fprintln(stdout, ns.Render(m, self))
 			}
 			received++
 			if opts.Count > 0 && received >= opts.Count {

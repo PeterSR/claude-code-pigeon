@@ -124,8 +124,19 @@ type Message struct {
 	// Priority is "" for a normal message or PriorityAlert for the one level
 	// above it. See PriorityAlert's doc comment for why there are only two.
 	Priority string `json:"priority,omitempty"`
-	Payload  string `json:"payload,omitempty"`
-	ReplyTo  string `json:"replyTo,omitempty"`
+	// For names which sessions a topic message is actually aimed at. It is NOT
+	// routing: the message still lands in the topic log in full and still
+	// reaches every subscriber's inbox (see Publish), so the record stays
+	// complete and catch-up/audit are unaffected. It changes only how the
+	// message is presented -- Render, writeInboxItem -- and, once delivery
+	// modes exist, whether it interrupts.
+	//
+	// Deliberately not resolved to session ids at send time; see the comment
+	// on that in Publish. It is matched against a viewing session at read
+	// time instead, by IsFor.
+	For     []string `json:"for,omitempty"`
+	Payload string   `json:"payload,omitempty"`
+	ReplyTo string   `json:"replyTo,omitempty"`
 }
 
 // Draft is a message being composed. Text is required; everything else is
@@ -135,7 +146,32 @@ type Draft struct {
 	Subject  string
 	Brief    string
 	Priority string
+	For      []string
 	ReplyTo  string
+}
+
+// IsFor reports whether a topic message is addressed to e: true when m.For is
+// empty (a message for everyone), or when e answers to one of the named
+// entries -- by its declared name or its short session id, both
+// case-insensitively, the same two handles ResolveTarget accepts as an
+// address.
+func (m *Message) IsFor(e *Entry) bool {
+	if len(m.For) == 0 {
+		return true
+	}
+	if e == nil {
+		return false
+	}
+	short := Short(e.SessionID)
+	for _, f := range m.For {
+		if e.Name != "" && strings.EqualFold(f, e.Name) {
+			return true
+		}
+		if strings.EqualFold(f, short) {
+			return true
+		}
+	}
+	return false
 }
 
 // CurrentSender builds the `from` stamp for this process. Both the MCP server
@@ -381,6 +417,12 @@ func (n Namespace) Send(to *Entry, d Draft, from Sender) (*Message, error) {
 	if err := validatePriority(d.Priority); err != nil {
 		return nil, err
 	}
+	// A direct message already has exactly one recipient -- the target Send
+	// was called with. A second, disagreeing list of names would be a trap:
+	// whichever one a reader believed would sometimes be wrong.
+	if len(d.For) > 0 {
+		return nil, fmt.Errorf("for is only valid on a topic publish, not a direct send: a direct message already has exactly one recipient")
+	}
 
 	msg := &Message{
 		ID:       newMessageID(),
@@ -433,8 +475,12 @@ func (n Namespace) Send(to *Entry, d Draft, from Sender) (*Message, error) {
 // The receiver is a namespace because two of the decisions here depend on
 // where the message landed: which payload directories may be pointed at, and
 // whether the sender is close enough that a bare reply address would reach it.
-
-func (n Namespace) Render(m *Message) string {
+//
+// self is the entry of the session this is being rendered for, so the "->
+// you" marker (see the addressed comment below) can be decided. It may be
+// nil -- a caller that does not know who it is rendering for (or is
+// rendering generically, e.g. in a test) simply gets the un-addressed form.
+func (n Namespace) Render(m *Message, self *Entry) string {
 	// Everything here arrives from a peer, including the fields that look like
 	// metadata: a sender controls its own cwd, name, namespace and topic, and a
 	// spool line could have been written by hand. Sanitise and bound each one
@@ -466,6 +512,19 @@ func (n Namespace) Render(m *Message) string {
 		bang = "!"
 	}
 
+	// addressed marks a topic message that names this session among its For
+	// list -- as opposed to one with no For at all, which is for everyone and
+	// gets no marker. The marker itself is a fixed string chosen by this
+	// boolean, never text built from m.For: For comes off disk and a spool
+	// line can be hand-written, so echoing any of it into the line would let
+	// a hostile entry forge its own bracketed hint the same way a raw
+	// priority value could (see the sentinel comparison above).
+	addressed := m.Topic != "" && len(m.For) > 0 && m.IsFor(self)
+	marker := ""
+	if addressed {
+		marker = " -> you"
+	}
+
 	var prefix string
 	switch {
 	case m.Topic == "":
@@ -475,9 +534,9 @@ func (n Namespace) Render(m *Message) string {
 		}
 		prefix += "] message from "
 	case global:
-		prefix = "[pigeon " + bang + truncate(Sanitize(m.Topic), maxTopic) + "] from "
+		prefix = "[pigeon " + bang + truncate(Sanitize(m.Topic), maxTopic) + marker + "] from "
 	default:
-		prefix = "[pigeon " + bang + "#" + truncate(Sanitize(m.Topic), maxTopic) + "] from "
+		prefix = "[pigeon " + bang + "#" + truncate(Sanitize(m.Topic), maxTopic) + marker + "] from "
 	}
 	prefix += truncate(Sanitize(m.From.Display()), maxName)
 

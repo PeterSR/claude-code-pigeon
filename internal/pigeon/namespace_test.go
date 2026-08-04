@@ -441,7 +441,7 @@ func TestRenderAcceptsOwnAndSharedPayloadsOnly(t *testing.T) {
 	shared := filepath.Join(SharedPayloadsDir(), "m_def.txt")
 	for _, good := range []string{ours, shared} {
 		m := &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "hi", Payload: good}
-		if got := acme.Render(m); !strings.Contains(got, good) {
+		if got := acme.Render(m, nil); !strings.Contains(got, good) {
 			t.Errorf("Render dropped a pointer it should follow (%s): %s", good, got)
 		}
 	}
@@ -453,7 +453,7 @@ func TestRenderAcceptsOwnAndSharedPayloadsOnly(t *testing.T) {
 		"relative.txt",
 	} {
 		m := &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "hi", Payload: bad}
-		if got := acme.Render(m); strings.Contains(got, bad) {
+		if got := acme.Render(m, nil); strings.Contains(got, bad) {
 			t.Errorf("Render surfaced a foreign payload path %q: %s", bad, got)
 		}
 	}
@@ -473,7 +473,7 @@ func TestGlobalTopicPayloadsGoToTheSharedDirectory(t *testing.T) {
 	if filepath.Dir(msg.Payload) != SharedPayloadsDir() {
 		t.Fatalf("payload went to %q, want the shared directory", filepath.Dir(msg.Payload))
 	}
-	if got := other.Render(msg); !strings.Contains(got, msg.Payload) {
+	if got := other.Render(msg, nil); !strings.Contains(got, msg.Payload) {
 		t.Errorf("a subscriber in another namespace cannot follow the pointer:\n%s", got)
 	}
 
@@ -536,7 +536,7 @@ func TestRenderNamesTheSenderNamespaceOnlyWhenItMatters(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := acme.Render(c.msg)
+			got := acme.Render(c.msg, nil)
 			if has := strings.Contains(got, "[ns: "); has != c.wantNS {
 				t.Errorf("namespace shown = %v, want %v: %s", has, c.wantNS, got)
 			}
@@ -553,8 +553,8 @@ func TestRenderNamesTheSenderNamespaceOnlyWhenItMatters(t *testing.T) {
 func TestRenderMarksAGlobalTopicDifferently(t *testing.T) {
 	withHome(t)
 	ns := mustNS(t, "acme")
-	global := ns.Render(&Message{From: Sender{Kind: "shell", Name: "sh"}, Topic: "@ops", Text: "x"})
-	local := ns.Render(&Message{From: Sender{Kind: "shell", Name: "sh"}, Topic: "ops", Text: "x"})
+	global := ns.Render(&Message{From: Sender{Kind: "shell", Name: "sh"}, Topic: "@ops", Text: "x"}, nil)
+	local := ns.Render(&Message{From: Sender{Kind: "shell", Name: "sh"}, Topic: "ops", Text: "x"}, nil)
 	if !strings.Contains(global, "[pigeon @ops]") {
 		t.Errorf("global topic rendered as %q", global)
 	}
@@ -580,7 +580,7 @@ func TestRenderBoundsAHostileSenderNamespace(t *testing.T) {
 		},
 		Text: strings.Repeat("z", 4000),
 	}
-	got := ns.Render(m)
+	got := ns.Render(m, nil)
 	if strings.ContainsAny(got, "<>") {
 		t.Fatalf("Render leaked structural characters from the namespace: %q", got)
 	}
@@ -618,11 +618,11 @@ func TestCrossNamespaceSendLandsInTheRecipientsTree(t *testing.T) {
 	if filepath.Dir(msg.Payload) != other.PayloadsDir() {
 		t.Errorf("payload went to %q, want the recipient's directory", filepath.Dir(msg.Payload))
 	}
-	if got := other.Render(msg); !strings.Contains(got, msg.Payload) {
+	if got := other.Render(msg, nil); !strings.Contains(got, msg.Payload) {
 		t.Errorf("the recipient cannot follow its own payload pointer:\n%s", got)
 	}
 	// And the reply has to say where to send it, or it goes nowhere.
-	if got := other.Render(msg); !strings.Contains(got, "pigeon send -n acme alpha") {
+	if got := other.Render(msg, nil); !strings.Contains(got, "pigeon send -n acme alpha") {
 		t.Errorf("the reply hint does not name the sender's namespace:\n%s", got)
 	}
 }

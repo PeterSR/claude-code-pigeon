@@ -162,7 +162,15 @@ func tools() []toolDef {
 							"decide whether to read the rest. Max 600 characters. Readers see " +
 							"this by default, so write it as if it is all they will read.",
 					}),
-					"priority":  priorityArg(),
+					"priority": priorityArg(),
+					"for": obj(map[string]any{
+						"type":  "array",
+						"items": obj(map[string]any{"type": "string"}),
+						"description": "Session names this message is actually for. Everyone " +
+							"still receives it and it stays in the topic log; naming people marks " +
+							"who should act on it, and later lets everyone else keep it out of " +
+							"their notifications. Omit when it genuinely concerns everybody.",
+					}),
 					"namespace": namespaceArg("publish into"),
 				}),
 				"required": []string{"topic", "text"},
@@ -459,12 +467,13 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		return mcpSend(ns, a.To, a.Text, a.Subject, a.Brief, priority)
 	case "publish":
 		var a struct {
-			Topic     string `json:"topic"`
-			Text      string `json:"text"`
-			Subject   string `json:"subject"`
-			Brief     string `json:"brief"`
-			Priority  string `json:"priority"`
-			Namespace string `json:"namespace"`
+			Topic     string   `json:"topic"`
+			Text      string   `json:"text"`
+			Subject   string   `json:"subject"`
+			Brief     string   `json:"brief"`
+			Priority  string   `json:"priority"`
+			For       []string `json:"for"`
+			Namespace string   `json:"namespace"`
 		}
 		_ = json.Unmarshal(raw, &a)
 		ns, err := mcpNamespace(a.Namespace)
@@ -475,7 +484,7 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return mcpPublish(ns, a.Topic, a.Text, a.Subject, a.Brief, priority)
+		return mcpPublish(ns, a.Topic, a.Text, a.Subject, a.Brief, priority, a.For)
 	case "subscribe", "unsubscribe":
 		var a struct {
 			Topic     string `json:"topic"`
@@ -617,11 +626,11 @@ func mcpSend(ns Namespace, to, text, subject, brief, priority string) (string, e
 	return b.String(), nil
 }
 
-func mcpPublish(ns Namespace, topic, text, subject, brief, priority string) (string, error) {
+func mcpPublish(ns Namespace, topic, text, subject, brief, priority string, forNames []string) (string, error) {
 	if strings.TrimSpace(topic) == "" || strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("both 'topic' and 'text' are required")
 	}
-	msg, err := ns.Publish(topic, Draft{Text: text, Subject: subject, Brief: brief, Priority: priority}, CurrentSender())
+	msg, err := ns.Publish(topic, Draft{Text: text, Subject: subject, Brief: brief, Priority: priority, For: forNames}, CurrentSender())
 	if err != nil {
 		return "", err
 	}
@@ -763,7 +772,7 @@ func mcpInbox(raw json.RawMessage) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return RenderInbox(items, more, unreadOnly, detail, "unread_only: false"), nil
+	return RenderInbox(items, more, unreadOnly, detail, "unread_only: false", e), nil
 }
 
 func mcpWhoami() (string, error) {

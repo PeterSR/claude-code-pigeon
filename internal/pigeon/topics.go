@@ -35,6 +35,47 @@ const GlobalPublicTopic = GlobalPrefix + PublicTopic
 
 var topicRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
+// forMaxEntries caps how many names a topic message's For may list. Eight is
+// generous for "the people who should act on this" and stingy for "the
+// people I am cc-ing", which is the distinction For exists to force.
+const forMaxEntries = 8
+
+// forNameLimit caps each For entry, in runes. Names are addresses (see
+// ValidName), which top out at 32; 64 leaves room for a name typed slightly
+// wrong without inviting a paragraph in what is meant to be a short list.
+const forNameLimit = 64
+
+// validateFor sanitises and bounds a topic message's For list the same way
+// validateBounded does for subject/brief: rejected outright rather than
+// silently trimmed or dropped, so a sender can trust that what was typed is
+// what was stored. Empties are dropped rather than rejected -- a stray blank
+// in a list is noise, not a claim about a recipient -- and the result is
+// deduplicated case-insensitively so "alice" and "Alice" cost one slot, not
+// two.
+func validateFor(names []string) ([]string, error) {
+	seen := map[string]bool{}
+	var out []string
+	for _, raw := range names {
+		v := strings.TrimSpace(Sanitize(raw))
+		if v == "" {
+			continue
+		}
+		if n := len([]rune(v)); n > forNameLimit {
+			return nil, fmt.Errorf("for entry %q is %d runes; the limit is %d", v, n, forNameLimit)
+		}
+		key := strings.ToLower(v)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, v)
+	}
+	if len(out) > forMaxEntries {
+		return nil, fmt.Errorf("for names %d sessions; the limit is %d", len(out), forMaxEntries)
+	}
+	return out, nil
+}
+
 // inboxCursorKey tracks how far the direct spool has been read. It is not a
 // valid topic name, so it can never collide with one.
 const inboxCursorKey = ":inbox"
@@ -273,6 +314,10 @@ func (n Namespace) Publish(topic string, d Draft, from Sender) (*Message, error)
 	if err := validatePriority(d.Priority); err != nil {
 		return nil, err
 	}
+	for_, err := validateFor(d.For)
+	if err != nil {
+		return nil, err
+	}
 
 	msg := &Message{
 		ID:       newMessageID(),
@@ -283,6 +328,17 @@ func (n Namespace) Publish(topic string, d Draft, from Sender) (*Message, error)
 		Subject:  subject,
 		Brief:    brief,
 		Priority: d.Priority,
+		// Stored as the sender typed it, not resolved to a session id here.
+		// A name is only unique among sessions live *right now*; the same
+		// name read back later -- a catch-up pull, a --all browse, another
+		// subscriber's monitor a minute from now -- can by then belong to a
+		// different session, or to nobody at all. Resolving early would bake
+		// in whichever session happened to answer to the name at publish
+		// time and silently misattribute the marker forever after. Matching
+		// the typed name against each reader at the moment they look (see
+		// Message.IsFor) is the only version of this that stays honest as
+		// the set of live sessions changes underneath the log.
+		For: for_,
 	}
 	if len([]rune(body)) > BodyBudget {
 		p := filepath.Join(ref.payloadsDir(n), msg.ID+".txt")

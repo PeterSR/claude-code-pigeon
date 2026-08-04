@@ -456,7 +456,7 @@ func TestRenderKeepsThePayloadPointerWhenSpaceIsTight(t *testing.T) {
 				Payload: payload,
 			}
 
-			got := ns.Render(m)
+			got := ns.Render(m, nil)
 			if n := len([]rune(got)); n > RenderBudget {
 				t.Errorf("line is %d runes, over the %d budget:\n%s", n, RenderBudget, got)
 			}
@@ -502,7 +502,7 @@ func TestRenderKeepsTheSubjectWhenSpaceIsTight(t *testing.T) {
 				Subject: subject,
 			}
 
-			got := ns.Render(m)
+			got := ns.Render(m, nil)
 			if n := len([]rune(got)); n > RenderBudget {
 				t.Errorf("line is %d runes, over the %d budget:\n%s", n, RenderBudget, got)
 			}
@@ -528,7 +528,7 @@ func TestRenderKeepsEveryHintWhenThereIsRoom(t *testing.T) {
 		Topic: "deploys",
 		Text:  "short",
 	}
-	got := ns.Render(m)
+	got := ns.Render(m, nil)
 	for _, want := range []string{"[reply: pigeon send alpha]", "[topic: pigeon publish deploys]", ":: short"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q:\n%s", want, got)

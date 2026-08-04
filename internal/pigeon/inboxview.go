@@ -44,7 +44,12 @@ func ResolveInboxDetail(s string) (string, error) {
 // Newest message is printed LAST: ReadInbox already returns items oldest
 // first, so the text a caller most likely needs next sits closest to the end
 // of the output, nearest the model's next token.
-func RenderInbox(items []InboxItem, more int, unreadOnly bool, detail, hint string) string {
+//
+// self is the viewing session's own entry, used only to decide whether a
+// topic message's For list names it (see writeInboxItem); it plays no part
+// in what ReadInbox already selected. It may be nil for a caller that cannot
+// resolve its own identity, which simply turns the marker off.
+func RenderInbox(items []InboxItem, more int, unreadOnly bool, detail, hint string, self *Entry) string {
 	if len(items) == 0 {
 		if unreadOnly {
 			return fmt.Sprintf("No unread messages. Pass %s to see recent history.", hint)
@@ -56,7 +61,7 @@ func RenderInbox(items []InboxItem, more int, unreadOnly bool, detail, hint stri
 	b.WriteString(inboxSummary(items, unreadOnly))
 	b.WriteByte('\n')
 	for _, it := range items {
-		writeInboxItem(&b, it, detail)
+		writeInboxItem(&b, it, detail, self)
 	}
 	// Without this a session that pulls ten of sixty unread reads the batch as
 	// the whole backlog and stops, which is the quiet half of a message never
@@ -138,7 +143,12 @@ func inboxSummary(items []InboxItem, unreadOnly bool) string {
 // Sanitize flattens to one line, which is right for the header fields. Bodies
 // may legitimately be long, so they are indented instead: every continuation
 // line is pushed inside the item block, where it cannot impersonate a header.
-func writeInboxItem(b *strings.Builder, it InboxItem, detail string) {
+//
+// self is the viewing session's own entry (nil if unknown); it decides only
+// whether "-> you" appears, never what text does -- the same bound-the-marker
+// rule Render follows, because For is exactly as peer-controlled here as it
+// is there.
+func writeInboxItem(b *strings.Builder, it InboxItem, detail string, self *Entry) {
 	ts := "?"
 	if t, err := time.Parse(time.RFC3339, it.Message.TS); err == nil {
 		ts = t.Local().Format("15:04")
@@ -147,6 +157,9 @@ func writeInboxItem(b *strings.Builder, it InboxItem, detail string) {
 	if it.Source != "" {
 		// Direct messages show no topic column: there is nothing to name.
 		fmt.Fprintf(b, "  %s", TopicLabel(it.Source))
+	}
+	if it.Message.Topic != "" && len(it.Message.For) > 0 && it.Message.IsFor(self) {
+		b.WriteString("  -> you")
 	}
 	fmt.Fprintf(b, "  (%s)\n", formatAge(it.Age))
 	if it.Message.Subject != "" {

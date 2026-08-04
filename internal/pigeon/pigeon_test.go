@@ -873,7 +873,7 @@ func TestFollowSourceRecoversFromTruncation(t *testing.T) {
 func TestRateLimiterSuppressesFloods(t *testing.T) {
 	withHome(t)
 	var sb strings.Builder
-	emit, _ := newRateLimiter(&sb, DefaultNamespace(), "/tmp/spool", time.Minute)
+	emit, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute)
 	for i := 0; i < maxPerMinute+25; i++ {
 		emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "line"})
 	}
@@ -892,7 +892,7 @@ func TestRateLimiterNamesTheLogASuppressedMessageIsIn(t *testing.T) {
 	withHome(t)
 	ns := DefaultNamespace()
 	var sb strings.Builder
-	emit, flush := newRateLimiter(&sb, ns, ns.SpoolPath("aaaa1111"), time.Minute)
+	emit, flush := newRateLimiter(&sb, ns, "", ns.SpoolPath("aaaa1111"), time.Minute)
 
 	// Fill exactly the normal-traffic budget with direct messages, then
 	// suppress a topic message.
@@ -919,7 +919,7 @@ func TestRateLimiterNamesTheLogASuppressedMessageIsIn(t *testing.T) {
 func TestAlertSurvivesAFloodThatExhaustsTheNormalBudget(t *testing.T) {
 	withHome(t)
 	var sb strings.Builder
-	emit, _ := newRateLimiter(&sb, DefaultNamespace(), "/tmp/spool", time.Minute)
+	emit, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute)
 
 	// Exhaust the normal-traffic budget and then some, so the flood alone
 	// would already be past what a plain cap could ever admit.
@@ -940,7 +940,7 @@ func TestAlertSurvivesAFloodThatExhaustsTheNormalBudget(t *testing.T) {
 func TestSuppressionNoticeDistinguishesAlertsFromNormalMessages(t *testing.T) {
 	withHome(t)
 	var sb strings.Builder
-	emit, flush := newRateLimiter(&sb, DefaultNamespace(), "/tmp/spool", time.Minute)
+	emit, flush := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute)
 
 	// Fill the normal-traffic budget, then spend the whole alert reserve too,
 	// so both a normal message and an alert have nowhere left in the window.

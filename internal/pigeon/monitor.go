@@ -151,7 +151,7 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	// for this session should survive until a monitor actually reads it.
 	defer ns.RemoveEntry(sid)
 
-	emit, flushSuppressed := newRateLimiter(stdout, ns, spool, time.Minute)
+	emit, flushSuppressed := newRateLimiter(stdout, ns, sid, spool, time.Minute)
 	defer flushSuppressed()
 	for {
 		select {
@@ -613,7 +613,11 @@ const alertReserve = 10
 // The notice is per source. It used to name the direct spool for everything,
 // so a suppressed topic message pointed the recipient at a file it had never
 // been in -- the one recovery hint they get, aimed somewhere useless.
-func newRateLimiter(w io.Writer, ns Namespace, spool string, window time.Duration) (emit func(*Message), flush func()) {
+// sid is this session's own id, re-read into an *Entry on every emitted line
+// rather than captured once, so a For marker reflects a name declared (or
+// changed) via set_identity partway through the session's life instead of
+// whatever it was when the monitor armed.
+func newRateLimiter(w io.Writer, ns Namespace, sid, spool string, window time.Duration) (emit func(*Message), flush func()) {
 	windowStart := time.Now()
 	count := 0
 	// Suppression is tracked separately for alerts and normal traffic, per
@@ -665,7 +669,8 @@ func newRateLimiter(w io.Writer, ns Namespace, spool string, window time.Duratio
 			return
 		}
 		count++
-		fmt.Fprintln(w, ns.Render(m))
+		self, _ := ns.ReadEntry(sid)
+		fmt.Fprintln(w, ns.Render(m, self))
 	}
 	return emit, flush
 }

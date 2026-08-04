@@ -29,6 +29,15 @@ const BodyBudget = 300
 // order to read an overflowing message.
 const RenderBudget = 460
 
+// SubjectLimit caps a message's subject line, in runes. validateSubject
+// rejects an oversize subject at send time rather than truncating it: the
+// subject is the one part of a message guaranteed to reach the recipient (see
+// Render), so cutting it silently would leave the sender believing a shorter
+// line arrived intact when it did not. Render enforces the same bound again,
+// independently, because a spool line can be hand-written and never pass
+// through validateSubject at all.
+const SubjectLimit = 120
+
 // Sender identifies who sent a message. Stamped automatically -- a session
 // never has to state its own address, so replies always have somewhere to go.
 type Sender struct {
@@ -77,8 +86,17 @@ type Message struct {
 	To      string `json:"to,omitempty"`
 	Topic   string `json:"topic,omitempty"`
 	Text    string `json:"text"`
+	Subject string `json:"subject,omitempty"`
 	Payload string `json:"payload,omitempty"`
 	ReplyTo string `json:"replyTo,omitempty"`
+}
+
+// Draft is a message being composed. Text is required; everything else is
+// optional and validated before it reaches a spool.
+type Draft struct {
+	Text    string
+	Subject string
+	ReplyTo string
 }
 
 // CurrentSender builds the `from` stamp for this process. Both the MCP server
@@ -264,20 +282,52 @@ func truncate(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
+// validateSubject sanitises a subject line and enforces SubjectLimit,
+// rejecting an oversize subject outright rather than truncating it -- the
+// same reasoning as SubjectLimit's own comment. An empty subject after
+// sanitising is not an error: it simply means none was given. Shared by Send
+// and Publish so the rule cannot drift between the two paths.
+func validateSubject(s string) (string, error) {
+	subj := Sanitize(s)
+	if n := len([]rune(subj)); n > SubjectLimit {
+		return "", fmt.Errorf("subject is %d runes; the limit is %d", n, SubjectLimit)
+	}
+	return subj, nil
+}
+
+// SubjectNudge returns a hint to append to a send/publish confirmation when
+// the message left with no subject and a body long enough that the recipient
+// only ever sees a truncated prefix of it. Without this the sender has no way
+// to learn that; the confirmation is the only signal it gets back at all.
+func SubjectNudge(msg *Message) string {
+	if msg.Subject != "" {
+		return ""
+	}
+	if n := len([]rune(msg.Text)); n > BodyBudget {
+		return fmt.Sprintf("\nNo subject given, and the body is %d chars -- recipients see a prefix cut at %d. A subject would let them triage it.",
+			n, BodyBudget)
+	}
+	return ""
+}
+
 // Send appends one message to the target's spool and returns it. The namespace
 // is the recipient's, not the sender's: a cross-namespace send has to land in
 // the inbox the recipient's monitor is actually following.
-func Send(to *Entry, text string, from Sender, replyTo string) (*Message, error) {
-	return CurrentNamespace().Send(to, text, from, replyTo)
+func Send(to *Entry, d Draft, from Sender) (*Message, error) {
+	return CurrentNamespace().Send(to, d, from)
 }
 
-func (n Namespace) Send(to *Entry, text string, from Sender, replyTo string) (*Message, error) {
+func (n Namespace) Send(to *Entry, d Draft, from Sender) (*Message, error) {
 	if err := n.EnsureDirs(); err != nil {
 		return nil, err
 	}
-	body := Sanitize(text)
+	body := Sanitize(d.Text)
 	if body == "" {
 		return nil, fmt.Errorf("refusing to send an empty message")
+	}
+	subject, err := validateSubject(d.Subject)
+	if err != nil {
+		return nil, err
 	}
 
 	msg := &Message{
@@ -286,7 +336,8 @@ func (n Namespace) Send(to *Entry, text string, from Sender, replyTo string) (*M
 		From:    from,
 		To:      to.SessionID,
 		Text:    body,
-		ReplyTo: replyTo,
+		Subject: subject,
+		ReplyTo: d.ReplyTo,
 	}
 
 	// Overflow goes to a file the recipient can Read on demand, in the
@@ -294,7 +345,7 @@ func (n Namespace) Send(to *Entry, text string, from Sender, replyTo string) (*M
 	// anywhere else.
 	if len([]rune(body)) > BodyBudget {
 		p := filepath.Join(n.PayloadsDir(), msg.ID+".txt")
-		if err := os.WriteFile(p, []byte(text), 0o600); err == nil {
+		if err := os.WriteFile(p, []byte(d.Text), 0o600); err == nil {
 			msg.Payload = p
 		}
 	}
@@ -335,10 +386,11 @@ func (n Namespace) Render(m *Message) string {
 	// spool line could have been written by hand. Sanitise and bound each one
 	// rather than trusting that it was checked on the way in.
 	const (
-		maxName  = 40
-		maxWhere = 32
-		maxTopic = 33 // one more than a topic name, for the "@" of a global one
-		maxNS    = 32
+		maxName    = 40
+		maxWhere   = 32
+		maxTopic   = 33 // one more than a topic name, for the "@" of a global one
+		maxNS      = 32
+		maxSubject = SubjectLimit
 	)
 
 	// The "@" is presentation here rather than a path decision, so a hostile
@@ -411,11 +463,23 @@ func (n Namespace) Render(m *Message) string {
 		}
 	}
 
+	// The subject sits in the never-dropped class alongside the payload
+	// pointer: send-time validation already bounds it to SubjectLimit, but a
+	// spool line can be hand-written and never pass through that check, so it
+	// is sanitised and bounded again here regardless of where the message came
+	// from -- the same reasoning that already applies to name/cwd/topic/
+	// namespace above.
+	subject := truncate(Sanitize(m.Subject), maxSubject)
+
 	// A body spilled to a file is recoverable from the pointer, so it may be
-	// squeezed to nothing. One that was not spilled is all the recipient will
-	// ever get, so keep a readable minimum and give up something else instead.
+	// squeezed to nothing. A subject makes the same case for a different
+	// reason: it is itself a readable minimum, so a long one must not force
+	// every rung of the ladder below to give up the reply address just to
+	// protect a body that already has a substitute. A message with neither is
+	// all the recipient will ever get, so only then keep a readable minimum
+	// for the body and give up something else instead.
 	minBody := 24
-	if payload != "" {
+	if payload != "" || subject != "" {
 		minBody = 0
 	}
 
@@ -433,6 +497,12 @@ func (n Namespace) Render(m *Message) string {
 		give()
 		head := prefix + where + nsTag
 		room := RenderBudget - len([]rune(head)) - len([]rune(payload+reply+topicHint)) - 4
+		if subject != "" {
+			// Reserved unconditionally, unlike the body's speculative 4
+			// characters above: the subject is never dropped, so this
+			// allowance is always spent, never merely offered.
+			room -= 4 + len([]rune(subject))
+		}
 		if room < minBody {
 			continue
 		}
@@ -443,15 +513,32 @@ func (n Namespace) Render(m *Message) string {
 			room = 0
 		}
 		body := truncate(Sanitize(m.Text), room)
-		if body == "" {
+		switch {
+		case body == "" && subject == "":
 			return head + payload + reply + topicHint
+		case body == "":
+			return head + " :: " + subject + payload + reply + topicHint
+		case subject == "":
+			return head + " :: " + body + payload + reply + topicHint
+		default:
+			return head + " :: " + subject + " :: " + body + payload + reply + topicHint
 		}
-		return head + " :: " + body + payload + reply + topicHint
 	}
 
 	// Everything droppable is gone and it still does not fit, which needs a
 	// pathological state path. The pointer is the only part with no substitute,
 	// so give up the header for it before giving up any of it.
+	//
+	// The subject is never-dropped everywhere above, and this is the one place
+	// that claim weakens: reaching here needs a payload path long enough to
+	// exhaust the budget by itself, which a deep enough home directory
+	// supplies, and by then there may be no room for anything else. Keep the
+	// subject where it still fits -- a line saying who sent it and what it
+	// says beats one saying only who sent it -- but never at the pointer's
+	// expense, because the pointer is the only part with no substitute.
+	if subject != "" && len([]rune(prefix+" :: "+subject+payload)) <= RenderBudget {
+		return prefix + " :: " + subject + payload
+	}
 	if len([]rune(prefix+payload)) <= RenderBudget {
 		return prefix + payload
 	}

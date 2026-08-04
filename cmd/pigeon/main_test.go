@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -723,7 +724,7 @@ func TestTopicsAcrossNamespaces(t *testing.T) {
 	if err := other.Subscribe(beta.SessionID, "secrets"); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
-	if _, err := other.Publish("@ops", "all hands", pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := other.Publish("@ops", pigeon.Draft{Text: "all hands"}, pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 
@@ -980,5 +981,38 @@ func TestSendPublishRejectBadAs(t *testing.T) {
 	}
 	if r := invoke(t, "publish", "--as", "bad name", "all", "hi"); r.code == 0 {
 		t.Errorf("publish with a bad --as should fail: %s", r)
+	}
+}
+
+// A flag written after the topic is swallowed by Go's flag package as message
+// text. Silently dropping a subject the caller clearly meant to set is the
+// failure mode this guard exists to convert into an error.
+func TestPublishRejectsAFlagWrittenAfterThePositionalArgs(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := cmdPublish([]string{"testtopic", "--subject", "SHORT", "body"}, &out, &errOut)
+	if err == nil {
+		t.Fatal("expected an error for a misplaced --subject, got none")
+	}
+	if !strings.Contains(err.Error(), "came after a positional argument") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSendRejectsAFlagWrittenAfterThePositionalArgs(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := cmdSend([]string{"sometarget", "--as", "someone", "body"}, &out, &errOut)
+	if err == nil {
+		t.Fatal("expected an error for a misplaced --as, got none")
+	}
+	if !strings.Contains(err.Error(), "came after a positional argument") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// A body may legitimately begin with a dash; only names pigeon actually
+// defines are rejected.
+func TestPublishAllowsABodyThatLooksLikeAnUnknownFlag(t *testing.T) {
+	if err := misplacedFlag([]string{"--not-a-pigeon-flag", "text"}); err != nil {
+		t.Fatalf("unexpected rejection: %v", err)
 	}
 }

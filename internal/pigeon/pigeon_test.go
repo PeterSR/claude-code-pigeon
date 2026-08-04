@@ -202,7 +202,7 @@ func TestSendRoundTrip(t *testing.T) {
 	to := liveEntry(t, "bbbb2222-3333", "beta", "/tmp/y")
 
 	from := Sender{Kind: "session", SessionID: "aaaa1111-2222", Name: "alpha"}
-	msg, err := Send(to, "the build is green", from, "")
+	msg, err := Send(to, Draft{Text: "the build is green"}, from)
 	if err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -226,8 +226,42 @@ func TestSendRoundTrip(t *testing.T) {
 func TestSendRejectsEmpty(t *testing.T) {
 	withHome(t)
 	to := liveEntry(t, "cccc3333-4444", "", "/tmp/z")
-	if _, err := Send(to, "   \n\t ", Sender{Kind: "shell"}, ""); err == nil {
+	if _, err := Send(to, Draft{Text: "   \n\t "}, Sender{Kind: "shell"}); err == nil {
 		t.Fatal("expected an error for a whitespace-only message")
+	}
+}
+
+// A subject is rejected outright rather than truncated: the whole point of
+// SubjectLimit is that the sender can trust the subject arrived exactly as
+// written, which a silent truncation would break just as much as an
+// unenforced limit would.
+func TestSendRejectsAnOversizeSubject(t *testing.T) {
+	withHome(t)
+	to := liveEntry(t, "cccc3333-5555", "", "/tmp/z2")
+	over := strings.Repeat("s", SubjectLimit+1)
+	_, err := Send(to, Draft{Text: "hello", Subject: over}, Sender{Kind: "shell", Name: "sh"})
+	if err == nil {
+		t.Fatal("expected an error for a subject over the limit")
+	}
+	if !strings.Contains(err.Error(), "121") || !strings.Contains(err.Error(), "120") {
+		t.Errorf("error should name both the actual and allowed length: %v", err)
+	}
+	// A rejected draft must leave no trace: a half-sent message with a
+	// truncated subject would be worse than an outright refusal.
+	if _, err := os.Stat(SpoolPath(to.SessionID)); !os.IsNotExist(err) {
+		t.Error("Send wrote to the spool despite rejecting the subject")
+	}
+}
+
+func TestPublishRejectsAnOversizeSubject(t *testing.T) {
+	withHome(t)
+	over := strings.Repeat("s", SubjectLimit+1)
+	_, err := Publish("deploys", Draft{Text: "shipped", Subject: over}, Sender{Kind: "shell", Name: "sh"})
+	if err == nil {
+		t.Fatal("expected an error for a subject over the limit")
+	}
+	if !strings.Contains(err.Error(), "121") || !strings.Contains(err.Error(), "120") {
+		t.Errorf("error should name both the actual and allowed length: %v", err)
 	}
 }
 
@@ -240,7 +274,7 @@ func TestSendConcurrentWritersDoNotInterleave(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func() {
 			defer func() { done <- struct{}{} }()
-			_, _ = Send(to, strings.Repeat("x", 100), Sender{Kind: "shell", Name: "sh"}, "")
+			_, _ = Send(to, Draft{Text: strings.Repeat("x", 100)}, Sender{Kind: "shell", Name: "sh"})
 		}()
 	}
 	for i := 0; i < n; i++ {
@@ -267,7 +301,7 @@ func TestOversizeBodySpillsToPayload(t *testing.T) {
 	to := liveEntry(t, "eeee5555-6666", "", "/tmp/v")
 
 	long := strings.Repeat("a", BodyBudget*3)
-	msg, err := Send(to, long, Sender{Kind: "shell", Name: "sh"}, "")
+	msg, err := Send(to, Draft{Text: long}, Sender{Kind: "shell", Name: "sh"})
 	if err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -319,6 +353,22 @@ func TestRenderOmitsReplyForShellSender(t *testing.T) {
 	m := &Message{From: Sender{Kind: "shell", Name: "shell:p@h"}, Text: "hi"}
 	if got := Render(m); strings.Contains(got, "reply:") {
 		t.Errorf("Render() offered a reply handle to a shell sender: %q", got)
+	}
+}
+
+// A message with no subject must render byte-identical to how it always
+// has: subject support has to be additive, not a reformatting of the
+// ordinary case nobody asked to change.
+func TestRenderWithoutSubjectMatchesTheOriginalFormat(t *testing.T) {
+	m := &Message{
+		From:  Sender{Kind: "session", SessionID: "aaaa1111-2222", Name: "alpha", Cwd: "/home/p/api"},
+		Topic: "deploys",
+		Text:  "v2.1 rolled out",
+	}
+	got := Render(m)
+	want := "[pigeon #deploys] from alpha (api) :: v2.1 rolled out [reply: pigeon send alpha] [topic: pigeon publish deploys]"
+	if got != want {
+		t.Errorf("Render() = %q, want %q -- adding Subject changed the no-subject format", got, want)
 	}
 }
 
@@ -520,10 +570,10 @@ func TestValidTopic(t *testing.T) {
 func TestPublishAppendsToTopicLog(t *testing.T) {
 	withHome(t)
 	from := Sender{Kind: "session", SessionID: "aaaa1111-2222", Name: "alpha"}
-	if _, err := Publish("deploys", "v1 shipped", from); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "v1 shipped"}, from); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
-	if _, err := Publish("deploys", "v2 shipped", from); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "v2 shipped"}, from); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 
@@ -546,7 +596,7 @@ func TestPublishAppendsToTopicLog(t *testing.T) {
 
 func TestPublishRejectsBadTopic(t *testing.T) {
 	withHome(t)
-	if _, err := Publish("../etc", "x", Sender{Kind: "shell"}); err == nil {
+	if _, err := Publish("../etc", Draft{Text: "x"}, Sender{Kind: "shell"}); err == nil {
 		t.Fatal("expected a path-traversal topic to be rejected")
 	}
 }
@@ -580,7 +630,7 @@ func TestSubscribeStartsAtEndOfLog(t *testing.T) {
 	withHome(t)
 	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
 	// Existing history must not be replayed into a new subscriber's context.
-	if _, err := Publish("deploys", "old news", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "old news"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := os.Stat(TopicPath("deploys"))
@@ -887,7 +937,7 @@ func TestConcurrentSubscribesDoNotLoseEachOther(t *testing.T) {
 func TestQueuedMailSurvivesUntilRead(t *testing.T) {
 	withHome(t)
 	to := liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
-	if _, err := Send(to, "queued while nobody listened", Sender{Kind: "shell", Name: "sh"}, ""); err != nil {
+	if _, err := Send(to, Draft{Text: "queued while nobody listened"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatal(err)
 	}
 	// A monitor that starts later must be able to see it: the spool is the
@@ -972,7 +1022,7 @@ func TestPruneClearsEverySessionFile(t *testing.T) {
 
 func TestPruneTopicsRemovesUnsubscribedLogs(t *testing.T) {
 	withHome(t)
-	if _, err := Publish("orphaned", "nobody listens to this", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := Publish("orphaned", Draft{Text: "nobody listens to this"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(TopicPath("orphaned")); err != nil {
@@ -997,7 +1047,7 @@ func TestPruneTopicsKeepsSubscribedLogs(t *testing.T) {
 	if err := Subscribe("aaaa1111-2222", "kept"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Publish("kept", "someone is listening", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := Publish("kept", Draft{Text: "someone is listening"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := PruneTopics(); err != nil {
@@ -1020,7 +1070,7 @@ func TestPruneTopicsCompactsWithoutMovingCursors(t *testing.T) {
 	from := Sender{Kind: "shell", Name: "sh"}
 	body := strings.Repeat("x", 250)
 	for i := 0; i < 600; i++ {
-		if _, err := Publish("busy", body, from); err != nil {
+		if _, err := Publish("busy", Draft{Text: body}, from); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1078,7 +1128,7 @@ func TestPruneTopicsWaitsForTheSlowestSubscriber(t *testing.T) {
 	}
 	from := Sender{Kind: "shell", Name: "sh"}
 	for i := 0; i < 600; i++ {
-		if _, err := Publish("shared", strings.Repeat("y", 250), from); err != nil {
+		if _, err := Publish("shared", Draft{Text: strings.Repeat("y", 250)}, from); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1182,6 +1232,73 @@ func TestRenderBoundsPeerControlledFields(t *testing.T) {
 	}
 	if n := len([]rune(Render(m))); n > RenderBudget {
 		t.Fatalf("rendered %d chars from peer-controlled fields, over the %d budget", n, RenderBudget)
+	}
+}
+
+// TestRenderBoundsAHandWrittenSubject covers a message that never passed
+// through validateSubject at all: a spool line can be written by hand, so the
+// bound has to be enforced again here, the same way name/cwd/topic/namespace
+// already are just above.
+func TestRenderBoundsAHandWrittenSubject(t *testing.T) {
+	withHome(t)
+	m := &Message{
+		From:    Sender{Kind: "shell", Name: "sh"},
+		Text:    "hi",
+		Subject: strings.Repeat("s", 400),
+	}
+	got := Render(m)
+	if n := len([]rune(got)); n > RenderBudget {
+		t.Fatalf("rendered %d chars from a hand-written subject, over the %d budget", n, RenderBudget)
+	}
+	if strings.Contains(got, strings.Repeat("s", SubjectLimit+1)) {
+		t.Errorf("Render did not bound an oversize hand-written subject: %s", got)
+	}
+	if !strings.Contains(got, strings.Repeat("s", SubjectLimit-1)) {
+		t.Errorf("Render trimmed the subject well below its limit: %s", got)
+	}
+}
+
+// TestRenderSubjectLetsTheBodySqueezeBelowTheOldMinimum guards minBody's
+// second exception: without it, a long subject would force every rung of the
+// give-up ladder to fail the old 24-rune floor, dropping the reply address
+// and topic hint purely to protect a body that the subject already gives the
+// recipient a readable substitute for.
+func TestRenderSubjectLetsTheBodySqueezeBelowTheOldMinimum(t *testing.T) {
+	withHome(t)
+	m := &Message{
+		From: Sender{
+			Kind: "session", SessionID: "aaaa1111",
+			Name: strings.Repeat("n", 40), Cwd: "/" + strings.Repeat("c", 32),
+			Namespace: strings.Repeat("z", 32), // foreign to whatever this test's namespace is
+		},
+		Topic:   "@" + strings.Repeat("t", 32), // global, so the ns tag is also in play
+		Text:    strings.Repeat("x", 500),
+		Subject: strings.Repeat("j", SubjectLimit),
+	}
+	got := Render(m)
+	if n := len([]rune(got)); n > RenderBudget {
+		t.Fatalf("rendered %d chars, over the %d budget:\n%s", n, RenderBudget, got)
+	}
+	// The subject is never dropped, and here it is what makes the line tight
+	// enough that the body has to be squeezed well under the old 24-rune
+	// minimum -- so the assembly below only proves the point if the subject
+	// actually arrived in full.
+	if !strings.Contains(got, m.Subject) {
+		t.Fatalf("the subject itself was cut, which defeats this test:\n%s", got)
+	}
+	// Everything droppable has to survive here: minBody dropping to 0 is what
+	// lets the ladder succeed on its very first rung despite the tiny room
+	// left for the body, so nothing droppable ever needs to be given up.
+	for _, want := range []string{"[topic: pigeon publish", " (" + strings.Repeat("c", 32) + ")", "[reply: pigeon send -n ", "[ns: "} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q -- minBody must have reverted to 24 despite the subject:\n%s", want, got)
+		}
+	}
+	// And the body itself must be the thing that gave way: with a 500-rune
+	// text and hardly any room left after the subject, it cannot have
+	// survived whole.
+	if strings.Contains(got, strings.Repeat("x", 20)) {
+		t.Errorf("body was not squeezed despite the tight room the subject leaves it:\n%s", got)
 	}
 }
 

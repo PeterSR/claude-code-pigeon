@@ -343,9 +343,10 @@ func cmdList(args []string, w, stderr io.Writer) error {
 
 func cmdSend(args []string, w, stderr io.Writer) error {
 	fs := flags("send", stderr)
-	var nsName, asName string
+	var nsName, asName, subject string
 	nsFlag(fs, &nsName)
 	asFlag(fs, &asName)
+	fs.StringVar(&subject, "subject", "", "one-line subject, max 120 characters; the only part guaranteed to arrive")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -354,7 +355,10 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf("usage: pigeon send [-n <namespace>] [--as <name>] <target> <text>")
+		return fmt.Errorf("usage: pigeon send [-n <namespace>] [--as <name>] [--subject <text>] <target> <text>")
+	}
+	if err := misplacedFlag(rest[1:]); err != nil {
+		return err
 	}
 	target, text := rest[0], strings.Join(rest[1:], " ")
 
@@ -369,7 +373,7 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	msg, err := ns.Send(to, text, pigeon.ActingSender(asName), "")
+	msg, err := ns.Send(to, pigeon.Draft{Text: text, Subject: subject}, pigeon.ActingSender(asName))
 	if err != nil {
 		return err
 	}
@@ -384,14 +388,43 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 				"A brand-new session gets a new id and will not see it.\n",
 			to.Display())
 	}
+	if nudge := pigeon.SubjectNudge(msg); nudge != "" {
+		fmt.Fprintln(w, nudge)
+	}
+	return nil
+}
+
+// misplacedFlag catches the trap Go's flag package sets for a caller that
+// writes the topic before the flags: parsing stops at the first positional
+// argument, so `pigeon publish topic --subject x body` files "--subject" and
+// its value away as message text. The subject then never arrives, the send
+// reports success, and nothing anywhere says otherwise -- which is the exact
+// class of silent failure this tool exists to make loud. Only names we
+// actually define are rejected, so a message body may still legitimately begin
+// with a dash.
+func misplacedFlag(rest []string) error {
+	for _, a := range rest {
+		name := strings.TrimLeft(a, "-")
+		if name == a {
+			continue
+		}
+		if i := strings.IndexByte(name, '='); i >= 0 {
+			name = name[:i]
+		}
+		switch name {
+		case "subject", "n", "namespace", "as":
+			return fmt.Errorf("%q came after a positional argument, so it was read as message text rather than as a flag; put flags before the target and the body", a)
+		}
+	}
 	return nil
 }
 
 func cmdPublish(args []string, w, stderr io.Writer) error {
 	fs := flags("publish", stderr)
-	var nsName, asName string
+	var nsName, asName, subject string
 	nsFlag(fs, &nsName)
 	asFlag(fs, &asName)
+	fs.StringVar(&subject, "subject", "", "one-line subject, max 120 characters; the only part guaranteed to arrive")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -400,14 +433,17 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf("usage: pigeon publish [-n <namespace>] [--as <name>] <topic> <text>")
+		return fmt.Errorf("usage: pigeon publish [-n <namespace>] [--as <name>] [--subject <text>] <topic> <text>")
+	}
+	if err := misplacedFlag(rest[1:]); err != nil {
+		return err
 	}
 	topic, text := rest[0], strings.Join(rest[1:], " ")
 	ns, err := namespaceOf(nsName)
 	if err != nil {
 		return err
 	}
-	msg, err := ns.Publish(topic, text, pigeon.ActingSender(asName))
+	msg, err := ns.Publish(topic, pigeon.Draft{Text: text, Subject: subject}, pigeon.ActingSender(asName))
 	if err != nil {
 		return err
 	}
@@ -416,6 +452,9 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 		pigeon.TopicLabel(msg.Topic), num)
 	if msg.Payload != "" {
 		fmt.Fprintf(w, "body exceeded %d chars; full text at %s\n", pigeon.BodyBudget, msg.Payload)
+	}
+	if nudge := pigeon.SubjectNudge(msg); nudge != "" {
+		fmt.Fprintln(w, nudge)
 	}
 	return nil
 }

@@ -316,7 +316,7 @@ func TestRegisterPreservesTopicCursorsAcrossRestarts(t *testing.T) {
 	before := readCursors("aaaa1111")["deploys"]
 
 	// Something is published while this session's monitor is down.
-	if _, err := Publish("deploys", "shipped", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "shipped"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	if err := register(DefaultNamespace(), "aaaa1111", quiet); err != nil {

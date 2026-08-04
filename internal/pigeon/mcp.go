@@ -101,6 +101,12 @@ func tools() []toolDef {
 						"type":        "string",
 						"description": "Message body.",
 					}),
+					"subject": obj(map[string]any{
+						"type": "string",
+						"description": "One line: the conclusion, not the topic. Max 120 " +
+							"characters. It is the only part guaranteed to reach the recipient, " +
+							"who may never see anything else.",
+					}),
 					"namespace": namespaceArg("resolve the target in"),
 				}),
 				"required": []string{"to", "text"},
@@ -121,7 +127,13 @@ func tools() []toolDef {
 						"description": "Topic name: lowercase letters, digits, dot, dash or " +
 							"underscore. Prefix with '@' for the machine-wide topic of that name.",
 					}),
-					"text":      obj(map[string]any{"type": "string", "description": "Message body."}),
+					"text": obj(map[string]any{"type": "string", "description": "Message body."}),
+					"subject": obj(map[string]any{
+						"type": "string",
+						"description": "One line: the conclusion, not the topic. Max 120 " +
+							"characters. It is the only part guaranteed to reach the recipient, " +
+							"who may never see anything else.",
+					}),
 					"namespace": namespaceArg("publish into"),
 				}),
 				"required": []string{"topic", "text"},
@@ -365,6 +377,7 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		var a struct {
 			To        string `json:"to"`
 			Text      string `json:"text"`
+			Subject   string `json:"subject"`
 			Namespace string `json:"namespace"`
 		}
 		_ = json.Unmarshal(raw, &a)
@@ -372,11 +385,12 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return mcpSend(ns, a.To, a.Text)
+		return mcpSend(ns, a.To, a.Text, a.Subject)
 	case "publish":
 		var a struct {
 			Topic     string `json:"topic"`
 			Text      string `json:"text"`
+			Subject   string `json:"subject"`
 			Namespace string `json:"namespace"`
 		}
 		_ = json.Unmarshal(raw, &a)
@@ -384,7 +398,7 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return mcpPublish(ns, a.Topic, a.Text)
+		return mcpPublish(ns, a.Topic, a.Text, a.Subject)
 	case "subscribe", "unsubscribe":
 		var a struct {
 			Topic     string `json:"topic"`
@@ -484,7 +498,7 @@ func elsewhereNote(ns Namespace) string {
 		"list_namespaces names them.", sessions, spaces)
 }
 
-func mcpSend(ns Namespace, to, text string) (string, error) {
+func mcpSend(ns Namespace, to, text, subject string) (string, error) {
 	if strings.TrimSpace(to) == "" || strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("both 'to' and 'text' are required")
 	}
@@ -492,7 +506,7 @@ func mcpSend(ns Namespace, to, text string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	msg, err := ns.Send(target, text, CurrentSender(), "")
+	msg, err := ns.Send(target, Draft{Text: text, Subject: subject}, CurrentSender())
 	if err != nil {
 		return "", err
 	}
@@ -505,14 +519,15 @@ func mcpSend(ns Namespace, to, text string) (string, error) {
 	if target.Status == StatusDeaf {
 		b.WriteString(" WARNING: that session is running but has no listening monitor. The message is queued on its spool, but only a monitor for the same session id will ever read it; a newly started session gets a new id and will not see it.")
 	}
+	b.WriteString(SubjectNudge(msg))
 	return b.String(), nil
 }
 
-func mcpPublish(ns Namespace, topic, text string) (string, error) {
+func mcpPublish(ns Namespace, topic, text, subject string) (string, error) {
 	if strings.TrimSpace(topic) == "" || strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("both 'topic' and 'text' are required")
 	}
-	msg, err := ns.Publish(topic, text, CurrentSender())
+	msg, err := ns.Publish(topic, Draft{Text: text, Subject: subject}, CurrentSender())
 	if err != nil {
 		return "", err
 	}
@@ -528,6 +543,7 @@ func mcpPublish(ns Namespace, topic, text string) (string, error) {
 	if msg.Payload != "" {
 		out += fmt.Sprintf(" Body exceeded %d chars, so subscribers got a pointer to %s.", BodyBudget, msg.Payload)
 	}
+	out += SubjectNudge(msg)
 	return out, nil
 }
 

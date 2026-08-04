@@ -136,11 +136,11 @@ func (n Namespace) cursorPath(sessionID string) string {
 // Publish appends a message to a topic log. Every subscriber's monitor picks
 // it up independently; there is no fan-out at write time, which keeps
 // publishing O(1) regardless of how many sessions are listening.
-func Publish(topic, text string, from Sender) (*Message, error) {
-	return CurrentNamespace().Publish(topic, text, from)
+func Publish(topic string, d Draft, from Sender) (*Message, error) {
+	return CurrentNamespace().Publish(topic, d, from)
 }
 
-func (n Namespace) Publish(topic, text string, from Sender) (*Message, error) {
+func (n Namespace) Publish(topic string, d Draft, from Sender) (*Message, error) {
 	ref, err := ParseTopicRef(topic)
 	if err != nil {
 		return nil, err
@@ -155,21 +155,26 @@ func (n Namespace) Publish(topic, text string, from Sender) (*Message, error) {
 	if err := n.EnsureDirs(); err != nil {
 		return nil, err
 	}
-	body := Sanitize(text)
+	body := Sanitize(d.Text)
 	if body == "" {
 		return nil, fmt.Errorf("refusing to publish an empty message")
 	}
+	subject, err := validateSubject(d.Subject)
+	if err != nil {
+		return nil, err
+	}
 
 	msg := &Message{
-		ID:    newMessageID(),
-		TS:    nowRFC3339(),
-		From:  from,
-		Topic: ref.String(),
-		Text:  body,
+		ID:      newMessageID(),
+		TS:      nowRFC3339(),
+		From:    from,
+		Topic:   ref.String(),
+		Text:    body,
+		Subject: subject,
 	}
 	if len([]rune(body)) > BodyBudget {
 		p := filepath.Join(ref.payloadsDir(n), msg.ID+".txt")
-		if err := os.WriteFile(p, []byte(text), 0o600); err == nil {
+		if err := os.WriteFile(p, []byte(d.Text), 0o600); err == nil {
 			msg.Payload = p
 		}
 	}

@@ -347,7 +347,7 @@ func TestDoctorReportsQueuedMail(t *testing.T) {
 	withHome(t)
 	beta := liveEntry(t, "bbbb2222", "beta", "/tmp/work")
 	t.Setenv(EnvSessionID, "bbbb2222")
-	if _, err := Send(beta, "waiting", Sender{Kind: "shell", Name: "test"}, ""); err != nil {
+	if _, err := Send(beta, Draft{Text: "waiting"}, Sender{Kind: "shell", Name: "test"}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 

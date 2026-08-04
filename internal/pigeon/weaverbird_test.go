@@ -176,7 +176,7 @@ func TestWeaverbirdValue_DeafWithWaitingCount(t *testing.T) {
 	t.Setenv(EnvSessionID, "bbbb2222")
 
 	for i := 0; i < 3; i++ {
-		if _, err := Send(beta, "queued message", Sender{Kind: "shell", Name: "test"}, ""); err != nil {
+		if _, err := Send(beta, Draft{Text: "queued message"}, Sender{Kind: "shell", Name: "test"}); err != nil {
 			t.Fatalf("Send: %v", err)
 		}
 	}
@@ -348,7 +348,7 @@ func TestWeaverbirdValue_FindsASessionInAnotherNamespace(t *testing.T) {
 		t.Errorf("vals = %+v, want its real deaf state, not \"not armed\"", vals)
 	}
 
-	if _, err := acme.Send(&Entry{SessionID: "bbbb2222"}, "queued", Sender{Kind: "shell", Name: "sh"}, ""); err != nil {
+	if _, err := acme.Send(&Entry{SessionID: "bbbb2222"}, Draft{Text: "queued"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	vals, err = WeaverbirdValue(wb.Session{}, nil)

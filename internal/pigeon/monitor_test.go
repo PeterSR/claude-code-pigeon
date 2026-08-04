@@ -338,11 +338,10 @@ func TestMonitorEmitsDirectMessagesButNeverItsOwn(t *testing.T) {
 
 	// A message stamped with this session's own id must never be emitted:
 	// waking a session with its own broadcast is a loop with a model in it.
-	if _, err := Send(mailbox(sid), "echo of my own voice",
-		Sender{Kind: "session", SessionID: sid, Name: "me"}, ""); err != nil {
+	if _, err := Send(mailbox(sid), Draft{Text: "echo of my own voice"}, Sender{Kind: "session", SessionID: sid, Name: "me"}); err != nil {
 		t.Fatalf("Send (self): %v", err)
 	}
-	if _, err := Send(mailbox(sid), "the build is green", peer(), ""); err != nil {
+	if _, err := Send(mailbox(sid), Draft{Text: "the build is green"}, peer()); err != nil {
 		t.Fatalf("Send (peer): %v", err)
 	}
 
@@ -366,7 +365,7 @@ func TestMonitorDeliversMailQueuedBeforeItStarted(t *testing.T) {
 	// Mail written while nothing was listening: the inbox cursor must resume
 	// from where it was rather than skipping to the end of the spool, or a
 	// `claude --resume` silently loses everything sent while it was away.
-	if _, err := Send(mailbox(sid), "queued while nobody listened", peer(), ""); err != nil {
+	if _, err := Send(mailbox(sid), Draft{Text: "queued while nobody listened"}, peer()); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -390,10 +389,10 @@ func TestMonitorDeliversSubscribedTopicsOnly(t *testing.T) {
 	// Nothing subscribes this session to #secrets, so it must stay silent even
 	// though the log sits in the same state directory and is trivially
 	// readable. Publishing it first means the barrier below is meaningful.
-	if _, err := Publish("secrets", "not for you", peer()); err != nil {
+	if _, err := Publish("secrets", Draft{Text: "not for you"}, peer()); err != nil {
 		t.Fatalf("Publish (#secrets): %v", err)
 	}
-	if _, err := Publish(PublicTopic, "deploying to staging in 5", peer()); err != nil {
+	if _, err := Publish(PublicTopic, Draft{Text: "deploying to staging in 5"}, peer()); err != nil {
 		t.Fatalf("Publish (#%s): %v", PublicTopic, err)
 	}
 
@@ -424,7 +423,7 @@ func TestSubscribingWhileTheMonitorRunsTakesEffect(t *testing.T) {
 		return m.stderr.has(`following topic "deploys"`)
 	})
 
-	if _, err := Publish("deploys", "v2.1 rolled out", peer()); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "v2.1 rolled out"}, peer()); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	eventually(t, 6*time.Second, "the #deploys message", func() bool {
@@ -443,7 +442,7 @@ func TestUnsubscribingWhileTheMonitorRunsStopsDelivery(t *testing.T) {
 	eventually(t, 6*time.Second, "the monitor to start following #deploys", func() bool {
 		return m.stderr.has(`following topic "deploys"`)
 	})
-	if _, err := Publish("deploys", "first while subscribed", peer()); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "first while subscribed"}, peer()); err != nil {
 		t.Fatalf("Publish (before): %v", err)
 	}
 	eventually(t, 6*time.Second, "the first #deploys message", func() bool {
@@ -457,12 +456,12 @@ func TestUnsubscribingWhileTheMonitorRunsStopsDelivery(t *testing.T) {
 		return m.stderr.has(`unfollowing topic "deploys"`)
 	})
 
-	if _, err := Publish("deploys", "second after unsubscribing", peer()); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "second after unsubscribing"}, peer()); err != nil {
 		t.Fatalf("Publish (after): %v", err)
 	}
 	// Barrier: a direct message sent afterwards proves the monitor is still
 	// emitting, so the missing topic line is a real absence.
-	if _, err := Send(mailbox(sid), "still listening", peer(), ""); err != nil {
+	if _, err := Send(mailbox(sid), Draft{Text: "still listening"}, peer()); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	eventually(t, 6*time.Second, "the barrier direct message", func() bool {
@@ -493,8 +492,7 @@ func TestMonitorReceivesGlobalBroadcastsFromAnotherNamespace(t *testing.T) {
 	const sid = "mon-global-1"
 	m := startMonitor(t, sid)
 
-	if _, err := DefaultNamespace().Publish(GlobalPublicTopic, "everyone please stand by",
-		peerFrom(DefaultNamespaceName)); err != nil {
+	if _, err := DefaultNamespace().Publish(GlobalPublicTopic, Draft{Text: "everyone please stand by"}, peerFrom(DefaultNamespaceName)); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	eventually(t, 6*time.Second, "the machine-wide broadcast", func() bool {
@@ -523,13 +521,12 @@ func TestMonitorIgnoresANamespacedTopicFromAnotherNamespace(t *testing.T) {
 		return m.stderr.has(`following topic "deploys"`)
 	})
 
-	if _, err := DefaultNamespace().Publish("deploys", "not for you",
-		peerFrom(DefaultNamespaceName)); err != nil {
+	if _, err := DefaultNamespace().Publish("deploys", Draft{Text: "not for you"}, peerFrom(DefaultNamespaceName)); err != nil {
 		t.Fatalf("Publish (other namespace): %v", err)
 	}
 	// Barrier: a publish into this namespace's own #deploys proves the follower
 	// is running, so the missing line above is a real absence.
-	if _, err := acme.Publish("deploys", "this one is ours", peerFrom("acme")); err != nil {
+	if _, err := acme.Publish("deploys", Draft{Text: "this one is ours"}, peerFrom("acme")); err != nil {
 		t.Fatalf("Publish (own namespace): %v", err)
 	}
 	eventually(t, 6*time.Second, "the barrier message", func() bool {
@@ -549,8 +546,7 @@ func TestMonitorDeliversACrossNamespaceDirectMessage(t *testing.T) {
 	const sid = "mon-crossns-1"
 	m := startMonitor(t, sid)
 
-	if _, err := mustNS(t, "acme").Send(mailbox(sid), "from next door",
-		peerFrom(DefaultNamespaceName), ""); err != nil {
+	if _, err := mustNS(t, "acme").Send(mailbox(sid), Draft{Text: "from next door"}, peerFrom(DefaultNamespaceName)); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	eventually(t, 6*time.Second, "the cross-namespace message", func() bool {

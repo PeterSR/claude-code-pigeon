@@ -188,12 +188,12 @@ func TestPrivateNamespaceCannotPublishToAGlobalTopic(t *testing.T) {
 	withUserConfig(t, `{"namespaces": {"acme": {"private": true}}}`)
 	acme := mustNS(t, "acme")
 
-	if _, err := acme.Publish("@all", "leaking", Sender{Kind: "shell", Name: "sh"}); err == nil {
+	if _, err := acme.Publish("@all", Draft{Text: "leaking"}, Sender{Kind: "shell", Name: "sh"}); err == nil {
 		t.Error("a private namespace published to the machine-wide mailbox")
 	}
 	// Its own namespaced topics are unaffected.
 	liveEntryIn(t, acme, "aaaa1111", "one", "/tmp/a")
-	if _, err := acme.Publish("all", "internal", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := acme.Publish("all", Draft{Text: "internal"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Errorf("a private namespace cannot use its own mailbox: %v", err)
 	}
 }

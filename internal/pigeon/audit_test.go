@@ -275,7 +275,7 @@ func TestCompactionDoesNotMoveAnyCursor(t *testing.T) {
 
 	body := strings.Repeat("x", 400)
 	for i := 0; i < 500; i++ {
-		if _, err := ns.Publish("busy", body, from); err != nil {
+		if _, err := ns.Publish("busy", Draft{Text: body}, from); err != nil {
 			t.Fatalf("Publish: %v", err)
 		}
 	}
@@ -338,7 +338,7 @@ func TestFollowerLosesNothingAcrossACompaction(t *testing.T) {
 	body := strings.Repeat("y", 400)
 	const total = 500
 	for i := 0; i < total; i++ {
-		if _, err := ns.Publish("busy", body, from); err != nil {
+		if _, err := ns.Publish("busy", Draft{Text: body}, from); err != nil {
 			t.Fatalf("Publish: %v", err)
 		}
 	}
@@ -464,6 +464,56 @@ func TestRenderKeepsThePayloadPointerWhenSpaceIsTight(t *testing.T) {
 			// A truncated path is not a pointer.
 			if !strings.Contains(got, payload) {
 				t.Errorf("the payload pointer was cut, stranding the message:\n%s", got)
+			}
+		})
+	}
+}
+
+// The subject is never-dropped for the same reason the payload pointer is,
+// so it has to survive the same tight-budget sweep TestRenderKeepsThe
+// PayloadPointerWhenSpaceIsTight already runs the pointer through.
+func TestRenderKeepsTheSubjectWhenSpaceIsTight(t *testing.T) {
+	// Only swept up to a pad that stays inside the give-up ladder itself
+	// (unlike the payload-only sweep this mirrors): the subject's own
+	// never-dropped reservation eats into the same budget the pointer does,
+	// so at large enough pads even the fully-collapsed last rung of the
+	// ladder no longer fits and the pathological fallback below it takes
+	// over -- a separate code path this test is not about.
+	for _, pad := range []int{0, 30, 60, 90} {
+		t.Run(fmt.Sprintf("pad%d", pad), func(t *testing.T) {
+			home := filepath.Join(t.TempDir(), strings.Repeat("d", pad))
+			t.Setenv(EnvHome, home)
+			ns := mustNS(t, strings.Repeat("n", 60))
+			if err := ns.EnsureDirs(); err != nil {
+				t.Skipf("path too long for this filesystem: %v", err)
+			}
+
+			payload := filepath.Join(ns.PayloadsDir(), "m_deadbeefcafe.txt")
+			subject := strings.Repeat("j", 80)
+			m := &Message{
+				From: Sender{
+					Kind: "session", SessionID: "aaaa1111",
+					Name: strings.Repeat("s", 32), Cwd: "/tmp/" + strings.Repeat("w", 40),
+					Namespace: "elsewhere",
+				},
+				Topic:   strings.Repeat("t", 60),
+				Text:    strings.Repeat("body ", 200),
+				Payload: payload,
+				Subject: subject,
+			}
+
+			got := ns.Render(m)
+			if n := len([]rune(got)); n > RenderBudget {
+				t.Errorf("line is %d runes, over the %d budget:\n%s", n, RenderBudget, got)
+			}
+			// The pointer is the only route to a body that did not fit inline.
+			if !strings.Contains(got, payload) {
+				t.Errorf("the payload pointer was cut, stranding the message:\n%s", got)
+			}
+			// The subject is the only part of the body a recipient is
+			// guaranteed to see; it must survive right alongside the pointer.
+			if !strings.Contains(got, subject) {
+				t.Errorf("the subject was dropped by the give-up ladder:\n%s", got)
 			}
 		})
 	}

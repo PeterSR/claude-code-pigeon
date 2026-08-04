@@ -276,7 +276,7 @@ func TestNamespacedTopicsDoNotLeak(t *testing.T) {
 	withHome(t)
 	acme, other := mustNS(t, "acme"), mustNS(t, "other")
 
-	if _, err := acme.Publish("deploys", "acme shipped", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := acme.Publish("deploys", Draft{Text: "acme shipped"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	if acme.TopicPath("deploys") == other.TopicPath("deploys") {
@@ -312,7 +312,7 @@ func TestGlobalTopicsReachEveryNamespace(t *testing.T) {
 	if err := other.Subscribe("bbbb2222", "@ops"); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
-	if _, err := acme.Publish("@ops", "everyone please stand by", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := acme.Publish("@ops", Draft{Text: "everyone please stand by"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	body, err := os.ReadFile(other.TopicPath("@ops"))
@@ -372,7 +372,7 @@ func TestGlobalAndLocalTopicsKeepSeparateCursors(t *testing.T) {
 	liveEntryIn(t, ns, "aaaa1111", "alpha", "/tmp/a")
 
 	from := Sender{Kind: "shell", Name: "sh"}
-	if _, err := ns.Publish("deploys", "local history", from); err != nil {
+	if _, err := ns.Publish("deploys", Draft{Text: "local history"}, from); err != nil {
 		t.Fatal(err)
 	}
 	if err := ns.Subscribe("aaaa1111", "deploys"); err != nil {
@@ -395,10 +395,10 @@ func TestListTopicsCoversLocalAndSharedLogs(t *testing.T) {
 	withHome(t)
 	ns := mustNS(t, "acme")
 	from := Sender{Kind: "shell", Name: "sh"}
-	if _, err := ns.Publish("deploys", "x", from); err != nil {
+	if _, err := ns.Publish("deploys", Draft{Text: "x"}, from); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ns.Publish("@ops", "y", from); err != nil {
+	if _, err := ns.Publish("@ops", Draft{Text: "y"}, from); err != nil {
 		t.Fatal(err)
 	}
 
@@ -420,7 +420,7 @@ func TestListTopicsCoversLocalAndSharedLogs(t *testing.T) {
 	}
 	// A topic published in another namespace is not reachable from here and
 	// must not be listed as though it were.
-	if _, err := mustNS(t, "other").Publish("secrets", "z", from); err != nil {
+	if _, err := mustNS(t, "other").Publish("secrets", Draft{Text: "z"}, from); err != nil {
 		t.Fatal(err)
 	}
 	if again, _ := ns.ListTopics(); len(again) != len(topics) {
@@ -466,7 +466,7 @@ func TestGlobalTopicPayloadsGoToTheSharedDirectory(t *testing.T) {
 	acme, other := mustNS(t, "acme"), mustNS(t, "other")
 	long := strings.Repeat("g", BodyBudget*2)
 
-	msg, err := acme.Publish("@ops", long, Sender{Kind: "shell", Name: "sh"})
+	msg, err := acme.Publish("@ops", Draft{Text: long}, Sender{Kind: "shell", Name: "sh"})
 	if err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
@@ -479,7 +479,7 @@ func TestGlobalTopicPayloadsGoToTheSharedDirectory(t *testing.T) {
 
 	// A namespaced topic keeps its payload local, where only its own
 	// subscribers can be pointed at it.
-	local, err := acme.Publish("deploys", long, Sender{Kind: "shell", Name: "sh"})
+	local, err := acme.Publish("deploys", Draft{Text: long}, Sender{Kind: "shell", Name: "sh"})
 	if err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
@@ -603,7 +603,7 @@ func TestCrossNamespaceSendLandsInTheRecipientsTree(t *testing.T) {
 	liveEntryIn(t, acme, "aaaa1111", "alpha", "/home/p/api")
 	to := liveEntryIn(t, other, "bbbb2222", "beta", "/home/p/web")
 
-	msg, err := other.Send(to, strings.Repeat("x", BodyBudget*2), CurrentSender(), "")
+	msg, err := other.Send(to, Draft{Text: strings.Repeat("x", BodyBudget*2)}, CurrentSender())
 	if err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -782,7 +782,7 @@ func TestSharedTopicsAreNotPrunedWhileAnotherNamespaceSubscribes(t *testing.T) {
 	if err := other.Subscribe("bbbb2222", "@ops"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := acme.Publish("@ops", "still wanted", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := acme.Publish("@ops", Draft{Text: "still wanted"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatal(err)
 	}
 

@@ -63,7 +63,7 @@ func TestToolsListIsComplete(t *testing.T) {
 
 	want := []string{
 		"list_sessions", "send_message", "publish", "subscribe",
-		"unsubscribe", "inbox", "list_topics", "list_namespaces", "whoami", "set_identity",
+		"unsubscribe", "set_delivery", "inbox", "list_topics", "list_namespaces", "whoami", "set_identity",
 	}
 	got := map[string]bool{}
 	for _, d := range defs {
@@ -238,6 +238,28 @@ func TestSubscribeAndListTopicsViaMCP(t *testing.T) {
 	}
 	if got := toolText(t, "unsubscribe", map[string]any{"topic": "deploys"}); !strings.Contains(got, "Unsubscribed") {
 		t.Errorf("unsubscribe returned %q", got)
+	}
+}
+
+func TestSetDeliveryViaMCP(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "aaaa1111-2222")
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+
+	got := toolText(t, "set_delivery", map[string]any{"topic": "deploys", "mode": "digest"})
+	if !strings.Contains(got, "digest") || !strings.Contains(got, "#deploys") {
+		t.Errorf("set_delivery returned %q", got)
+	}
+	e, err := ReadEntry("aaaa1111-2222")
+	if err != nil {
+		t.Fatalf("ReadEntry: %v", err)
+	}
+	if e.Delivery["deploys"] != DeliveryDigest {
+		t.Errorf("Delivery[%q] = %q, want %q", "deploys", e.Delivery["deploys"], DeliveryDigest)
+	}
+
+	if got := toolText(t, "set_delivery", map[string]any{"topic": "deploys", "mode": "bogus"}); !strings.Contains(got, "error") {
+		t.Errorf("set_delivery with an invalid mode returned %q, want an error", got)
 	}
 }
 

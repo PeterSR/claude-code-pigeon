@@ -9,6 +9,7 @@ package pigeon
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -151,6 +152,20 @@ func (m *monitor) stop(t *testing.T) {
 			return
 		}
 	}
+}
+
+// withDigestInterval shrinks the package's digest flush interval for one
+// test. digestInterval is a full minute in production; RunMonitor reads it
+// exactly once, early, to build its ticker (see RunMonitor), so setting it
+// before startMonitor launches the monitor goroutine -- and restoring it only
+// once that goroutine has actually stopped -- never races the read. t.Cleanup
+// runs LIFO, and startMonitor registers its own stop cleanup after this
+// function returns, so the restore below always runs after the monitor exits.
+func withDigestInterval(t *testing.T, d time.Duration) {
+	t.Helper()
+	orig := digestInterval
+	digestInterval = d
+	t.Cleanup(func() { digestInterval = orig })
 }
 
 // peer is a plausible sender that is not the session under test.
@@ -472,6 +487,314 @@ func TestUnsubscribingWhileTheMonitorRunsStopsDelivery(t *testing.T) {
 	}
 }
 
+// --- delivery modes ----------------------------------------------------------
+
+// A digest topic must collapse a burst into ONE line per interval, not one
+// notification per message -- that collapsing is the entire point.
+func TestDigestTopicCollapsesMultipleMessagesIntoOneLine(t *testing.T) {
+	withDigestInterval(t, 300*time.Millisecond)
+	withHome(t)
+	const sid = "mon-digest-collapse-1"
+	m := startMonitor(t, sid)
+
+	if err := Subscribe(sid, "deploys"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	eventually(t, 6*time.Second, "the monitor to start following #deploys", func() bool {
+		return m.stderr.has(`following topic "deploys"`)
+	})
+	if err := SetDelivery(sid, "deploys", DeliveryDigest); err != nil {
+		t.Fatalf("SetDelivery: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := Publish("deploys", Draft{Text: fmt.Sprintf("build %d", i)}, peer()); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+	}
+
+	eventually(t, 3*time.Second, "the digest line", func() bool {
+		return m.stdout.has("3 waiting on #deploys")
+	})
+	for i := 0; i < 3; i++ {
+		if m.stdout.has(fmt.Sprintf("build %d", i)) {
+			t.Errorf("a digest topic pushed an individual message instead of collapsing them:\n%s", m.stdout.String())
+		}
+	}
+	if got := strings.Count(m.stdout.String(), "waiting on #deploys"); got != 1 {
+		t.Errorf("the digest line appeared %d time(s), want exactly 1 (one per interval, not one per message)", got)
+	}
+}
+
+// An alert bypasses a digest topic's buffering entirely: it is scarce by
+// construction (see PriorityAlert), and holding it for a minute defeats the
+// one thing it exists to do.
+func TestAlertOnADigestTopicPushesImmediately(t *testing.T) {
+	withHome(t)
+	const sid = "mon-digest-alert-1"
+	m := startMonitor(t, sid)
+
+	if err := Subscribe(sid, "deploys"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	eventually(t, 6*time.Second, "the monitor to start following #deploys", func() bool {
+		return m.stderr.has(`following topic "deploys"`)
+	})
+	if err := SetDelivery(sid, "deploys", DeliveryDigest); err != nil {
+		t.Fatalf("SetDelivery: %v", err)
+	}
+
+	if _, err := Publish("deploys", Draft{Text: "prod is down", Priority: PriorityAlert}, peer()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	eventually(t, 3*time.Second, "the alert to push immediately, without waiting for a digest tick", func() bool {
+		return m.stdout.has("prod is down")
+	})
+}
+
+// quiet is absolute: unlike digest, not even an alert earns an immediate
+// push there. A peer's self-assessed urgency cannot override a session that
+// asked not to be interrupted at all.
+func TestAlertOnAQuietTopicDoesNotPushImmediately(t *testing.T) {
+	withHome(t)
+	const sid = "mon-quiet-alert-1"
+	m := startMonitor(t, sid)
+
+	if err := Subscribe(sid, "deploys"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	eventually(t, 6*time.Second, "the monitor to start following #deploys", func() bool {
+		return m.stderr.has(`following topic "deploys"`)
+	})
+	if err := SetDelivery(sid, "deploys", DeliveryQuiet); err != nil {
+		t.Fatalf("SetDelivery: %v", err)
+	}
+
+	if _, err := Publish("deploys", Draft{Text: "prod is down", Priority: PriorityAlert}, peer()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	// Barrier: a direct message sent afterwards proves the monitor is alive
+	// and processing, so the missing alert text below is a real absence
+	// rather than a slow test.
+	if _, err := Send(mailbox(sid), Draft{Text: "still listening"}, peer()); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	eventually(t, 6*time.Second, "the barrier direct message", func() bool {
+		return m.stdout.has("still listening")
+	})
+	if m.stdout.has("prod is down") {
+		t.Errorf("an alert on a quiet topic was pushed immediately; quiet must be absolute:\n%s", m.stdout.String())
+	}
+}
+
+// A message naming this session in For pushes immediately on a digest topic,
+// the same as an alert -- it is not chatter, it is something this session was
+// specifically asked to act on.
+func TestForNamedMessagePushesOnADigestTopic(t *testing.T) {
+	withHome(t)
+	const sid = "mon-digest-for-1"
+	m := startMonitor(t, sid)
+
+	if err := Subscribe(sid, "deploys"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	eventually(t, 6*time.Second, "the monitor to start following #deploys", func() bool {
+		return m.stderr.has(`following topic "deploys"`)
+	})
+	if err := SetDelivery(sid, "deploys", DeliveryDigest); err != nil {
+		t.Fatalf("SetDelivery: %v", err)
+	}
+
+	// Short(sid), not a declared name: this session was never given one, and
+	// For matches either handle (see Message.IsFor).
+	if _, err := Publish("deploys", Draft{Text: "please review this", For: []string{Short(sid)}}, peer()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	eventually(t, 3*time.Second, "the for-named message to push immediately", func() bool {
+		return m.stdout.has("please review this")
+	})
+}
+
+// The one property Part 1 exists for: a message held in an unflushed digest
+// buffer must not have its cursor crossed by something else on the same
+// topic, or a monitor that dies before the next flush loses it for good.
+//
+// The synchronization here is structural, not timing-based: "routine change"
+// and the alert that follows it are both on #deploys, read by the one
+// goroutine following that log, in that order. So once the alert -- which
+// pushes immediately -- is actually on stdout, "routine change" has
+// necessarily already been read and folded into the digest buffer by the
+// single-threaded delivery loop, whether or not the buffer has flushed yet.
+func TestMonitorCursorHoldsAtAnUnflushedDigestMessageThenAdvancesOnFlush(t *testing.T) {
+	withDigestInterval(t, 300*time.Millisecond)
+	withHome(t)
+	const sid = "mon-digest-cursor-1"
+	m := startMonitor(t, sid)
+
+	if err := Subscribe(sid, "deploys"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	eventually(t, 6*time.Second, "the monitor to start following #deploys", func() bool {
+		return m.stderr.has(`following topic "deploys"`)
+	})
+	if err := SetDelivery(sid, "deploys", DeliveryDigest); err != nil {
+		t.Fatalf("SetDelivery: %v", err)
+	}
+
+	if _, err := Publish("deploys", Draft{Text: "routine change"}, peer()); err != nil {
+		t.Fatalf("Publish (routine): %v", err)
+	}
+	if _, err := Publish("deploys", Draft{Text: "urgent followup", Priority: PriorityAlert}, peer()); err != nil {
+		t.Fatalf("Publish (alert): %v", err)
+	}
+	eventually(t, 3*time.Second, "the alert to push past the still-buffered routine message", func() bool {
+		return m.stdout.has("urgent followup")
+	})
+
+	// "routine change" is confirmed read and buffered by now (see the doc
+	// comment above), but the digest has not flushed, so the topic's cursor
+	// must still be exactly where it started: untouched.
+	if got := readCursors(sid)["deploys"]; got != 0 {
+		t.Errorf("cursor for #deploys = %d before any digest flush, want 0 (must not advance past the buffered message)", got)
+	}
+
+	eventually(t, 3*time.Second, "the digest to flush", func() bool {
+		return m.stdout.has("1 waiting on #deploys")
+	})
+	eventually(t, 3*time.Second, "the cursor to advance once the digest flushes", func() bool {
+		return readCursors(sid)["deploys"] > 0
+	})
+}
+
+// A message the rate limiter suppresses is still HANDLED -- it is deliberately
+// not re-notified (see newRateLimiter) -- so the cursor has to cross it same
+// as a pushed one, or the same flood is reconsidered forever.
+func TestRateLimitSuppressedMessageStillAdvancesTheCursor(t *testing.T) {
+	withHome(t)
+	const sid = "mon-ratelimit-cursor-1"
+	m := startMonitor(t, sid)
+
+	// Enough direct messages to spill past the normal-traffic cap and into
+	// suppression (see newRateLimiter's alertReserve), well inside the
+	// one-minute window so none of this relies on it rolling over.
+	const total = maxPerMinute - alertReserve + 5
+	for i := 0; i < total; i++ {
+		if _, err := Send(mailbox(sid), Draft{Text: fmt.Sprintf("msg %d", i)}, peer()); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+	}
+
+	want := endOffset(SpoolPath(sid))
+	eventually(t, 6*time.Second, "the inbox cursor to cross every message, suppressed included", func() bool {
+		return readCursors(sid)[inboxCursorKey] == want
+	})
+
+	// If this test's flood never actually triggered suppression it would not
+	// be testing anything: confirm the tail really was held back rather than
+	// printed, now that the cursor above proves it was still handled.
+	last := fmt.Sprintf("msg %d", total-1)
+	if m.stdout.has(last) {
+		t.Fatalf("%q was printed rather than suppressed; this test needs a real suppression to prove anything", last)
+	}
+}
+
+// Shutdown must flush whatever digest is still buffered, the same way it
+// already flushes rate-limit suppression notices: a session that stops its
+// monitor with an unflushed digest tick pending must still learn what was
+// waiting, not lose it silently to a ticker that never got to fire.
+func TestMonitorFlushesPendingDigestOnShutdown(t *testing.T) {
+	// A long interval: the flush this test checks for must come from
+	// shutdown, not from the ticker winning a race against it.
+	withDigestInterval(t, time.Hour)
+	withHome(t)
+	const sid = "mon-digest-shutdown-1"
+	m := startMonitor(t, sid)
+
+	if err := Subscribe(sid, "deploys"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	eventually(t, 6*time.Second, "the monitor to start following #deploys", func() bool {
+		return m.stderr.has(`following topic "deploys"`)
+	})
+	if err := SetDelivery(sid, "deploys", DeliveryDigest); err != nil {
+		t.Fatalf("SetDelivery: %v", err)
+	}
+	if _, err := Publish("deploys", Draft{Text: "routine change"}, peer()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	// Barrier: a direct message proves the monitor has read the buffered
+	// message off #deploys before shutdown is requested below, rather than
+	// this test racing its own Publish.
+	if _, err := Send(mailbox(sid), Draft{Text: "still listening"}, peer()); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	eventually(t, 6*time.Second, "the barrier direct message", func() bool {
+		return m.stdout.has("still listening")
+	})
+
+	m.stop(t) // triggers RunMonitor's deferred flushDigests via the SIGTERM path
+
+	if !m.stdout.has("1 waiting on #deploys") {
+		t.Errorf("shutdown did not flush the pending digest:\n%s", m.stdout.String())
+	}
+}
+
+// Push mode is the default and must behave exactly as it did before delivery
+// modes existed: the notification line the monitor prints is Render's output,
+// verbatim, with nothing else on stdout around it.
+func TestPushModeNotificationIsByteIdenticalToRender(t *testing.T) {
+	withHome(t)
+	const sid = "mon-push-identical-1"
+	m := startMonitor(t, sid)
+
+	msg, err := Send(mailbox(sid), Draft{Text: "the build is green", Subject: "ci"}, peer())
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	eventually(t, 5*time.Second, "the notification line", func() bool {
+		return m.stdout.has("the build is green")
+	})
+
+	self, err := ReadEntry(sid)
+	if err != nil {
+		t.Fatalf("ReadEntry: %v", err)
+	}
+	want := DefaultNamespace().Render(msg, self) + "\n"
+	if got := m.stdout.String(); got != want {
+		t.Errorf("push-mode notification differs from Render's own output:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
+// renderDigestLine is peer-controlled input rendered into a notification, the
+// same threat model as Render itself: a sender name may carry the structural
+// characters Sanitize exists to neutralise, and a burst of senders may not fit
+// the notification budget at all.
+func TestRenderDigestLineSanitisesSenderNames(t *testing.T) {
+	line := renderDigestLine("deploys", 2, []string{"al<pha>", "be]ta["})
+	if !strings.HasPrefix(line, "[pigeon] 2 waiting on #deploys from ") {
+		t.Errorf("unexpected line shape: %q", line)
+	}
+	if !strings.HasSuffix(line, "-- read with the inbox tool") {
+		t.Errorf("missing trailer: %q", line)
+	}
+	body := strings.TrimSuffix(strings.TrimPrefix(line, "[pigeon] 2 waiting on #deploys from "), " -- read with the inbox tool")
+	if strings.ContainsAny(body, "<>[]") {
+		t.Errorf("an unsanitised structural character reached the line: %q", line)
+	}
+}
+
+func TestRenderDigestLineIsBoundedByRenderBudget(t *testing.T) {
+	senders := make([]string, 50)
+	for i := range senders {
+		senders[i] = strings.Repeat("x", 40)
+	}
+	line := renderDigestLine("deploys", len(senders), senders)
+	if n := len([]rune(line)); n > RenderBudget {
+		t.Errorf("digest line is %d runes, want at most RenderBudget (%d)", n, RenderBudget)
+	}
+}
+
 // --- namespaces ------------------------------------------------------------
 //
 // The library tests cover which directory each call reads. These cover the one
@@ -678,57 +1001,53 @@ func TestMonitorRefusesToGuessTheSession(t *testing.T) {
 
 // --- followers -------------------------------------------------------------
 
-func TestFollowSourcePersistsOffsetSoARestartDoesNotReplay(t *testing.T) {
+// followSource no longer persists a cursor itself -- see its doc comment --
+// so this test now checks the replacement contract: every message carries the
+// logical offset immediately after it, and resuming a fresh follower from
+// that offset (as the delivery side does once it has actually handled the
+// message) picks up only what is new.
+func TestFollowSourceStampsOffsetsSoARestartDoesNotReplay(t *testing.T) {
 	dir := withHome(t)
 	path := filepath.Join(dir, "topic.ndjson")
 	appendMessage(t, path, "one")
 	appendMessage(t, path, "two")
 
-	var mu sync.Mutex
-	var saved int64
-	persist := func(n int64) {
-		mu.Lock()
-		defer mu.Unlock()
-		saved = n
-	}
-	readSaved := func() int64 {
-		mu.Lock()
-		defer mu.Unlock()
-		return saved
-	}
-
-	out := make(chan *Message, 8)
+	out := make(chan followedMessage, 8)
 	stop := make(chan struct{})
-	go followSource(path, 0, out, stop, persist, func(string, ...any) {})
+	go followSource(path, 0, "topic", out, stop, func(string, ...any) {})
 
+	var lastOffset int64
 	for _, want := range []string{"one", "two"} {
 		select {
-		case m := <-out:
-			if m.Text != want {
-				t.Fatalf("got %q, want %q -- the log must be read in order", m.Text, want)
+		case fm := <-out:
+			if fm.msg.Text != want {
+				t.Fatalf("got %q, want %q -- the log must be read in order", fm.msg.Text, want)
 			}
+			if fm.source != "topic" {
+				t.Fatalf("source = %q, want %q", fm.source, "topic")
+			}
+			lastOffset = fm.offset
 		case <-time.After(5 * time.Second):
 			t.Fatalf("timed out waiting for %q", want)
 		}
 	}
-	eventually(t, 5*time.Second, "the offset to be persisted", func() bool {
-		return readSaved() == endOffset(path)
-	})
+	if lastOffset != endOffset(path) {
+		t.Errorf("offset on the last message = %d, want %d (the end of the log)", lastOffset, endOffset(path))
+	}
 	close(stop)
 
-	// Restarting from the persisted offset must pick up only what is new. A
-	// replay here would re-notify the session with everything it has already
-	// seen every time its monitor restarts.
-	out2 := make(chan *Message, 8)
+	// A replay here would re-notify the session with everything it has
+	// already seen every time its monitor restarts.
+	out2 := make(chan followedMessage, 8)
 	stop2 := make(chan struct{})
 	defer close(stop2)
-	go followSource(path, readSaved(), out2, stop2, nil, func(string, ...any) {})
+	go followSource(path, lastOffset, "topic", out2, stop2, func(string, ...any) {})
 	appendMessage(t, path, "three")
 
 	select {
-	case m := <-out2:
-		if m.Text != "three" {
-			t.Fatalf("got %q after restart, want only the new line", m.Text)
+	case fm := <-out2:
+		if fm.msg.Text != "three" {
+			t.Fatalf("got %q after restart, want only the new line", fm.msg.Text)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for the line appended after the restart")
@@ -744,16 +1063,16 @@ func TestFollowSourceSkipsUnparseableLines(t *testing.T) {
 		t.Fatalf("write log: %v", err)
 	}
 
-	out := make(chan *Message, 4)
+	out := make(chan followedMessage, 4)
 	stop := make(chan struct{})
 	defer close(stop)
-	go followSource(path, 0, out, stop, nil, func(string, ...any) {})
+	go followSource(path, 0, "topic", out, stop, func(string, ...any) {})
 	appendMessage(t, path, "after the junk")
 
 	select {
-	case m := <-out:
-		if m.Text != "after the junk" {
-			t.Fatalf("got %q, want the message after the junk line", m.Text)
+	case fm := <-out:
+		if fm.msg.Text != "after the junk" {
+			t.Fatalf("got %q, want the message after the junk line", fm.msg.Text)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("follower stalled on an unparseable line")

@@ -707,6 +707,41 @@ func TestSubscribeAndUnsubscribe(t *testing.T) {
 	}
 }
 
+func TestSetDeliveryRejectsAnInvalidMode(t *testing.T) {
+	withHome(t)
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+	if err := SetDelivery("aaaa1111-2222", "deploys", "bogus"); err == nil {
+		t.Fatal("SetDelivery accepted an invalid mode")
+	}
+	if e, _ := ReadEntry("aaaa1111-2222"); e.Delivery != nil {
+		t.Errorf("Delivery = %v after a rejected mode, want untouched", e.Delivery)
+	}
+}
+
+// Setting a topic back to push removes its key rather than storing "push"
+// explicitly, so a session that never touched delivery modes and one that
+// dialled every topic back to push look identical on disk.
+func TestSetDeliveryToPushRemovesTheEntry(t *testing.T) {
+	withHome(t)
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+
+	if err := SetDelivery("aaaa1111-2222", "deploys", DeliveryDigest); err != nil {
+		t.Fatalf("SetDelivery (digest): %v", err)
+	}
+	e, _ := ReadEntry("aaaa1111-2222")
+	if e.Delivery["deploys"] != DeliveryDigest {
+		t.Fatalf("Delivery[deploys] = %q, want %q", e.Delivery["deploys"], DeliveryDigest)
+	}
+
+	if err := SetDelivery("aaaa1111-2222", "deploys", DeliveryPush); err != nil {
+		t.Fatalf("SetDelivery (push): %v", err)
+	}
+	e, _ = ReadEntry("aaaa1111-2222")
+	if _, ok := e.Delivery["deploys"]; ok {
+		t.Errorf("Delivery still has a %q key after setting it back to push: %v", "deploys", e.Delivery)
+	}
+}
+
 func TestSubscribeStartsAtEndOfLog(t *testing.T) {
 	withHome(t)
 	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
@@ -811,10 +846,10 @@ func TestFollowSourceDeliversNewLinesOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out := make(chan *Message, 4)
+	out := make(chan followedMessage, 4)
 	stop := make(chan struct{})
 	defer close(stop)
-	go followSource(path, endOffset(path), out, stop, nil, func(string, ...any) {})
+	go followSource(path, endOffset(path), "topic", out, stop, func(string, ...any) {})
 
 	post, _ := json.Marshal(&Message{ID: "new", Text: "after", From: Sender{Kind: "shell"}})
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
@@ -827,9 +862,9 @@ func TestFollowSourceDeliversNewLinesOnly(t *testing.T) {
 	f.Close()
 
 	select {
-	case m := <-out:
-		if m.ID != "new" {
-			t.Fatalf("got message %q, want only lines appended after start", m.ID)
+	case fm := <-out:
+		if fm.msg.ID != "new" {
+			t.Fatalf("got message %q, want only lines appended after start", fm.msg.ID)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for the appended line")
@@ -843,10 +878,10 @@ func TestFollowSourceRecoversFromTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out := make(chan *Message, 4)
+	out := make(chan followedMessage, 4)
 	stop := make(chan struct{})
 	defer close(stop)
-	go followSource(path, endOffset(path), out, stop, nil, func(string, ...any) {})
+	go followSource(path, endOffset(path), "topic", out, stop, func(string, ...any) {})
 
 	// Truncate, then write a fresh message: the follower must reset rather
 	// than sit past the end of a shorter file forever.
@@ -856,9 +891,9 @@ func TestFollowSourceRecoversFromTruncation(t *testing.T) {
 	}
 
 	select {
-	case m := <-out:
-		if m.ID != "fresh" {
-			t.Fatalf("got %q, want fresh", m.ID)
+	case fm := <-out:
+		if fm.msg.ID != "fresh" {
+			t.Fatalf("got %q, want fresh", fm.msg.ID)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("follower did not recover from truncation")
@@ -1353,10 +1388,10 @@ func TestFollowerResumesFromCursorAfterCompaction(t *testing.T) {
 
 	// The follower starts past the old entry, as a caught-up reader would. Its
 	// offset is logical, so it keeps meaning the same place after the cut.
-	out := make(chan *Message, 8)
+	out := make(chan followedMessage, 8)
 	stop := make(chan struct{})
 	defer close(stop)
-	go followSource(path, cut, out, stop, nil, func(string, ...any) {})
+	go followSource(path, cut, "topic", out, stop, func(string, ...any) {})
 
 	// Compact away the prefix the follower has already passed, exactly as
 	// pruneTopicDir does it: rewrite, then record what was cut.
@@ -1369,9 +1404,9 @@ func TestFollowerResumesFromCursorAfterCompaction(t *testing.T) {
 	write("fresh")
 
 	select {
-	case m := <-out:
-		if m.ID != "fresh" {
-			t.Fatalf("got %q; the follower replayed compacted history instead of resuming", m.ID)
+	case fm := <-out:
+		if fm.msg.ID != "fresh" {
+			t.Fatalf("got %q; the follower replayed compacted history instead of resuming", fm.msg.ID)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("follower stalled after the log was compacted")

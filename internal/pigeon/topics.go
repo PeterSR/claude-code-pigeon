@@ -418,6 +418,60 @@ func (n Namespace) Unsubscribe(sessionID, topic string) error {
 	})
 }
 
+// Delivery modes a topic may be set to (see Entry.Delivery). There is no mode
+// for the direct spool: see the comment on Entry.Delivery for why.
+const (
+	DeliveryPush   = "push"   // notify immediately, one line per message
+	DeliveryDigest = "digest" // collapse routine messages into one line a minute
+	DeliveryQuiet  = "quiet"  // never notify a message directly, only the digest line
+)
+
+// validDeliveryMode rejects anything but the three values Entry.Delivery may
+// hold for a topic, the same defence-in-depth as validatePriority: an entry is
+// a file on disk and can be hand-edited, so a stored value is never trusted
+// without being checked again wherever it is read.
+func validDeliveryMode(mode string) error {
+	switch mode {
+	case DeliveryPush, DeliveryDigest, DeliveryQuiet:
+		return nil
+	}
+	return fmt.Errorf("delivery mode %q is not valid; use %q, %q or %q", mode, DeliveryPush, DeliveryDigest, DeliveryQuiet)
+}
+
+// SetDelivery changes how topic reaches sessionID. RunMonitor reads the
+// entry fresh for every message it delivers (see its deliver closure), so
+// this takes effect at least as fast as a subscribe or unsubscribe does --
+// well within subCheckInterval -- without a restart.
+func SetDelivery(sessionID, topic, mode string) error {
+	return CurrentNamespace().SetDelivery(sessionID, topic, mode)
+}
+
+func (n Namespace) SetDelivery(sessionID, topic, mode string) error {
+	ref, err := ParseTopicRef(topic)
+	if err != nil {
+		return err
+	}
+	if err := validDeliveryMode(mode); err != nil {
+		return err
+	}
+	return n.MutateEntry(sessionID, func(e *Entry) error {
+		// Push is the default and the absent case reads the same way, so
+		// setting it back to push removes the key rather than storing it
+		// explicitly. Otherwise a session that has never touched delivery
+		// modes at all and one that dialled every topic back to push would
+		// look different on disk for no behavioural reason.
+		if mode == DeliveryPush {
+			delete(e.Delivery, ref.String())
+			return nil
+		}
+		if e.Delivery == nil {
+			e.Delivery = map[string]string{}
+		}
+		e.Delivery[ref.String()] = mode
+		return nil
+	})
+}
+
 // --- log bases -------------------------------------------------------------
 //
 // A cursor is a LOGICAL offset: bytes since the beginning of a log's life,

@@ -359,11 +359,9 @@ func TestFollowerLosesNothingAcrossACompaction(t *testing.T) {
 	}
 
 	// Now follow from the stored cursor, as a restarting monitor does.
-	out := make(chan *Message, total)
+	out := make(chan followedMessage, total)
 	stop := make(chan struct{})
-	go followSource(path, ns.readCursors(slow.SessionID)["busy"], out, stop,
-		func(at int64) { _ = ns.mutateCursors(slow.SessionID, func(m map[string]int64) { m["busy"] = at }) },
-		func(string, ...any) {})
+	go followSource(path, ns.readCursors(slow.SessionID)["busy"], "busy", out, stop, func(string, ...any) {})
 
 	got := 0
 	deadline := time.After(10 * time.Second)

@@ -65,6 +65,17 @@ type Entry struct {
 	ClaudeName       string `json:"claudeName,omitempty"`
 	ClaudeNameSource string `json:"claudeNameSource,omitempty"`
 	Driven           bool   `json:"driven,omitempty"`
+	// Delivery maps a subscribed topic to how it reaches this session: absent
+	// (or "push") notifies per message, "digest" collapses routine traffic
+	// into one line a minute (an alert or a message naming this session in
+	// `for` still pushes immediately), "quiet" notifies nothing but that one
+	// line, ever -- see RunMonitor's delivery switch for the exact rules.
+	//
+	// The direct spool has no key here and cannot be configured: a message
+	// addressed to this session personally is not chatter to be batched, it
+	// is mail for exactly one reader, so RunMonitor never even looks this map
+	// up for it.
+	Delivery map[string]string `json:"delivery,omitempty"`
 	// Private sessions publish no cwd and no description. The flag itself is
 	// published so this session can be told why its own entry looks bare.
 	Private bool `json:"private,omitempty"`

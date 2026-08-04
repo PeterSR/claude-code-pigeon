@@ -26,6 +26,12 @@ const subCheckInterval = time.Second
 // produce too many events, so we suppress and report rather than get killed.
 const maxPerMinute = 30
 
+// digestInterval is how often a digest or quiet topic's buffered messages are
+// collapsed into one notification line. A var, not a const, so a test can
+// shrink it rather than wait a real minute for a flush; see withDigestInterval
+// in monitor_test.go.
+var digestInterval = time.Minute
+
 // overrunGrace is how many polls a follower waits when the log is shorter than
 // its own position before deciding this is not a compaction. Compaction leaves
 // that window open for one rename plus one small write, so a handful of polls
@@ -130,7 +136,7 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	var closeOnce sync.Once
 	defer closeOnce.Do(func() { close(done) })
 
-	lines := make(chan *Message, 256)
+	lines := make(chan followedMessage, 256)
 
 	go heartbeat(ns, sid, done)
 	go watchdog(CurrentClaudePID(), sigc, done, logf)
@@ -140,9 +146,7 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	// The spool is never compacted, so its base is always zero and a logical
 	// offset is a file position. followSource re-derives that either way.
 	inboxOffset := ns.readCursors(sid)[inboxCursorKey]
-	go followSource(spool, inboxOffset, lines, done,
-		func(off int64) { _ = ns.mutateCursors(sid, func(c map[string]int64) { c[inboxCursorKey] = off }) },
-		logf)
+	go followSource(spool, inboxOffset, inboxCursorKey, lines, done, logf)
 
 	// Topics: started and stopped as subscriptions change.
 	go manageSubscriptions(ns, sid, lines, done, logf)
@@ -153,25 +157,210 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 
 	emit, flushSuppressed := newRateLimiter(stdout, ns, sid, spool, time.Minute)
 	defer flushSuppressed()
+
+	// persistCursor advances source's monitor cursor to at, and only ever
+	// forward: mutateCursors is a plain read-modify-write, so without the
+	// guard a message arriving out of order -- or this call racing a seed --
+	// could walk the cursor backwards and replay history that was already
+	// notified.
+	//
+	// Called once per message, and only once it has been HANDLED: pushed,
+	// dropped as this session's own broadcast, suppressed by the rate
+	// limiter, or folded into a digest that has since flushed. See
+	// followSource's doc comment for why ownership moved here.
+	persistCursor := func(source string, at int64) {
+		_ = ns.mutateCursors(sid, func(c map[string]int64) {
+			if at > c[source] {
+				c[source] = at
+			}
+		})
+	}
+
+	// digests buffers topic messages held for a digest or quiet topic, keyed
+	// by source (a topic string). Touched only from this goroutine -- both
+	// message arrival and the flush tick run through the select loop below --
+	// so it needs no lock. A key's presence in the map, not merely its count,
+	// is what advanceCursor below treats as "something on this topic is still
+	// unflushed": bufferDigest never leaves a zero-count entry behind, so the
+	// two conditions are the same thing asked two ways.
+	digests := map[string]*digestState{}
+	flushDigests := func() {
+		for topic, st := range digests {
+			if st.count == 0 {
+				continue
+			}
+			fmt.Fprintln(stdout, renderDigestLine(topic, st.count, st.senders))
+			// The buffer's highest offset is safe to persist only now: the
+			// digest line naming it has actually reached the session.
+			persistCursor(topic, st.maxOffset)
+		}
+		clear(digests)
+	}
+	defer flushDigests()
+
+	// advanceCursor persists a handled message's offset, UNLESS an earlier
+	// message on the same topic is still sitting in an unflushed digest
+	// buffer. Every message on one topic comes off one append-only log
+	// through one follower, so any message reaching here while that topic
+	// has a pending buffer necessarily sits past the oldest thing in it --
+	// persisting its offset would silently carry the cursor over a message
+	// nothing has notified about yet. So the cursor for that topic simply
+	// does not move again until the buffer flushes and takes it there itself.
+	// A message frozen out this way is not lost: it is exactly where
+	// followSource left it, and a restart re-reads it rather than skipping
+	// it, which is the redeliver-over-drop rule this whole design follows.
+	//
+	// This also covers a session's own broadcast on a digest topic: dropping
+	// it is still "handled" and still must not jump the cursor past a peer's
+	// message still waiting on the same buffer.
+	advanceCursor := func(fm followedMessage) {
+		if fm.msg.Topic != "" {
+			if _, pending := digests[fm.msg.Topic]; pending {
+				return
+			}
+		}
+		persistCursor(fm.source, fm.offset)
+	}
+
+	// deliver routes one handled-off-the-log message according to its topic's
+	// delivery mode, and is the one place that decides push vs. digest vs.
+	// quiet. The direct spool never reaches the mode switch at all: it has no
+	// Delivery entry to look up (see Entry.Delivery), so every direct message
+	// is push, unconditionally.
+	deliver := func(fm followedMessage) {
+		m := fm.msg
+		if m.Topic == "" {
+			emit(m)
+			persistCursor(fm.source, fm.offset)
+			return
+		}
+
+		mode := DeliveryPush
+		self, err := ns.ReadEntry(sid)
+		if err == nil && self.Delivery != nil {
+			if v, ok := self.Delivery[m.Topic]; ok {
+				mode = v
+			}
+		}
+
+		alert := m.Priority == PriorityAlert
+		// Mirrors Render's own "addressed" test: a For list naming everyone
+		// (empty) is not a personal mention, only one that actually names
+		// this session is.
+		namedFor := len(m.For) > 0 && m.IsFor(self)
+
+		switch mode {
+		case DeliveryQuiet:
+			// Absolute, by design: a peer's self-assessed urgency cannot
+			// override a session that asked not to be interrupted. Whatever
+			// alert or For says, the most it earns is a line at the next
+			// digest tick, exactly like everything else on this topic.
+			bufferDigest(digests, m.Topic, fm)
+		case DeliveryDigest:
+			if alert || namedFor {
+				emit(m)
+				advanceCursor(fm)
+			} else {
+				bufferDigest(digests, m.Topic, fm)
+			}
+		default:
+			// DeliveryPush, or a value this build does not recognise -- an
+			// entry is a file on disk and can be hand-edited -- fails open to
+			// the safer behaviour rather than silently swallowing a message.
+			emit(m)
+			advanceCursor(fm)
+		}
+	}
+
+	digestTicker := time.NewTicker(digestInterval)
+	defer digestTicker.Stop()
+
 	for {
 		select {
 		case <-sigc:
 			logf("shutting down")
 			return nil
-		case m := <-lines:
-			// Never wake a session with its own broadcast.
-			if m.From.SessionID != "" && m.From.SessionID == sid {
+		case <-digestTicker.C:
+			flushDigests()
+		case fm := <-lines:
+			// Never wake a session with its own broadcast, but it has still
+			// been handled: advance the cursor or the same message is
+			// reconsidered forever.
+			if fm.msg.From.SessionID != "" && fm.msg.From.SessionID == sid {
+				advanceCursor(fm)
 				continue
 			}
-			emit(m)
+			deliver(fm)
 		}
 	}
+}
+
+// followedMessage pairs a message read off a source with what it takes to
+// advance that source's cursor once the message has been handled: the cursor
+// key (inboxCursorKey, or a topic's TopicRef.String()) and the logical offset
+// immediately after this message in that source. followSource stamps both, so
+// the delivery side never has to ask which follower a message came from.
+type followedMessage struct {
+	msg    *Message
+	source string
+	offset int64
+}
+
+// digestState buffers what a digest or quiet topic has accumulated since its
+// last flush: how many messages, who sent them (in the order first seen, for
+// a reproducible line), and how far the cursor may move once this buffer is
+// actually flushed -- never before, or a monitor that dies with messages
+// still sitting here would resume past them and they would never be seen.
+type digestState struct {
+	count      int
+	senders    []string
+	seenSender map[string]bool
+	maxOffset  int64
+}
+
+// bufferDigest folds fm into topic's digest buffer, creating it on first use.
+func bufferDigest(digests map[string]*digestState, topic string, fm followedMessage) {
+	st, ok := digests[topic]
+	if !ok {
+		st = &digestState{seenSender: map[string]bool{}}
+		digests[topic] = st
+	}
+	st.count++
+	if name := fm.msg.From.Display(); !st.seenSender[name] {
+		st.seenSender[name] = true
+		st.senders = append(st.senders, name)
+	}
+	if fm.offset > st.maxOffset {
+		st.maxOffset = fm.offset
+	}
+}
+
+// digestSenderNameLimit bounds one sender's name in a digest line, matching
+// the bound Render places on the same field: a name is peer-controlled (see
+// Sanitize), so it gets the same defensive truncation here as everywhere else
+// it is rendered.
+const digestSenderNameLimit = 40
+
+// renderDigestLine is the one line a digest or quiet topic produces per
+// flush, naming the topic, how many messages piled up, and who sent them --
+// e.g. "[pigeon] 6 waiting on #inventory-chain from indkoeb-ui, ad-hoc,
+// project-overview -- read with the inbox tool". Bounded by RenderBudget like
+// every other notification line, for the same reason: Claude Code clips a
+// longer one and there is no payload pointer here to lose.
+func renderDigestLine(topic string, count int, senders []string) string {
+	names := make([]string, len(senders))
+	for i, s := range senders {
+		names[i] = truncate(Sanitize(s), digestSenderNameLimit)
+	}
+	line := fmt.Sprintf("[pigeon] %d waiting on %s from %s -- read with the inbox tool",
+		count, TopicLabel(topic), strings.Join(names, ", "))
+	return truncate(line, RenderBudget)
 }
 
 // manageSubscriptions starts a follower per subscribed topic and stops it when
 // the session unsubscribes, re-reading the registry entry as the source of
 // truth so MCP and CLI changes both take effect without a restart.
-func manageSubscriptions(ns Namespace, sid string, out chan<- *Message, done <-chan struct{}, logf func(string, ...any)) {
+func manageSubscriptions(ns Namespace, sid string, out chan<- followedMessage, done <-chan struct{}, logf func(string, ...any)) {
 	type follower struct{ stop chan struct{} }
 	active := map[string]*follower{}
 
@@ -228,11 +417,8 @@ func manageSubscriptions(ns Namespace, sid string, out chan<- *Message, done <-c
 				off = readBase(path) + endOffset(path)
 			}
 			tp := topic
-			persist := func(at int64) {
-				_ = ns.mutateCursors(sid, func(c map[string]int64) { c[tp] = at })
-			}
 			logf("following topic %q from offset %d", topic, off)
-			go followSource(path, off, out, stop, persist, logf)
+			go followSource(path, off, tp, out, stop, logf)
 		}
 
 		for topic, f := range active {
@@ -472,9 +658,22 @@ func endOffset(path string) int64 {
 }
 
 // followSource tails an NDJSON log from a LOGICAL offset, tolerating
-// compaction, truncation, and a file that does not exist yet. persist, when
-// non-nil, records the logical offset so a restart resumes rather than
-// replays.
+// compaction, truncation, and a file that does not exist yet. source is the
+// cursor key this log is filed under (inboxCursorKey, or a topic's
+// TopicRef.String()); it is stamped onto every message this loop emits so the
+// delivery side, not this one, can decide when a cursor is safe to move.
+//
+// It deliberately does not persist a cursor itself. That used to happen here,
+// once per read pass, right after the pass's messages were pushed into the
+// channel and before any of them had been rendered, folded into a digest, or
+// even looked at -- so the cursor recorded ingestion, not delivery. A digest
+// can hold a message for up to a minute inside a process known to die on
+// session resume without always being rearmed; if the cursor had already
+// moved past a message still sitting in that buffer, a restarted follower
+// would resume beyond it and the message would never be seen again, by
+// monitor or digest alike. So cursor ownership
+// belongs to whoever decides a message has actually been handled -- pushed,
+// dropped, suppressed, or flushed out of a digest -- which is never this loop.
 //
 // Working in logical offsets is what makes this safe against a concurrent
 // compaction. The physical position is derived from the base on every pass, so
@@ -482,8 +681,8 @@ func endOffset(path string) int64 {
 // read: there is no shared number for the compactor and this loop to race
 // over, and no window in which one of them sees the file in one era and the
 // cursor in another.
-func followSource(path string, offset int64, out chan<- *Message, stop <-chan struct{},
-	persist func(int64), logf func(string, ...any)) {
+func followSource(path string, offset int64, source string, out chan<- followedMessage, stop <-chan struct{},
+	logf func(string, ...any)) {
 
 	// Consecutive passes seeing a file shorter than our position. Compaction
 	// produces exactly one or two of these; anything sustained is not one.
@@ -577,16 +776,13 @@ func followSource(path string, offset int64, out chan<- *Message, stop <-chan st
 				continue
 			}
 			select {
-			case out <- m:
+			case out <- followedMessage{msg: m, source: source, offset: offset}:
 			case <-stop:
 				f.Close()
 				return
 			}
 		}
 		f.Close()
-		if persist != nil {
-			persist(offset)
-		}
 	}
 }
 

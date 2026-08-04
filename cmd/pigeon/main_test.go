@@ -353,6 +353,49 @@ func TestSubscribeTakesExactlyOneTopic(t *testing.T) {
 	}
 }
 
+// --- delivery ----------------------------------------------------------------
+
+func TestDeliverySetsAndListsNonDefaultModes(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+
+	r := invoke(t, "delivery")
+	wantContains(t, r, "stdout", "every topic is push")
+
+	if r := invoke(t, "delivery", "deploys", "digest"); r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	e, err := pigeon.ReadEntry("aaaa1111-0000-0000-0000-000000000000")
+	if err != nil {
+		t.Fatalf("ReadEntry: %v", err)
+	}
+	if e.Delivery["deploys"] != pigeon.DeliveryDigest {
+		t.Errorf("Delivery[deploys] = %q, want %q", e.Delivery["deploys"], pigeon.DeliveryDigest)
+	}
+
+	r = invoke(t, "delivery")
+	wantContains(t, r, "stdout", "#deploys")
+	wantContains(t, r, "stdout", "digest")
+
+	// Setting it back to push removes the entry rather than storing the
+	// default explicitly (see Namespace.SetDelivery).
+	if r := invoke(t, "delivery", "deploys", "push"); r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	r = invoke(t, "delivery")
+	wantContains(t, r, "stdout", "every topic is push")
+}
+
+func TestDeliveryRejectsAnInvalidMode(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+	r := invoke(t, "delivery", "deploys", "bogus")
+	if r.code != 1 {
+		t.Errorf("exit = %d, want 1\n%s", r.code, r)
+	}
+	wantContains(t, r, "stderr", "not valid")
+}
+
 // --- identity --------------------------------------------------------------
 
 func TestNameSetsAnAddressAndRejectsBadOnes(t *testing.T) {

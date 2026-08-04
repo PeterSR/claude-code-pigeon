@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"text/tabwriter"
 
@@ -45,6 +46,7 @@ const usage = `pigeon -- message passing between live Claude Code sessions
   pigeon publish <topic> <text>  publish to a topic (everyone subscribed)
   pigeon subscribe <topic>       start receiving a topic in this session
   pigeon unsubscribe <topic>     stop receiving it
+  pigeon delivery [<topic> <push|digest|quiet>]  set or list per-topic delivery modes
   pigeon listen [topic...]       receive messages in this shell (blocks)
   pigeon inbox [--all] [--peek]  read this session's mail (brief by default; --subjects, --full)
   pigeon topics                  list topics and subscriber counts
@@ -102,6 +104,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		err = cmdSubscribe(rest, stdout)
 	case "unsubscribe", "unsub":
 		err = cmdUnsubscribe(rest, stdout)
+	case "delivery":
+		err = cmdDelivery(rest, stdout, stderr)
 	case "listen":
 		err = cmdListen(rest, stdout, stderr)
 	case "inbox":
@@ -533,6 +537,43 @@ func cmdUnsubscribe(args []string, w io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(w, "unsubscribed from %s\n", pigeon.TopicLabel(args[0]))
+	return nil
+}
+
+// cmdDelivery is get-or-set, like cmdName: with a topic and a mode it sets
+// this session's delivery for that topic; with neither it lists whatever is
+// not already push, since push is the default and listing every topic at the
+// default would just be `pigeon topics` with an extra column nobody asked for.
+func cmdDelivery(args []string, w, stderr io.Writer) error {
+	e, err := ownEntry()
+	if err != nil {
+		return err
+	}
+	if len(args) == 0 {
+		if len(e.Delivery) == 0 {
+			fmt.Fprintln(w, "every topic is push (the default); nothing is set to digest or quiet")
+			return nil
+		}
+		topics := make([]string, 0, len(e.Delivery))
+		for t := range e.Delivery {
+			topics = append(topics, t)
+		}
+		sort.Strings(topics)
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "TOPIC\tMODE")
+		for _, t := range topics {
+			fmt.Fprintf(tw, "%s\t%s\n", pigeon.TopicLabel(t), e.Delivery[t])
+		}
+		return tw.Flush()
+	}
+	if len(args) != 2 {
+		return fmt.Errorf("usage: pigeon delivery [<topic> <push|digest|quiet>]")
+	}
+	if err := pigeon.SetDelivery(e.SessionID, args[0], args[1]); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "delivery for %s set to %s (takes effect within a second, no restart)\n",
+		pigeon.TopicLabel(args[0]), args[1])
 	return nil
 }
 

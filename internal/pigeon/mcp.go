@@ -209,6 +209,28 @@ func tools() []toolDef {
 			}),
 		},
 		{
+			Name: "set_delivery",
+			Description: "How a topic reaches you. push notifies per message; digest collapses " +
+				"them into one line a minute and you read them with the inbox tool; quiet " +
+				"notifies only the digest line. An alert or a message naming you still interrupts " +
+				"a digest topic, but never a quiet one.",
+			InputSchema: obj(map[string]any{
+				"type": "object",
+				"properties": obj(map[string]any{
+					"topic": obj(map[string]any{
+						"type":        "string",
+						"description": "Topic to set delivery for. '@name' selects the machine-wide one.",
+					}),
+					"mode": obj(map[string]any{
+						"type":        "string",
+						"enum":        []string{"push", "digest", "quiet"},
+						"description": "push (default): notify per message. digest: one line a minute. quiet: only that line, ever.",
+					}),
+				}),
+				"required": []string{"topic", "mode"},
+			}),
+		},
+		{
 			Name: "list_topics",
 			Description: "List the topics reachable from this session -- its namespace's own, " +
 				"plus the machine-wide '@' ones -- and how many live sessions subscribe to each.",
@@ -496,6 +518,13 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 			return "", err
 		}
 		return mcpSubscription(ns, name, a.Topic)
+	case "set_delivery":
+		var a struct {
+			Topic string `json:"topic"`
+			Mode  string `json:"mode"`
+		}
+		_ = json.Unmarshal(raw, &a)
+		return mcpSetDelivery(a.Topic, a.Mode)
 	case "inbox":
 		return mcpInbox(raw)
 	case "list_topics":
@@ -676,6 +705,21 @@ func mcpSubscription(ns Namespace, action, topic string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("Unsubscribed from %s.", TopicLabel(topic)), nil
+}
+
+func mcpSetDelivery(topic, mode string) (string, error) {
+	sid := CurrentSessionID()
+	if sid == "" {
+		return "", fmt.Errorf("not running inside a Claude Code session")
+	}
+	if strings.TrimSpace(topic) == "" {
+		return "", fmt.Errorf("'topic' is required")
+	}
+	if err := SetDelivery(sid, topic, mode); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Delivery for %s set to %s. Takes effect within about a second.",
+		TopicLabel(topic), mode), nil
 }
 
 func mcpTopics() (string, error) {

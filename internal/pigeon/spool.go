@@ -29,14 +29,23 @@ const BodyBudget = 300
 // order to read an overflowing message.
 const RenderBudget = 460
 
-// SubjectLimit caps a message's subject line, in runes. validateSubject
+// SubjectLimit caps a message's subject line, in runes. validateBounded
 // rejects an oversize subject at send time rather than truncating it: the
 // subject is the one part of a message guaranteed to reach the recipient (see
 // Render), so cutting it silently would leave the sender believing a shorter
 // line arrived intact when it did not. Render enforces the same bound again,
 // independently, because a spool line can be hand-written and never pass
-// through validateSubject at all.
+// through validateBounded at all.
 const SubjectLimit = 120
+
+// BriefLimit caps a message's brief, in runes. A brief is the default view of
+// `inbox`, not the notification path, so it does not need Subject's "must
+// survive a hard clip" discipline -- but it still has to be an outright
+// reject rather than a silent truncation, for the same reason a sender must
+// be able to trust that a subject arrived exactly as written: 600 runes is
+// generous enough for two or three real sentences while stopping a "brief"
+// that is actually the whole message again.
+const BriefLimit = 600
 
 // Sender identifies who sent a message. Stamped automatically -- a session
 // never has to state its own address, so replies always have somewhere to go.
@@ -87,6 +96,12 @@ type Message struct {
 	Topic   string `json:"topic,omitempty"`
 	Text    string `json:"text"`
 	Subject string `json:"subject,omitempty"`
+	// Brief is the middle tier between Subject and Text: a sender-written
+	// summary long enough to decide whether the full body is worth reading.
+	// It never reaches Render (see Render's doc comment) -- only `inbox`'s
+	// pull path shows it -- so it carries none of Subject's "must survive a
+	// hard clip" weight.
+	Brief   string `json:"brief,omitempty"`
 	Payload string `json:"payload,omitempty"`
 	ReplyTo string `json:"replyTo,omitempty"`
 }
@@ -96,6 +111,7 @@ type Message struct {
 type Draft struct {
 	Text    string
 	Subject string
+	Brief   string
 	ReplyTo string
 }
 
@@ -282,18 +298,24 @@ func truncate(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-// validateSubject sanitises a subject line and enforces SubjectLimit,
-// rejecting an oversize subject outright rather than truncating it -- the
-// same reasoning as SubjectLimit's own comment. An empty subject after
-// sanitising is not an error: it simply means none was given. Shared by Send
-// and Publish so the rule cannot drift between the two paths.
-func validateSubject(s string) (string, error) {
-	subj := Sanitize(s)
-	if n := len([]rune(subj)); n > SubjectLimit {
-		return "", fmt.Errorf("subject is %d runes; the limit is %d", n, SubjectLimit)
+// validateBounded sanitises a field and rejects it outright if it is over
+// limit runes, rather than truncating it: a sender has to be able to trust
+// that what arrived is exactly what was written, and a silent truncation
+// breaks that promise as thoroughly as no limit at all would. An empty
+// result after sanitising is not an error -- it simply means none was given.
+// Shared by every bounded field (subject, brief) across Send and Publish so
+// the rule cannot drift between fields or between the two paths.
+func validateBounded(field, s string, limit int) (string, error) {
+	v := Sanitize(s)
+	if n := len([]rune(v)); n > limit {
+		return "", fmt.Errorf("%s is %d runes; the limit is %d", field, n, limit)
 	}
-	return subj, nil
+	return v, nil
 }
+
+func validateSubject(s string) (string, error) { return validateBounded("subject", s, SubjectLimit) }
+
+func validateBrief(s string) (string, error) { return validateBounded("brief", s, BriefLimit) }
 
 // SubjectNudge returns a hint to append to a send/publish confirmation when
 // the message left with no subject and a body long enough that the recipient
@@ -329,6 +351,10 @@ func (n Namespace) Send(to *Entry, d Draft, from Sender) (*Message, error) {
 	if err != nil {
 		return nil, err
 	}
+	brief, err := validateBrief(d.Brief)
+	if err != nil {
+		return nil, err
+	}
 
 	msg := &Message{
 		ID:      newMessageID(),
@@ -337,6 +363,7 @@ func (n Namespace) Send(to *Entry, d Draft, from Sender) (*Message, error) {
 		To:      to.SessionID,
 		Text:    body,
 		Subject: subject,
+		Brief:   brief,
 		ReplyTo: d.ReplyTo,
 	}
 

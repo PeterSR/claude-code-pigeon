@@ -46,7 +46,7 @@ const usage = `pigeon -- message passing between live Claude Code sessions
   pigeon subscribe <topic>       start receiving a topic in this session
   pigeon unsubscribe <topic>     stop receiving it
   pigeon listen [topic...]       receive messages in this shell (blocks)
-  pigeon inbox [--all] [--peek]  read this session's mail with full text
+  pigeon inbox [--all] [--peek]  read this session's mail (brief by default; --subjects, --full)
   pigeon topics                  list topics and subscriber counts
   pigeon namespaces              list namespaces and their session counts
   pigeon namespace [<name>]      show or set the namespace this shell uses
@@ -346,10 +346,11 @@ func cmdList(args []string, w, stderr io.Writer) error {
 
 func cmdSend(args []string, w, stderr io.Writer) error {
 	fs := flags("send", stderr)
-	var nsName, asName, subject string
+	var nsName, asName, subject, brief string
 	nsFlag(fs, &nsName)
 	asFlag(fs, &asName)
 	fs.StringVar(&subject, "subject", "", "one-line subject, max 120 characters; the only part guaranteed to arrive")
+	fs.StringVar(&brief, "brief", "", "a short summary, max 600 characters; what `pigeon inbox` shows by default")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -358,7 +359,7 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf("usage: pigeon send [-n <namespace>] [--as <name>] [--subject <text>] <target> <text>")
+		return fmt.Errorf("usage: pigeon send [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] <target> <text>")
 	}
 	if err := misplacedFlag(rest[1:]); err != nil {
 		return err
@@ -376,7 +377,7 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	msg, err := ns.Send(to, pigeon.Draft{Text: text, Subject: subject}, pigeon.ActingSender(asName))
+	msg, err := ns.Send(to, pigeon.Draft{Text: text, Subject: subject, Brief: brief}, pigeon.ActingSender(asName))
 	if err != nil {
 		return err
 	}
@@ -415,7 +416,7 @@ func misplacedFlag(rest []string) error {
 			name = name[:i]
 		}
 		switch name {
-		case "subject", "n", "namespace", "as":
+		case "subject", "brief", "n", "namespace", "as":
 			return fmt.Errorf("%q came after a positional argument, so it was read as message text rather than as a flag; put flags before the target and the body", a)
 		}
 	}
@@ -424,10 +425,11 @@ func misplacedFlag(rest []string) error {
 
 func cmdPublish(args []string, w, stderr io.Writer) error {
 	fs := flags("publish", stderr)
-	var nsName, asName, subject string
+	var nsName, asName, subject, brief string
 	nsFlag(fs, &nsName)
 	asFlag(fs, &asName)
 	fs.StringVar(&subject, "subject", "", "one-line subject, max 120 characters; the only part guaranteed to arrive")
+	fs.StringVar(&brief, "brief", "", "a short summary, max 600 characters; what `pigeon inbox` shows by default")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -436,7 +438,7 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf("usage: pigeon publish [-n <namespace>] [--as <name>] [--subject <text>] <topic> <text>")
+		return fmt.Errorf("usage: pigeon publish [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] <topic> <text>")
 	}
 	if err := misplacedFlag(rest[1:]); err != nil {
 		return err
@@ -446,7 +448,7 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	msg, err := ns.Publish(topic, pigeon.Draft{Text: text, Subject: subject}, pigeon.ActingSender(asName))
+	msg, err := ns.Publish(topic, pigeon.Draft{Text: text, Subject: subject, Brief: brief}, pigeon.ActingSender(asName))
 	if err != nil {
 		return err
 	}
@@ -558,6 +560,8 @@ func cmdInbox(args []string, w, stderr io.Writer) error {
 	all := fs.Bool("all", false, "include messages already read, not only new ones")
 	peek := fs.Bool("peek", false, "do not mark returned messages as read")
 	subjects := fs.Bool("subjects", false, "print only subject lines, not full bodies")
+	brief := fs.Bool("brief", false, "print the sender's brief (default); falls back to the full body when none was written")
+	full := fs.Bool("full", false, "print whole message bodies")
 	var topic string
 	fs.StringVar(&topic, "topic", "", "only this topic")
 	if err := fs.Parse(args); err != nil {
@@ -576,9 +580,26 @@ func cmdInbox(args []string, w, stderr io.Writer) error {
 			"(install the plugin and restart, or run `pigeon arm`)")
 	}
 
+	// The three flags describe one choice, not three independent ones -- a
+	// caller who sets more than one has said something contradictory that
+	// silently picking a winner would hide.
+	set := 0
+	for _, b := range []bool{*subjects, *brief, *full} {
+		if b {
+			set++
+		}
+	}
+	if set > 1 {
+		return fmt.Errorf("give at most one of --subjects, --brief, --full")
+	}
 	wantDetail := ""
-	if *subjects {
+	switch {
+	case *subjects:
 		wantDetail = "subject"
+	case *full:
+		wantDetail = "full"
+	case *brief:
+		wantDetail = "brief"
 	}
 	detail, err := pigeon.ResolveInboxDetail(wantDetail)
 	if err != nil {

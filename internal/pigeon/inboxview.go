@@ -12,17 +12,25 @@ import (
 // call RenderInbox so the two surfaces never drift apart.
 
 // ResolveInboxDetail normalises the "detail" argument shared by the inbox MCP
-// tool and the `pigeon inbox` CLI: "" defaults to "full", anything else must
-// be one of the two values the renderer understands. Rejecting a typo here
-// is better than silently treating it as "full" and hiding the mistake.
+// tool and the `pigeon inbox` CLI: "" defaults to "brief", anything else must
+// be one of the three values the renderer understands. Rejecting a typo here
+// is better than silently treating it as "brief" and hiding the mistake.
+//
+// "brief" is the default rather than "full" because a reader given only those
+// two choices measurably takes the cheap one: real usage showed 72% of pulls
+// reading a 300-char notification prefix rather than pay for a whole ~2000-
+// char body. A short, sender-written summary as the default gives a middle
+// tier cheap enough to actually read.
 func ResolveInboxDetail(s string) (string, error) {
 	switch s {
-	case "", "full":
+	case "", "brief":
+		return "brief", nil
+	case "full":
 		return "full", nil
 	case "subject":
 		return "subject", nil
 	default:
-		return "", fmt.Errorf("detail must be \"full\" or \"subject\", got %q", s)
+		return "", fmt.Errorf("detail must be \"subject\", \"brief\" or \"full\", got %q", s)
 	}
 }
 
@@ -94,11 +102,20 @@ func inboxSummary(items []InboxItem, unreadOnly bool) string {
 }
 
 // writeInboxItem appends one message's block: a header line dense enough to
-// triage without opening the body, the subject if there is one, and -- unless
-// detail is "subject" -- the full body. Nothing here is truncated: a pull is
-// a Read, not a push bound by BodyBudget, and the whole point of the tool is
-// that draining a burst this way costs less than the notifications it
-// replaces.
+// triage without opening the body, the subject if there is one, and then a
+// body governed by detail:
+//
+//   - "subject" -- nothing further; the header and SUBJECT line are all the
+//     tool exists to give at this tier.
+//   - "brief" -- the sender's Brief. A sender who wrote none leaves nothing
+//     to summarise, so this falls back to the full Text rather than show an
+//     empty tier -- but says so, so the reader knows it is seeing everything
+//     rather than mistake a full body for a short one.
+//   - "full" -- the full Text, unconditionally.
+//
+// Nothing here is truncated: a pull is a Read, not a push bound by
+// BodyBudget, and the whole point of the tool is that draining a burst this
+// way costs less than the notifications it replaces.
 func writeInboxItem(b *strings.Builder, it InboxItem, detail string) {
 	ts := "?"
 	if t, err := time.Parse(time.RFC3339, it.Message.TS); err == nil {
@@ -113,8 +130,17 @@ func writeInboxItem(b *strings.Builder, it InboxItem, detail string) {
 	if it.Message.Subject != "" {
 		fmt.Fprintf(b, "  SUBJECT: %s\n", it.Message.Subject)
 	}
-	if detail != "subject" {
+	switch detail {
+	case "subject":
+		return
+	case "full":
 		fmt.Fprintf(b, "  %s\n", it.Message.Text)
+	default: // "brief"
+		if it.Message.Brief != "" {
+			fmt.Fprintf(b, "  %s\n", it.Message.Brief)
+			return
+		}
+		fmt.Fprintf(b, "  (no brief written -- showing the full text)\n  %s\n", it.Message.Text)
 	}
 }
 

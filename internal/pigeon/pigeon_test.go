@@ -282,6 +282,42 @@ func TestPublishRejectsAnOversizeSubject(t *testing.T) {
 	}
 }
 
+// A brief over BriefLimit is rejected outright, not truncated -- the same
+// promise SubjectLimit makes, generalised by validateBounded rather than
+// re-implemented for the second field.
+func TestSendRejectsAnOversizeBrief(t *testing.T) {
+	withHome(t)
+	to := liveEntry(t, "cccc3333-6666", "", "/tmp/z3")
+	over := strings.Repeat("b", BriefLimit+1)
+	_, err := Send(to, Draft{Text: "hello", Brief: over}, Sender{Kind: "shell", Name: "sh"})
+	if err == nil {
+		t.Fatal("expected an error for a brief over the limit")
+	}
+	if !strings.Contains(err.Error(), "601") || !strings.Contains(err.Error(), "600") {
+		t.Errorf("error should name both the actual and allowed length: %v", err)
+	}
+	if !strings.Contains(err.Error(), "brief") {
+		t.Errorf("error should name the field: %v", err)
+	}
+	// A rejected draft must leave no trace, the same guarantee an oversize
+	// subject gets.
+	if _, err := os.Stat(SpoolPath(to.SessionID)); !os.IsNotExist(err) {
+		t.Error("Send wrote to the spool despite rejecting the brief")
+	}
+}
+
+func TestPublishRejectsAnOversizeBrief(t *testing.T) {
+	withHome(t)
+	over := strings.Repeat("b", BriefLimit+1)
+	_, err := Publish("deploys", Draft{Text: "shipped", Brief: over}, Sender{Kind: "shell", Name: "sh"})
+	if err == nil {
+		t.Fatal("expected an error for a brief over the limit")
+	}
+	if !strings.Contains(err.Error(), "601") || !strings.Contains(err.Error(), "600") {
+		t.Errorf("error should name both the actual and allowed length: %v", err)
+	}
+}
+
 func TestSendConcurrentWritersDoNotInterleave(t *testing.T) {
 	withHome(t)
 	to := liveEntry(t, "dddd4444-5555", "", "/tmp/w")
@@ -386,6 +422,34 @@ func TestRenderWithoutSubjectMatchesTheOriginalFormat(t *testing.T) {
 	want := "[pigeon #deploys] from alpha (api) :: v2.1 rolled out [reply: pigeon send alpha] [topic: pigeon publish deploys]"
 	if got != want {
 		t.Errorf("Render() = %q, want %q -- adding Subject changed the no-subject format", got, want)
+	}
+}
+
+// A brief is a pull-path concern only: Render builds the notification line,
+// and the notification budget did not grow to make room for it. A message
+// with a brief must therefore render byte-identical to the same message with
+// none -- the field is additive at the inbox tier and invisible everywhere
+// else.
+func TestRenderIgnoresBrief(t *testing.T) {
+	withBrief := &Message{
+		From:    Sender{Kind: "session", SessionID: "aaaa1111-2222", Name: "alpha", Cwd: "/home/p/api"},
+		Topic:   "deploys",
+		Text:    "v2.1 rolled out",
+		Subject: "release",
+		Brief:   "The 2.1 release rolled out to every region with no errors.",
+	}
+	withoutBrief := &Message{
+		From:    withBrief.From,
+		Topic:   withBrief.Topic,
+		Text:    withBrief.Text,
+		Subject: withBrief.Subject,
+	}
+	got, want := Render(withBrief), Render(withoutBrief)
+	if got != want {
+		t.Errorf("Render() with a brief = %q, want byte-identical to without one: %q", got, want)
+	}
+	if strings.Contains(got, withBrief.Brief) {
+		t.Errorf("Render() leaked the brief into the notification line: %q", got)
 	}
 }
 

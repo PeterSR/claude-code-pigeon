@@ -107,6 +107,12 @@ func tools() []toolDef {
 							"characters. It is the only part guaranteed to reach the recipient, " +
 							"who may never see anything else.",
 					}),
+					"brief": obj(map[string]any{
+						"type": "string",
+						"description": "Two or three sentences: what a peer needs in order to " +
+							"decide whether to read the rest. Max 600 characters. Readers see " +
+							"this by default, so write it as if it is all they will read.",
+					}),
 					"namespace": namespaceArg("resolve the target in"),
 				}),
 				"required": []string{"to", "text"},
@@ -133,6 +139,12 @@ func tools() []toolDef {
 						"description": "One line: the conclusion, not the topic. Max 120 " +
 							"characters. It is the only part guaranteed to reach the recipient, " +
 							"who may never see anything else.",
+					}),
+					"brief": obj(map[string]any{
+						"type": "string",
+						"description": "Two or three sentences: what a peer needs in order to " +
+							"decide whether to read the rest. Max 600 characters. Readers see " +
+							"this by default, so write it as if it is all they will read.",
 					}),
 					"namespace": namespaceArg("publish into"),
 				}),
@@ -197,10 +209,10 @@ func tools() []toolDef {
 		},
 		{
 			Name: "inbox",
-			Description: "Read messages sent to this session, with their full text. " +
-				"Notifications are clipped at about 300 characters and long messages spill to " +
-				"a file; this returns the whole thing, and one call drains a whole burst. By " +
-				"default it returns what you have not read yet and marks it read.",
+			Description: "Read messages sent to this session. Notifications are clipped at " +
+				"about 300 characters and long messages spill to a file; this returns as much " +
+				"as detail asks for, and one call drains a whole burst. By default it returns " +
+				"the sender's brief for what you have not read yet, and marks it read.",
 			InputSchema: obj(map[string]any{
 				"type": "object",
 				"properties": obj(map[string]any{
@@ -223,9 +235,10 @@ func tools() []toolDef {
 					}),
 					"detail": obj(map[string]any{
 						"type": "string",
-						"enum": []string{"full", "subject"},
-						"description": "full returns whole message bodies; subject returns only " +
-							"the one-line subject and sender, for triage. Default full.",
+						"enum": []string{"subject", "brief", "full"},
+						"description": "subject returns one line per message; brief (default) " +
+							"returns the sender's summary; full returns whole bodies. Prefer brief " +
+							"unless you need the detail.",
 					}),
 				}),
 			}),
@@ -413,6 +426,7 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 			To        string `json:"to"`
 			Text      string `json:"text"`
 			Subject   string `json:"subject"`
+			Brief     string `json:"brief"`
 			Namespace string `json:"namespace"`
 		}
 		_ = json.Unmarshal(raw, &a)
@@ -420,12 +434,13 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return mcpSend(ns, a.To, a.Text, a.Subject)
+		return mcpSend(ns, a.To, a.Text, a.Subject, a.Brief)
 	case "publish":
 		var a struct {
 			Topic     string `json:"topic"`
 			Text      string `json:"text"`
 			Subject   string `json:"subject"`
+			Brief     string `json:"brief"`
 			Namespace string `json:"namespace"`
 		}
 		_ = json.Unmarshal(raw, &a)
@@ -433,7 +448,7 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return mcpPublish(ns, a.Topic, a.Text, a.Subject)
+		return mcpPublish(ns, a.Topic, a.Text, a.Subject, a.Brief)
 	case "subscribe", "unsubscribe":
 		var a struct {
 			Topic     string `json:"topic"`
@@ -535,7 +550,7 @@ func elsewhereNote(ns Namespace) string {
 		"list_namespaces names them.", sessions, spaces)
 }
 
-func mcpSend(ns Namespace, to, text, subject string) (string, error) {
+func mcpSend(ns Namespace, to, text, subject, brief string) (string, error) {
 	if strings.TrimSpace(to) == "" || strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("both 'to' and 'text' are required")
 	}
@@ -543,7 +558,7 @@ func mcpSend(ns Namespace, to, text, subject string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	msg, err := ns.Send(target, Draft{Text: text, Subject: subject}, CurrentSender())
+	msg, err := ns.Send(target, Draft{Text: text, Subject: subject, Brief: brief}, CurrentSender())
 	if err != nil {
 		return "", err
 	}
@@ -560,11 +575,11 @@ func mcpSend(ns Namespace, to, text, subject string) (string, error) {
 	return b.String(), nil
 }
 
-func mcpPublish(ns Namespace, topic, text, subject string) (string, error) {
+func mcpPublish(ns Namespace, topic, text, subject, brief string) (string, error) {
 	if strings.TrimSpace(topic) == "" || strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("both 'topic' and 'text' are required")
 	}
-	msg, err := ns.Publish(topic, Draft{Text: text, Subject: subject}, CurrentSender())
+	msg, err := ns.Publish(topic, Draft{Text: text, Subject: subject, Brief: brief}, CurrentSender())
 	if err != nil {
 		return "", err
 	}

@@ -239,6 +239,10 @@ func (n Namespace) Publish(topic string, d Draft, from Sender) (*Message, error)
 	if err != nil {
 		return nil, err
 	}
+	brief, err := validateBrief(d.Brief)
+	if err != nil {
+		return nil, err
+	}
 
 	msg := &Message{
 		ID:      newMessageID(),
@@ -247,6 +251,7 @@ func (n Namespace) Publish(topic string, d Draft, from Sender) (*Message, error)
 		Topic:   ref.String(),
 		Text:    body,
 		Subject: subject,
+		Brief:   brief,
 	}
 	if len([]rune(body)) > BodyBudget {
 		p := filepath.Join(ref.payloadsDir(n), msg.ID+".txt")

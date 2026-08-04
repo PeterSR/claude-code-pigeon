@@ -559,6 +559,69 @@ func TestInboxToolDetailSubjectOmitsBody(t *testing.T) {
 	}
 }
 
+// The default tier is brief, not full: a reader given only "prefix or
+// everything" measurably took the cheap prefix most of the time, so the
+// default has to be the cheap-but-readable middle tier instead of the whole
+// body.
+func TestInboxToolDefaultDetailReturnsBriefNotFullBody(t *testing.T) {
+	withHome(t)
+	sid := "jjjj0000-1111"
+	t.Setenv(EnvSessionID, sid)
+	me := liveEntry(t, sid, "me", "/tmp/me")
+	long := strings.Repeat("x", BodyBudget+50)
+	if _, err := DefaultNamespace().Send(me, Draft{
+		Text: long, Subject: "the subject", Brief: "a short brief that is not the body",
+	}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "inbox", map[string]any{})
+	if !strings.Contains(got, "a short brief that is not the body") {
+		t.Errorf("default detail did not show the brief:\n%s", got)
+	}
+	if strings.Contains(got, long) {
+		t.Errorf("default detail showed the full body, not the brief:\n%s", got)
+	}
+}
+
+// A sender who wrote no brief must not leave the reader with nothing: the
+// brief tier falls back to the full text rather than hide the message behind
+// a summary that was never written.
+func TestInboxToolBriefFallsBackToFullTextWhenNoneWritten(t *testing.T) {
+	withHome(t)
+	sid := "kkkk1111-2222"
+	t.Setenv(EnvSessionID, sid)
+	me := liveEntry(t, sid, "me", "/tmp/me")
+	if _, err := DefaultNamespace().Send(me, Draft{Text: "the whole body, no brief given"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "inbox", map[string]any{"detail": "brief"})
+	if !strings.Contains(got, "the whole body, no brief given") {
+		t.Errorf("brief tier hid the body of a message with no brief:\n%s", got)
+	}
+}
+
+// detail: "full" must return the body even when a brief exists -- the two
+// tiers are alternative views, not a fallback chain that always prefers the
+// short one.
+func TestInboxToolDetailFullReturnsBodyEvenWhenABriefExists(t *testing.T) {
+	withHome(t)
+	sid := "llll2222-3333"
+	t.Setenv(EnvSessionID, sid)
+	me := liveEntry(t, sid, "me", "/tmp/me")
+	if _, err := DefaultNamespace().Send(me, Draft{
+		Text: "the full body text", Brief: "the short brief",
+	}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "inbox", map[string]any{"detail": "full"})
+	if !strings.Contains(got, "the full body text") {
+		t.Errorf("detail: full did not return the body:\n%s", got)
+	}
+}
+
 func TestInboxToolRejectsAnUnknownDetailValue(t *testing.T) {
 	withHome(t)
 	sid := "iiii9999-0000"

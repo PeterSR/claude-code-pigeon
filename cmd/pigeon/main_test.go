@@ -1022,3 +1022,102 @@ func TestPublishAllowsABodyThatLooksLikeAnUnknownFlag(t *testing.T) {
 		t.Fatalf("unexpected rejection: %v", err)
 	}
 }
+
+// --- inbox -------------------------------------------------------------
+
+// The CLI twin of the MCP inbox tool renders the same full body text a
+// notification would have clipped, using the same shared RenderInbox path.
+func TestInboxRendersFullBodyAndSubject(t *testing.T) {
+	withHome(t)
+	me := asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+
+	long := strings.Repeat("x", pigeon.BodyBudget+50)
+	if _, err := pigeon.DefaultNamespace().Send(me, pigeon.Draft{Text: long, Subject: "big one"}, pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	r := invoke(t, "inbox")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", long)
+	wantContains(t, r, "stdout", "SUBJECT: big one")
+}
+
+// --peek must not advance the read cursor: a second, default call sees the
+// same message again.
+func TestInboxPeekLeavesMessagesUnread(t *testing.T) {
+	withHome(t)
+	me := asSession(t, "bbbb2222-0000-0000-0000-000000000000", "beta")
+	if _, err := pigeon.DefaultNamespace().Send(me, pigeon.Draft{Text: "hello"}, pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	r := invoke(t, "inbox", "--peek")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", "hello")
+
+	r2 := invoke(t, "inbox")
+	if r2.code != 0 {
+		t.Fatalf("%s", r2)
+	}
+	wantContains(t, r2, "stdout", "hello")
+}
+
+// --subjects prints the header and subject only, never the body.
+func TestInboxSubjectsFlagOmitsBody(t *testing.T) {
+	withHome(t)
+	me := asSession(t, "cccc3333-0000-0000-0000-000000000000", "gamma")
+	if _, err := pigeon.DefaultNamespace().Send(me, pigeon.Draft{Text: "the body text", Subject: "the subject"}, pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	r := invoke(t, "inbox", "--subjects")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", "SUBJECT: the subject")
+	if strings.Contains(r.stdout, "the body text") {
+		t.Errorf("--subjects leaked the body:\n%s", r)
+	}
+}
+
+// --all surfaces history already marked read, not only unread mail.
+func TestInboxAllShowsAlreadyReadHistory(t *testing.T) {
+	withHome(t)
+	me := asSession(t, "dddd4444-0000-0000-0000-000000000000", "delta")
+	if _, err := pigeon.DefaultNamespace().Send(me, pigeon.Draft{Text: "already seen"}, pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+	if r := invoke(t, "inbox"); r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+
+	// Default (unread only) now finds nothing left.
+	r := invoke(t, "inbox")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", "No unread messages")
+	wantContains(t, r, "stdout", "--all")
+
+	r2 := invoke(t, "inbox", "--all")
+	if r2.code != 0 {
+		t.Fatalf("%s", r2)
+	}
+	wantContains(t, r2, "stdout", "already seen")
+}
+
+// A plain shell has no session's mail to read, so inbox has to say that
+// plainly rather than surface Self's generic "not inside a session" error.
+func TestInboxOutsideASessionSaysSo(t *testing.T) {
+	withHome(t)
+	r := invoke(t, "inbox")
+	if r.code == 0 {
+		t.Fatalf("inbox outside a session should fail: %s", r)
+	}
+	wantContains(t, r, "stderr", "inbox")
+	wantContains(t, r, "stderr", "session")
+}

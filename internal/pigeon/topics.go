@@ -463,6 +463,28 @@ func (n Namespace) seedCursor(sessionID string, ref TopicRef) error {
 	end := readBase(path) + size
 	return n.mutateCursors(sessionID, func(m map[string]int64) {
 		m[ref.String()] = end
+		// Seed the consumption cursor to the same place, and only here.
+		//
+		// It cannot be left absent to fall back on the monitor's cursor at read
+		// time, because the monitor advances its own within about 200ms of a
+		// message landing -- long before any session gets round to asking for
+		// it. A consumption cursor that chased it would find everything already
+		// behind it and ReadInbox would answer "nothing unread" forever, which
+		// is the whole feature rendered inert.
+		//
+		// Seeded together and then left alone, the two say different true
+		// things: the monitor's is how far notifications have got, and this one
+		// is how far the session has actually read.
+		// readat is deliberately NOT set here. It is written only when
+		// ReadInbox actually advances this cursor, so its absence means "this
+		// session has never pulled" -- and compaction treats a never-pulled
+		// cursor as abandoned rather than letting every session that only ever
+		// takes notifications hold its topic logs open for the staleness
+		// window. Pulling once opts a session into that protection; never
+		// pulling costs the fleet nothing.
+		if _, seen := m[readCursorKey(ref.String())]; !seen {
+			m[readCursorKey(ref.String())] = end
+		}
 	})
 }
 

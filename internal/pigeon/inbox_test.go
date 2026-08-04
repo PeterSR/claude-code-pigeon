@@ -36,7 +36,43 @@ func appendRawMessage(t *testing.T, path string, m *Message) {
 // rule: a session pulling for the first time must resume from its monitor
 // cursor, not dump its whole history into context just because it has never
 // called ReadInbox before.
-func TestReadInboxUnreadOnlySkipsAlreadyNotifiedHistory(t *testing.T) {
+func TestReadInboxTreatsEverythingSinceSubscribeAsUnread(t *testing.T) {
+	withHome(t)
+	sid := "aaaa1111-2222"
+	liveEntry(t, sid, "alpha", "/tmp/a")
+	if err := Subscribe(sid, "chatter"); err != nil {
+		t.Fatal(err)
+	}
+
+	from := Sender{Kind: "shell", Name: "sh"}
+	for i := 0; i < 4; i++ {
+		if _, err := Publish("chatter", Draft{Text: fmt.Sprintf("msg-%d", i)}, from); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The monitor ingests and notifies all four, moving its own cursor to the
+	// end. That must not consume them on the session's behalf: being told about
+	// a message is not the same as having read it.
+	if err := mutateCursors(sid, func(m map[string]int64) {
+		m["chatter"] = endOffset(TopicPath("chatter"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := DefaultNamespace().ReadInbox(sid, InboxQuery{UnreadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 4 {
+		t.Fatalf("got %d items, want 4: the monitor's ingest consumed messages the session never read", len(items))
+	}
+}
+
+// A session registered before the consumption cursors existed has none, and
+// must not have its entire backlog dumped into context on the first pull. With
+// the key absent the monitor's own position is the only honest estimate of what
+// it has already been shown.
+func TestReadInboxFallsBackToTheMonitorCursorForALegacySession(t *testing.T) {
 	withHome(t)
 	sid := "aaaa1111-2222"
 	liveEntry(t, sid, "alpha", "/tmp/a")
@@ -50,11 +86,13 @@ func TestReadInboxUnreadOnlySkipsAlreadyNotifiedHistory(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Simulate a monitor that already ingested (and notified) these two: park
-	// the MONITOR cursor at the current end of the log, exactly what
-	// followSource does after a read pass.
 	notified := endOffset(TopicPath("chatter"))
-	if err := mutateCursors(sid, func(m map[string]int64) { m["chatter"] = notified }); err != nil {
+	if err := mutateCursors(sid, func(m map[string]int64) {
+		m["chatter"] = notified
+		// Predate this feature: no consumption cursor was ever written.
+		delete(m, readCursorKey("chatter"))
+		delete(m, readAtCursorKey("chatter"))
+	}); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
@@ -68,19 +106,15 @@ func TestReadInboxUnreadOnlySkipsAlreadyNotifiedHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(items) != 2 {
-		t.Fatalf("got %d items, want 2: the whole 4-message history came back instead of "+
-			"just what followed the monitor cursor", len(items))
+		t.Fatalf("got %d items, want 2: a legacy session got its whole history instead of what followed the monitor cursor", len(items))
 	}
 	for _, it := range items {
-		if len(it.Message.Text) >= 4 && it.Message.Text[:4] == "old-" {
+		if strings.HasPrefix(it.Message.Text, "old-") {
 			t.Errorf("ReadInbox returned pre-cursor history: %q", it.Message.Text)
 		}
 	}
 }
 
-// TestReadInboxMarkReadAdvancesOnlyTheConsumptionCursor guards the two cursor
-// families staying separate: a pull must never move the cursor the monitor
-// uses to decide what to notify.
 func TestReadInboxMarkReadAdvancesOnlyTheConsumptionCursor(t *testing.T) {
 	withHome(t)
 	sid := "bbbb2222-3333"
@@ -235,9 +269,14 @@ func TestPruneTopicsCompactsWhenNoSessionHasEverPulled(t *testing.T) {
 	if full.Size() < minCompactBytes {
 		t.Skipf("log is only %d bytes, below the %d compaction threshold", full.Size(), minCompactBytes)
 	}
-	// Only the monitor cursor exists here -- no session has ever called
-	// ReadInbox, which is the fleet-wide state on day one.
-	if err := mutateCursors(sid, func(m map[string]int64) { m["busy"] = full.Size() }); err != nil {
+	// A session registered before consumption cursors existed: only the
+	// monitor cursor is on disk. A naive fix that trusted the missing key's
+	// zero value would collapse the cut to 0 and stop compaction fleet-wide.
+	if err := mutateCursors(sid, func(m map[string]int64) {
+		m["busy"] = full.Size()
+		delete(m, readCursorKey("busy"))
+		delete(m, readAtCursorKey("busy"))
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := readCursors(sid)["read:busy"]; ok {
@@ -483,5 +522,98 @@ func TestReadInboxDoesNotAdvancePastAGapInsideOneSource(t *testing.T) {
 		if !found {
 			t.Fatalf("%s was skipped by the cursor and is now unreachable; second pull returned %v", want, texts)
 		}
+	}
+}
+
+// The monitor advances its own cursor within about 200ms of a message landing,
+// long before any session asks for it. If the consumption cursor were left
+// absent and fell back on the monitor's at read time, every pull would find
+// everything already behind it and answer "nothing unread" forever. Seeding the
+// two together at registration is what keeps them saying different true things.
+func TestReadInboxStillSeesWhatTheMonitorHasAlreadyIngested(t *testing.T) {
+	withHome(t)
+	me := armed(t, "aaaa1111", "me")
+	ns := CurrentNamespace()
+	if err := ns.Subscribe(me.SessionID, "chatter"); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := ParseTopicRef("chatter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ns.seedCursor(me.SessionID, ref); err != nil {
+		t.Fatal(err)
+	}
+
+	topic := ns.TopicPath("chatter")
+	appendRawMessage(t, topic, &Message{
+		ID: "m_seen", TS: nowRFC3339(), Topic: "chatter",
+		From: Sender{Kind: "session", SessionID: "bbbb2222", Name: "peer", Namespace: ns.String()},
+		Text: "published, then ingested by the monitor before anyone asked",
+	})
+
+	// Simulate the monitor ingesting it: its cursor moves to the end of the log.
+	if err := ns.mutateCursors(me.SessionID, func(m map[string]int64) {
+		m["chatter"] = readBase(topic) + endOffset(topic)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ns.ReadInbox(me.SessionID, InboxQuery{UnreadOnly: true, MarkRead: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("the monitor's ingest hid the message from the pull path; got %d items", len(got))
+	}
+	if got[0].Message.ID != "m_seen" {
+		t.Fatalf("unexpected message: %+v", got[0].Message)
+	}
+}
+
+// The day-one state now that Subscribe seeds a consumption cursor: the key
+// exists but readat does not, because nobody has pulled. That must not hold the
+// log open -- a session that only ever takes notifications would otherwise pin
+// every topic it subscribes to for the whole staleness window. Pulling once is
+// what opts a session into that protection.
+func TestPruneTopicsCompactsForASeededButNeverPulledCursor(t *testing.T) {
+	requireRenameOverOpenFile(t)
+	withHome(t)
+	sid := "eeee5555-7777"
+	liveEntry(t, sid, "echo", "/tmp/e")
+	if err := Subscribe(sid, "busy"); err != nil {
+		t.Fatal(err)
+	}
+	from := Sender{Kind: "shell", Name: "sh"}
+	body := strings.Repeat("x", 250)
+	for i := 0; i < 600; i++ {
+		if _, err := Publish("busy", Draft{Text: body}, from); err != nil {
+			t.Fatal(err)
+		}
+	}
+	full, err := os.Stat(TopicPath("busy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full.Size() < minCompactBytes {
+		t.Skipf("log is only %d bytes, below the %d compaction threshold", full.Size(), minCompactBytes)
+	}
+	if err := mutateCursors(sid, func(m map[string]int64) { m["busy"] = full.Size() }); err != nil {
+		t.Fatal(err)
+	}
+	cur := readCursors(sid)
+	if _, ok := cur[readCursorKey("busy")]; !ok {
+		t.Fatal("Subscribe no longer seeds a consumption cursor; this test is checking nothing")
+	}
+	if _, ok := cur[readAtCursorKey("busy")]; ok {
+		t.Fatal("a seeded cursor must not carry a readat -- its absence is what marks it never-pulled")
+	}
+
+	res, err := PruneTopics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.TopicsCompacted != 1 {
+		t.Fatalf("TopicsCompacted = %d, want 1: a never-pulled cursor held the log open", res.TopicsCompacted)
 	}
 }

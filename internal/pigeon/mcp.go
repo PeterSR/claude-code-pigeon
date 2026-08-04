@@ -196,6 +196,41 @@ func tools() []toolDef {
 			}),
 		},
 		{
+			Name: "inbox",
+			Description: "Read messages sent to this session, with their full text. " +
+				"Notifications are clipped at about 300 characters and long messages spill to " +
+				"a file; this returns the whole thing, and one call drains a whole burst. By " +
+				"default it returns what you have not read yet and marks it read.",
+			InputSchema: obj(map[string]any{
+				"type": "object",
+				"properties": obj(map[string]any{
+					"limit": obj(map[string]any{
+						"type":        "integer",
+						"description": "How many messages. Default 10, maximum 50.",
+					}),
+					"unread_only": obj(map[string]any{
+						"type":        "boolean",
+						"description": "Only messages you have not pulled before. Default true.",
+					}),
+					"topic": obj(map[string]any{
+						"type":        "string",
+						"description": "Only this topic. Omit for everything, including direct messages.",
+					}),
+					"mark_read": obj(map[string]any{
+						"type": "boolean",
+						"description": "Advance your read position over what is returned. Default " +
+							"true. Pass false to look without consuming.",
+					}),
+					"detail": obj(map[string]any{
+						"type": "string",
+						"enum": []string{"full", "subject"},
+						"description": "full returns whole message bodies; subject returns only " +
+							"the one-line subject and sender, for triage. Default full.",
+					}),
+				}),
+			}),
+		},
+		{
 			Name: "set_identity",
 			Description: "Declare this session's name and/or description so other sessions " +
 				"can find and address it. The name must be a single word and unique among " +
@@ -410,6 +445,8 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 			return "", err
 		}
 		return mcpSubscription(ns, name, a.Topic)
+	case "inbox":
+		return mcpInbox(raw)
 	case "list_topics":
 		return mcpTopics()
 	case "list_namespaces":
@@ -621,6 +658,55 @@ func mcpNamespaces() (string, error) {
 		"or addressed without naming theirs, and a session cannot move: its namespace is fixed " +
 		"when it starts. '@' topics reach every namespace.")
 	return b.String(), nil
+}
+
+// mcpInbox resolves this session's identity through Self, never
+// CurrentSessionID. A per-turn tool process holds whatever session id
+// CLAUDE_CODE_SESSION_ID has right now, which after a /clear is a fresh id
+// the monitor and registry entry never adopt -- see the Self doc in self.go.
+// Reading or advancing the cursor of a session id nobody actually owns would
+// corrupt that other session's read position, so a Self failure is reported
+// rather than papered over with a guess.
+func mcpInbox(raw json.RawMessage) (string, error) {
+	var a struct {
+		Limit      int    `json:"limit"`
+		UnreadOnly *bool  `json:"unread_only"`
+		Topic      string `json:"topic"`
+		MarkRead   *bool  `json:"mark_read"`
+		Detail     string `json:"detail"`
+	}
+	_ = json.Unmarshal(raw, &a)
+
+	detail, err := ResolveInboxDetail(a.Detail)
+	if err != nil {
+		return "", err
+	}
+
+	ns, e, err := Self()
+	if err != nil {
+		return "", fmt.Errorf("could not resolve this session's own pigeon identity (%w); "+
+			"is the plugin installed and this session registered?", err)
+	}
+
+	unreadOnly := true
+	if a.UnreadOnly != nil {
+		unreadOnly = *a.UnreadOnly
+	}
+	markRead := true
+	if a.MarkRead != nil {
+		markRead = *a.MarkRead
+	}
+
+	items, err := ns.ReadInbox(e.SessionID, InboxQuery{
+		Limit:      a.Limit,
+		UnreadOnly: unreadOnly,
+		Topic:      a.Topic,
+		MarkRead:   markRead,
+	})
+	if err != nil {
+		return "", err
+	}
+	return RenderInbox(items, unreadOnly, detail, "unread_only: false"), nil
 }
 
 func mcpWhoami() (string, error) {

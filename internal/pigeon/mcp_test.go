@@ -63,7 +63,7 @@ func TestToolsListIsComplete(t *testing.T) {
 
 	want := []string{
 		"list_sessions", "send_message", "publish", "subscribe",
-		"unsubscribe", "list_topics", "list_namespaces", "whoami", "set_identity",
+		"unsubscribe", "inbox", "list_topics", "list_namespaces", "whoami", "set_identity",
 	}
 	got := map[string]bool{}
 	for _, d := range defs {
@@ -490,6 +490,153 @@ func TestListNamespacesViaMCP(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("list_namespaces is missing %q:\n%s", want, got)
 		}
+	}
+}
+
+// --- inbox (Task 1 / Task 2) ------------------------------------------------
+
+func TestInboxToolReturnsFullBodyPastTheNotificationClip(t *testing.T) {
+	withHome(t)
+	sid := "aaaa1111-2222"
+	t.Setenv(EnvSessionID, sid)
+	me := liveEntry(t, sid, "me", "/tmp/me")
+
+	long := strings.Repeat("x", BodyBudget+50)
+	if _, err := DefaultNamespace().Send(me, Draft{Text: long, Subject: "big one"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "inbox", map[string]any{})
+	if !strings.Contains(got, long) {
+		t.Errorf("inbox did not return the full %d-char body, which a notification would have clipped at %d:\n%s",
+			len(long), BodyBudget, got)
+	}
+	if !strings.Contains(got, "SUBJECT: big one") {
+		t.Errorf("inbox is missing the subject line:\n%s", got)
+	}
+}
+
+func TestInboxToolMarkReadFalseLeavesTheCursorAlone(t *testing.T) {
+	withHome(t)
+	sid := "bbbb2222-3333"
+	t.Setenv(EnvSessionID, sid)
+	me := liveEntry(t, sid, "me", "/tmp/me")
+	if _, err := DefaultNamespace().Send(me, Draft{Text: "hello"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "inbox", map[string]any{"mark_read": false})
+	if !strings.Contains(got, "hello") {
+		t.Fatalf("expected the message body, got %q", got)
+	}
+	if _, ok := readCursors(sid)[readCursorKey(inboxCursorKey)]; ok {
+		t.Error("mark_read: false advanced the consumption cursor")
+	}
+
+	// Nothing was consumed by the peek, so a second, default pull must still
+	// see the same message.
+	got2 := toolText(t, "inbox", map[string]any{})
+	if !strings.Contains(got2, "hello") {
+		t.Errorf("second pull did not see the message the peek left unread:\n%s", got2)
+	}
+}
+
+func TestInboxToolDetailSubjectOmitsBody(t *testing.T) {
+	withHome(t)
+	sid := "cccc3333-4444"
+	t.Setenv(EnvSessionID, sid)
+	me := liveEntry(t, sid, "me", "/tmp/me")
+	if _, err := DefaultNamespace().Send(me, Draft{Text: "the body text", Subject: "the subject"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "inbox", map[string]any{"detail": "subject"})
+	if !strings.Contains(got, "SUBJECT: the subject") {
+		t.Errorf("missing subject line:\n%s", got)
+	}
+	if strings.Contains(got, "the body text") {
+		t.Errorf("detail: subject leaked the body:\n%s", got)
+	}
+}
+
+func TestInboxToolRejectsAnUnknownDetailValue(t *testing.T) {
+	withHome(t)
+	sid := "iiii9999-0000"
+	t.Setenv(EnvSessionID, sid)
+	liveEntry(t, sid, "me", "/tmp/me")
+
+	res, rerr := call(t, "tools/call", map[string]any{"name": "inbox", "arguments": map[string]any{"detail": "everything"}})
+	if rerr != nil {
+		t.Fatalf("unexpected protocol error: %v", rerr.Message)
+	}
+	if isErr, _ := res.(map[string]any)["isError"].(bool); !isErr {
+		t.Error("an unrecognised detail value should be an error result")
+	}
+}
+
+func TestInboxToolEmptyCaseReadsSensibly(t *testing.T) {
+	withHome(t)
+	sid := "dddd4444-5555"
+	t.Setenv(EnvSessionID, sid)
+	liveEntry(t, sid, "me", "/tmp/me")
+
+	got := toolText(t, "inbox", map[string]any{})
+	if !strings.Contains(got, "No unread messages") {
+		t.Errorf("got %q, want the empty-inbox message", got)
+	}
+	if !strings.Contains(got, "unread_only: false") {
+		t.Errorf("got %q, want a hint pointing at unread_only: false", got)
+	}
+
+	got2 := toolText(t, "inbox", map[string]any{"unread_only": false})
+	if got2 != "No messages." {
+		t.Errorf("got %q, want the plain no-messages line when unread_only is false", got2)
+	}
+}
+
+// The MCP process holds whatever session id CLAUDE_CODE_SESSION_ID has right
+// now, which after a /clear is a fresh id the monitor and its spool never
+// adopt. inbox must resolve identity through Self, the same fallback
+// CurrentSender uses, not through CurrentSessionID -- guessing here would
+// read, and mark read, a cursor file belonging to a session that never asked.
+func TestInboxToolResolvesIdentityThroughSelfAfterAClear(t *testing.T) {
+	withHome(t)
+	const armedWith = "aaaa1111-2222-3333-4444-555555555555"
+	want := cleared(t, armedWith, "ffff9999-8888-7777-6666-555555555555")
+
+	if _, err := DefaultNamespace().Send(want, Draft{Text: "still reachable"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+	if CurrentSessionID() == armedWith {
+		t.Fatal("test setup did not actually diverge the environment's id from the armed one")
+	}
+
+	got := toolText(t, "inbox", map[string]any{})
+	if !strings.Contains(got, "still reachable") {
+		t.Errorf("inbox did not resolve identity through Self after a clear:\n%s", got)
+	}
+}
+
+// A guessed session id would silently corrupt somebody else's read cursor, so
+// the failure has to be a legible error, not a fallback to a plain-shell
+// identity nobody asked for.
+func TestInboxToolFailsClearlyWithNoSessionToResolve(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "")
+
+	res, rerr := call(t, "tools/call", map[string]any{"name": "inbox", "arguments": map[string]any{}})
+	if rerr != nil {
+		t.Fatalf("unexpected protocol error: %v", rerr.Message)
+	}
+	m := res.(map[string]any)
+	if isErr, _ := m["isError"].(bool); !isErr {
+		t.Error("inbox with no session to resolve should be an error result")
+	}
+	content := m["content"].([]any)
+	first, _ := content[0].(map[string]any)
+	text, _ := first["text"].(string)
+	if !strings.Contains(text, "identity") {
+		t.Errorf("got %q, want a message about not being able to resolve identity", text)
 	}
 }
 

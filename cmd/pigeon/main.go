@@ -46,6 +46,7 @@ const usage = `pigeon -- message passing between live Claude Code sessions
   pigeon subscribe <topic>       start receiving a topic in this session
   pigeon unsubscribe <topic>     stop receiving it
   pigeon listen [topic...]       receive messages in this shell (blocks)
+  pigeon inbox [--all] [--peek]  read this session's mail with full text
   pigeon topics                  list topics and subscriber counts
   pigeon namespaces              list namespaces and their session counts
   pigeon namespace [<name>]      show or set the namespace this shell uses
@@ -103,6 +104,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		err = cmdUnsubscribe(rest, stdout)
 	case "listen":
 		err = cmdListen(rest, stdout, stderr)
+	case "inbox":
+		err = cmdInbox(rest, stdout, stderr)
 	case "topics":
 		err = cmdTopics(rest, stdout, stderr)
 	case "namespaces":
@@ -544,6 +547,55 @@ func cmdListen(args []string, stdout, stderr io.Writer) error {
 		Timeout:   *timeout,
 		TTY:       isTerminal(stdout),
 	}, stdout, stderr)
+}
+
+// cmdInbox is the CLI twin of the MCP inbox tool: same query knobs, same
+// renderer, so a human at a terminal and a model in the same session see
+// identical text.
+func cmdInbox(args []string, w, stderr io.Writer) error {
+	fs := flags("inbox", stderr)
+	limit := fs.Int("limit", 0, "how many messages (default 10, max 50)")
+	all := fs.Bool("all", false, "include messages already read, not only new ones")
+	peek := fs.Bool("peek", false, "do not mark returned messages as read")
+	subjects := fs.Bool("subjects", false, "print only subject lines, not full bodies")
+	var topic string
+	fs.StringVar(&topic, "topic", "", "only this topic")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	// This command is session-bound by definition -- it reads THIS session's
+	// mail -- so a plain shell gets a message that says that, rather than the
+	// raw "not inside a Claude Code session" Self returns for every caller.
+	if pigeon.CurrentSessionID() == "" {
+		return fmt.Errorf("inbox reads this session's own mail, and this shell is not inside a Claude Code session")
+	}
+	ns, e, err := pigeon.Self()
+	if err != nil {
+		return fmt.Errorf("this session is not registered with pigeon, so it has no inbox to read " +
+			"(install the plugin and restart, or run `pigeon arm`)")
+	}
+
+	wantDetail := ""
+	if *subjects {
+		wantDetail = "subject"
+	}
+	detail, err := pigeon.ResolveInboxDetail(wantDetail)
+	if err != nil {
+		return err
+	}
+	unreadOnly := !*all
+	items, err := ns.ReadInbox(e.SessionID, pigeon.InboxQuery{
+		Limit:      *limit,
+		UnreadOnly: unreadOnly,
+		Topic:      topic,
+		MarkRead:   !*peek,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(w, pigeon.RenderInbox(items, unreadOnly, detail, "--all"))
+	return nil
 }
 
 func cmdTopics(args []string, w, stderr io.Writer) error {

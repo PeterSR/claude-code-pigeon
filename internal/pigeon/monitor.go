@@ -341,6 +341,18 @@ func register(ns Namespace, sid string, logf func(string, ...any)) error {
 			_ = ns.seedCursor(sid, ref)
 		}
 	}
+
+	// The direct spool's consumption cursor is seeded here rather than in
+	// seedCursor, because the spool is not a topic and has no TopicRef. It
+	// takes the monitor's own position, which is 0 for a new session and the
+	// resumed offset for one coming back under the same id -- either way, the
+	// point this session begins reading from, not wherever notifications
+	// happen to have reached by the time it first asks.
+	if _, seen := existing[readCursorKey(inboxCursorKey)]; !seen {
+		_ = ns.mutateCursors(sid, func(m map[string]int64) {
+			m[readCursorKey(inboxCursorKey)] = m[inboxCursorKey]
+		})
+	}
 	return nil
 }
 

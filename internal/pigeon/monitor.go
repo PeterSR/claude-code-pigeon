@@ -155,7 +155,7 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	// for this session should survive until a monitor actually reads it.
 	defer ns.RemoveEntry(sid)
 
-	emit, flushSuppressed := newRateLimiter(stdout, ns, sid, spool, time.Minute)
+	emit, emitLine, flushSuppressed, rollWindow := newRateLimiter(stdout, ns, sid, spool, time.Minute)
 	defer flushSuppressed()
 
 	// persistCursor advances source's monitor cursor to at, and only ever
@@ -186,20 +186,46 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	// two conditions are no longer always the same thing -- presence is the
 	// one that is load-bearing.
 	digests := map[string]*digestState{}
-	flushDigests := func() {
+
+	// flushDigests emits one line per topic with anything buffered, and moves
+	// that topic's cursor -- the only place a digest topic's cursor moves.
+	//
+	// persist says whether the cursor may follow the line out. It is false on
+	// the way out of the process, and that distinction is the whole point:
+	// the dominant shutdown here is Claude Code killing the monitor when a
+	// session resumes or exits, so the reader on the other end of stdout is
+	// already gone or going. The line lands nowhere. Advancing the cursor over
+	// messages whose only notification was that lost line would leave a rearmed
+	// monitor resuming past them, and nothing would ever mention them again --
+	// exactly the silent loss moving the cursor to handled-time was meant to
+	// end. So on shutdown the line is written best-effort and the cursor stays
+	// put: a duplicate digest line after a restart is the cheap side of the
+	// trade, a message nobody ever hears about is the expensive one.
+	flushDigests := func(persist bool) {
 		for topic, st := range digests {
 			if n := st.count(); n > 0 {
-				fmt.Fprintln(stdout, renderDigestLine(topic, n, st.senderNames()))
+				if !emitLine(renderDigestLine(topic, n, st.senderNames())) {
+					// Either the reader is gone or the budget is spent.
+					// Nothing was delivered, so nothing may be marked handled:
+					// keep the buffer and let the next tick try again.
+					continue
+				}
+			}
+			if !persist {
+				// Shutdown. The line went out best-effort, but the cursor
+				// stays where it is so a rearmed monitor re-reads rather than
+				// resumes past what only that line announced.
+				delete(digests, topic)
+				continue
 			}
 			// Persisted even when every buffered message was dropped by a
 			// supersede: dropping one still counts as handling it (see
-			// resolveSupersede), and this is the only place a digest topic's
-			// cursor moves at all.
+			// resolveSupersede).
 			persistCursor(topic, st.maxOffset)
+			delete(digests, topic)
 		}
-		clear(digests)
 	}
-	defer flushDigests()
+	defer flushDigests(false)
 
 	// senders remembers which session sent each message id this monitor has
 	// itself followed off a log, in a bounded window -- the minimum state
@@ -239,16 +265,29 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	// is push, unconditionally.
 	deliver := func(fm followedMessage) {
 		m := fm.msg
-		if m.Topic == "" {
-			emit(m)
+		// Routed by fm.source throughout, never by m.Topic.
+		//
+		// followSource stamps source from the log it actually read; m.Topic is
+		// a field in a line on disk, and this codebase's standing assumption is
+		// that such a line may have been written by hand. Trusting it here
+		// corrupts cursors two ways. A line in topic X's log omitting "topic"
+		// would take the direct branch below and persist X's cursor
+		// unconditionally, carrying it past X's own unflushed digest buffer --
+		// the one thing the whole cursor rule forbids. A line claiming to be on
+		// topic Y would be buffered under Y and flush Y's cursor to an offset
+		// measured in X's log, and since cursors only move forward, Y would
+		// skip its own unread messages for good.
+		if fm.source == inboxCursorKey {
+			emit(fm)
 			persistCursor(fm.source, fm.offset)
 			return
 		}
+		topic := fm.source
 
 		mode := DeliveryPush
 		self, err := ns.ReadEntry(sid)
 		if err == nil && self.Delivery != nil {
-			if v, ok := self.Delivery[m.Topic]; ok {
+			if v, ok := self.Delivery[topic]; ok {
 				mode = v
 			}
 		}
@@ -261,23 +300,25 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 
 		switch mode {
 		case DeliveryQuiet:
+			logf("holding a message on %q for the digest (mode %s)", topic, mode)
 			// Absolute, by design: a peer's self-assessed urgency cannot
 			// override a session that asked not to be interrupted. Whatever
 			// alert or For says, the most it earns is a line at the next
 			// digest tick, exactly like everything else on this topic.
-			bufferDigest(digests, m.Topic, fm)
+			bufferDigest(digests, topic, fm)
 		case DeliveryDigest:
 			if alert || namedFor {
-				emit(m)
+				emit(fm)
 				advanceCursor(fm)
 			} else {
-				bufferDigest(digests, m.Topic, fm)
+				logf("holding a message on %q for the digest (mode %s)", topic, mode)
+				bufferDigest(digests, topic, fm)
 			}
 		default:
 			// DeliveryPush, or a value this build does not recognise -- an
 			// entry is a file on disk and can be hand-edited -- fails open to
 			// the safer behaviour rather than silently swallowing a message.
-			emit(m)
+			emit(fm)
 			advanceCursor(fm)
 		}
 	}
@@ -291,7 +332,12 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 			logf("shutting down")
 			return nil
 		case <-digestTicker.C:
-			flushDigests()
+			flushDigests(true)
+			// The suppression notice is otherwise written only lazily, from
+			// inside the next emit -- and the shape that suppresses an alert
+			// is a flood followed by silence, where there is no next emit for
+			// hours. This tick is the only thing that reliably comes round.
+			rollWindow()
 		case fm := <-lines:
 			// Recorded before anything else so a later message on the same
 			// log -- however it is delivered -- can still find this one's
@@ -982,7 +1028,19 @@ const alertReserve = 10
 // rather than captured once, so a For marker reflects a name declared (or
 // changed) via set_identity partway through the session's life instead of
 // whatever it was when the monitor armed.
-func newRateLimiter(w io.Writer, ns Namespace, sid, spool string, window time.Duration) (emit func(*Message), flush func()) {
+// newRateLimiter returns the three things the delivery loop needs to stay
+// inside the host's event budget.
+//
+// emit renders and writes one message. emitLine writes an already-rendered line
+// -- a digest summary -- and it exists because those lines used to bypass the
+// cap entirely: Claude Code kills a monitor that produces too many events, so a
+// session with fifteen digest topics could put forty-five uncounted lines a
+// minute on top of the thirty counted ones and lose its monitor altogether,
+// which is strictly worse than any amount of suppression. A digest line spends
+// from the alert reserve, since one of them stands in for many messages and is
+// the opposite of chatter. tick rolls the window from outside, so a suppression
+// notice does not wait on traffic that may never come.
+func newRateLimiter(w io.Writer, ns Namespace, sid, spool string, window time.Duration) (emit func(followedMessage), emitLine func(string) bool, flush func(), tick func()) {
 	windowStart := time.Now()
 	count := 0
 	// Suppression is tracked separately for alerts and normal traffic, per
@@ -1006,17 +1064,39 @@ func newRateLimiter(w io.Writer, ns Namespace, sid, spool string, window time.Du
 		clear(suppressedNormal)
 	}
 
-	emit = func(m *Message) {
+	roll := func() {
 		if time.Since(windowStart) >= window {
 			flush()
 			windowStart = time.Now()
 			count = 0
 		}
+	}
+	tick = roll
+
+	emitLine = func(line string) bool {
+		roll()
+		if count >= maxPerMinute {
+			return false
+		}
+		count++
+		if _, err := fmt.Fprintln(w, line); err != nil {
+			return false
+		}
+		return true
+	}
+
+	emit = func(fm followedMessage) {
+		m := fm.msg
+		roll()
 		alert := m.Priority == PriorityAlert
 		suppress := func(dest map[string]int) {
+			// Named from the source the follower actually read, not from the
+			// message's own topic field: the notice's whole job is to tell the
+			// recipient which log to go and read, and a hand-written line
+			// could otherwise send them to the wrong one.
 			src := spool
-			if m.Topic != "" {
-				if p := ns.TopicPath(m.Topic); p != "" {
+			if fm.source != inboxCursorKey {
+				if p := ns.TopicPath(fm.source); p != "" {
 					src = p
 				}
 			}
@@ -1037,7 +1117,7 @@ func newRateLimiter(w io.Writer, ns Namespace, sid, spool string, window time.Du
 		self, _ := ns.ReadEntry(sid)
 		fmt.Fprintln(w, ns.Render(m, self))
 	}
-	return emit, flush
+	return emit, emitLine, flush, tick
 }
 
 func sortedKeys(m map[string]int) []string {

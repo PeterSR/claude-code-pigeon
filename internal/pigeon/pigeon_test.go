@@ -908,9 +908,9 @@ func TestFollowSourceRecoversFromTruncation(t *testing.T) {
 func TestRateLimiterSuppressesFloods(t *testing.T) {
 	withHome(t)
 	var sb strings.Builder
-	emit, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute)
+	emit, _, _, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute)
 	for i := 0; i < maxPerMinute+25; i++ {
-		emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "line"})
+		emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "line"}, source: inboxCursorKey})
 	}
 	got := strings.Count(sb.String(), "\n")
 	want := maxPerMinute - alertReserve
@@ -927,14 +927,14 @@ func TestRateLimiterNamesTheLogASuppressedMessageIsIn(t *testing.T) {
 	withHome(t)
 	ns := DefaultNamespace()
 	var sb strings.Builder
-	emit, flush := newRateLimiter(&sb, ns, "", ns.SpoolPath("aaaa1111"), time.Minute)
+	emit, _, flush, _ := newRateLimiter(&sb, ns, "", ns.SpoolPath("aaaa1111"), time.Minute)
 
 	// Fill exactly the normal-traffic budget with direct messages, then
 	// suppress a topic message.
 	for i := 0; i < maxPerMinute-alertReserve; i++ {
-		emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "direct"})
+		emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "direct"}, source: inboxCursorKey})
 	}
-	emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Topic: "deploys", Text: "topic"})
+	emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Topic: "deploys", Text: "topic"}, source: "deploys"})
 
 	flush()
 
@@ -954,14 +954,14 @@ func TestRateLimiterNamesTheLogASuppressedMessageIsIn(t *testing.T) {
 func TestAlertSurvivesAFloodThatExhaustsTheNormalBudget(t *testing.T) {
 	withHome(t)
 	var sb strings.Builder
-	emit, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute)
+	emit, _, _, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute)
 
 	// Exhaust the normal-traffic budget and then some, so the flood alone
 	// would already be past what a plain cap could ever admit.
 	for i := 0; i < maxPerMinute; i++ {
-		emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "routine"})
+		emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "routine"}, source: inboxCursorKey})
 	}
-	emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Priority: PriorityAlert, Text: "the alert"})
+	emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Priority: PriorityAlert, Text: "the alert"}, source: inboxCursorKey})
 
 	if !strings.Contains(sb.String(), "the alert") {
 		t.Fatalf("an alert was suppressed by a flood of ordinary traffic it should have priority over:\n%s", sb.String())
@@ -975,18 +975,18 @@ func TestAlertSurvivesAFloodThatExhaustsTheNormalBudget(t *testing.T) {
 func TestSuppressionNoticeDistinguishesAlertsFromNormalMessages(t *testing.T) {
 	withHome(t)
 	var sb strings.Builder
-	emit, flush := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute)
+	emit, _, flush, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute)
 
 	// Fill the normal-traffic budget, then spend the whole alert reserve too,
 	// so both a normal message and an alert have nowhere left in the window.
 	for i := 0; i < maxPerMinute-alertReserve; i++ {
-		emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "routine"})
+		emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "routine"}, source: inboxCursorKey})
 	}
 	for i := 0; i < alertReserve; i++ {
-		emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Priority: PriorityAlert, Text: "alert"})
+		emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Priority: PriorityAlert, Text: "alert"}, source: inboxCursorKey})
 	}
-	emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "one too many"})
-	emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Priority: PriorityAlert, Text: "alert overflow"})
+	emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "one too many"}, source: inboxCursorKey})
+	emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Priority: PriorityAlert, Text: "alert overflow"}, source: inboxCursorKey})
 
 	flush()
 	out := sb.String()

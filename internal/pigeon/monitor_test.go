@@ -854,14 +854,12 @@ func TestMonitorFlushesPendingDigestOnShutdown(t *testing.T) {
 	if _, err := Publish("deploys", Draft{Text: "routine change"}, peer()); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
-	// Barrier: a direct message proves the monitor has read the buffered
-	// message off #deploys before shutdown is requested below, rather than
-	// this test racing its own Publish.
-	if _, err := Send(mailbox(sid), Draft{Text: "still listening"}, peer()); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	eventually(t, 6*time.Second, "the barrier direct message", func() bool {
-		return m.stdout.has("still listening")
+	// Barrier: wait for the monitor to say it has actually buffered the
+	// message. A direct message used to stand in for this and could not: the
+	// spool and the topic have separate followers, so the direct one being
+	// emitted proves nothing about whether the topic one has been read yet.
+	eventually(t, 6*time.Second, "the message to be held for the digest", func() bool {
+		return m.stderr.has(`holding a message on "deploys"`)
 	})
 
 	m.stop(t) // triggers RunMonitor's deferred flushDigests via the SIGTERM path

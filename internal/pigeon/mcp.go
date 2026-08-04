@@ -703,11 +703,29 @@ func mcpPublish(ns Namespace, topic, text, subject, brief, priority string, forN
 	return out, nil
 }
 
-func mcpSubscription(ns Namespace, action, topic string) (string, error) {
-	sid := CurrentSessionID()
-	if sid == "" {
-		return "", fmt.Errorf("not running inside a Claude Code session")
+// selfEntry resolves the session this process belongs to the way every write
+// path must: through Self(), never through CurrentSessionID().
+//
+// A /clear mints a new session id while the monitor, the registry entry and the
+// cursors all stay under the old one. Writing a subscription or a delivery mode
+// against the environment's id either errors as unregistered, or worse creates
+// state under an id no running monitor is reading -- so the setting silently
+// never takes effect. Self also returns the namespace holding the entry, which
+// need not be the one resolved from this process's working directory.
+func selfEntry() (Namespace, *Entry, error) {
+	ns, e, err := Self()
+	if err != nil {
+		return ns, nil, fmt.Errorf("not running inside a Claude Code session pigeon knows about")
 	}
+	return ns, e, nil
+}
+
+func mcpSubscription(_ Namespace, action, topic string) (string, error) {
+	ns, self, err := selfEntry()
+	if err != nil {
+		return "", err
+	}
+	sid := self.SessionID
 	if strings.TrimSpace(topic) == "" {
 		return "", fmt.Errorf("'topic' is required")
 	}
@@ -725,14 +743,15 @@ func mcpSubscription(ns Namespace, action, topic string) (string, error) {
 }
 
 func mcpSetDelivery(topic, mode string) (string, error) {
-	sid := CurrentSessionID()
-	if sid == "" {
-		return "", fmt.Errorf("not running inside a Claude Code session")
+	ns, self, err := selfEntry()
+	if err != nil {
+		return "", err
 	}
+	sid := self.SessionID
 	if strings.TrimSpace(topic) == "" {
 		return "", fmt.Errorf("'topic' is required")
 	}
-	if err := SetDelivery(sid, topic, mode); err != nil {
+	if err := ns.SetDelivery(sid, topic, mode); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("Delivery for %s set to %s. Takes effect within about a second.",

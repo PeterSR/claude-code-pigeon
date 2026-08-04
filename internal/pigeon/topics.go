@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // PublicTopic is the mailbox every session joins by default, so a broadcast
@@ -37,6 +38,81 @@ var topicRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 // inboxCursorKey tracks how far the direct spool has been read. It is not a
 // valid topic name, so it can never collide with one.
 const inboxCursorKey = ":inbox"
+
+// --- consumption cursors -----------------------------------------------------
+//
+// cursors/<session>.json holds two families under one map. The bare key
+// (inboxCursorKey or a topic's TopicRef.String()) is the MONITOR's ingest
+// cursor: how far followSource has read as it decides what to notify. The
+// "read:" / "readat:" keys below are the SESSION's consumption cursor: how far
+// ReadInbox has actually handed back to a pull. They are advanced by different
+// code paths and must never be conflated -- a pull silently marking a message
+// as notified, or a notification silently marking it as pulled, both defeat
+// the other path's bookkeeping.
+//
+// A topic name can never contain ":" (ValidTopic), and inboxCursorKey already
+// leans on that same fact, so "read:" + any valid monitor-cursor key can never
+// collide with a bare monitor-cursor key, nor with another source's "read:"
+// key.
+
+const readCursorPrefix = "read:"
+const readAtCursorPrefix = "readat:"
+
+// readCursorKey and readAtCursorKey name a source's consumption cursor and the
+// unix-seconds timestamp it last advanced. source is the same key the
+// monitor's own cursor is filed under: inboxCursorKey for the direct spool
+// (giving "read::inbox" / "readat::inbox"), or a TopicRef's String() for a
+// topic.
+func readCursorKey(source string) string   { return readCursorPrefix + source }
+func readAtCursorKey(source string) string { return readAtCursorPrefix + source }
+
+// maxUnreadBytes and maxUnreadAge bound how long a consumption cursor can hold
+// a topic log's compaction back. Without a bound, a session that pulls once
+// and then idles -- or never comes back -- would pin the log open forever,
+// which is worse than the message loss the cursor exists to prevent.
+const (
+	maxUnreadBytes = 1 << 20 // 1 MiB behind the monitor cursor counts as abandoned
+	maxUnreadAge   = 6 * time.Hour
+)
+
+// effectiveOffset is the position pruneTopicDir treats one subscriber as
+// having reached, for the purpose of a compaction cut.
+//
+// It prefers the session's *consumption* cursor (what ReadInbox has actually
+// handed back) over its *monitor* cursor (what followSource has merely
+// ingested), because compaction must never cut past a message the session was
+// notified of but has not yet pulled. It falls back to the monitor cursor,
+// and reports abandoned=true, in exactly two cases:
+//
+//   - the consumption cursor does not exist at all. readCursors returns a
+//     plain map, so a missing key would otherwise read back as 0 -- and on
+//     the day this shipped, no session anywhere has a consumption cursor.
+//     Using that 0 as a real position would collapse `slowest` to 0 for every
+//     topic and stop compaction fleet-wide, forever. This is the "naive fix"
+//     the design explicitly forbids, so the zero-value read is guarded by the
+//     presence check below rather than trusted.
+//   - the consumption cursor is present but abandoned: too far behind the
+//     monitor cursor, or too old, or has a missing/zero readat alongside a
+//     present read cursor (which reads the same as "too old").
+//
+// abandoned is false when the fallback is simply "no consumption cursor
+// exists yet" -- that is the expected, unremarkable state for the entire
+// fleet on day one, not something worth counting as a problem.
+func effectiveOffset(cursors map[string]int64, topic string, now time.Time) (off int64, abandoned bool) {
+	monitorOff := cursors[topic]
+	roff, ok := cursors[readCursorKey(topic)]
+	if !ok {
+		return monitorOff, false
+	}
+	if monitorOff-roff > maxUnreadBytes {
+		return monitorOff, true
+	}
+	rat, hasAt := cursors[readAtCursorKey(topic)]
+	if !hasAt || rat <= 0 || now.Sub(time.Unix(rat, 0)) > maxUnreadAge {
+		return monitorOff, true
+	}
+	return roff, false
+}
 
 // ValidTopic keeps topic names safe as filenames and readable in a
 // notification line. It validates the bare name; the global prefix is stripped
@@ -566,6 +642,14 @@ type PruneResult struct {
 	TopicsCompacted int
 	PayloadsRemoved int
 	BytesReclaimed  int64
+	// AbandonedCursors counts subscribers whose consumption cursor
+	// (read:<topic>, advanced by ReadInbox) was present but stale enough --
+	// by byte distance or by age -- that a compaction pass fell back to their
+	// monitor cursor instead of waiting on it forever. pruneTopicDir has no
+	// logger to report through, so this count is that report: a caller that
+	// wants to know who was abandoned can compare a session's own cursors
+	// before and after.
+	AbandonedCursors int
 }
 
 // Add folds one pass into another, so a caller sweeping several namespaces
@@ -575,6 +659,7 @@ func (r *PruneResult) Add(o PruneResult) {
 	r.TopicsCompacted += o.TopicsCompacted
 	r.PayloadsRemoved += o.PayloadsRemoved
 	r.BytesReclaimed += o.BytesReclaimed
+	r.AbandonedCursors += o.AbandonedCursors
 }
 
 // PruneTopics reclaims space in this namespace's topic logs.
@@ -702,8 +787,14 @@ func pruneTopicDir(dir string, global bool, subscribers func(TopicRef) []*Entry,
 		base := readBase(p)
 		logicalEnd := base + fi.Size()
 		slowest := logicalEnd
+		now := time.Now()
 		for _, e := range subs {
-			if off := cursorNS(e).readCursors(e.SessionID)[ref.String()]; off < slowest {
+			cursors := cursorNS(e).readCursors(e.SessionID)
+			off, abandoned := effectiveOffset(cursors, ref.String(), now)
+			if abandoned {
+				res.AbandonedCursors++
+			}
+			if off < slowest {
 				slowest = off
 			}
 		}

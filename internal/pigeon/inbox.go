@@ -280,12 +280,36 @@ type positionedMessage struct {
 //     one-shot read has no later poll to resolve it on, so it takes the same
 //     resolution followSource reaches once its grace period lapses: treat the
 //     position as unrecoverable and start over from the base.
+//
+// readSourceFrom reads one source from a logical offset to EOF.
+//
+// Stat, readBase and Open are three separate syscalls with no lock between
+// them, and compaction renames the log and then writes the new base. A pull
+// that interleaves with that sees one era's base against the other era's file,
+// seeks to the wrong place, and returns offsets understated by the size of the
+// cut -- which MarkRead would then persist, so the following pull reads as
+// "compacted past us", resets to the base, and redelivers the whole surviving
+// log. So the base is re-read after the pass and the read is retried once if it
+// moved. One retry is enough: compaction holds the topic lock, so two cuts
+// cannot both land inside a single retry.
 func readSourceFrom(path string, offset int64) ([]positionedMessage, error) {
+	for attempt := 0; ; attempt++ {
+		out, base, err := readSourceOnce(path, offset)
+		if err != nil {
+			return nil, err
+		}
+		if attempt > 0 || readBase(path) == base {
+			return out, nil
+		}
+	}
+}
+
+func readSourceOnce(path string, offset int64) ([]positionedMessage, int64, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		// No log yet -- a topic never published to, or the direct spool
 		// before a first message. Nothing to read, not an error.
-		return nil, nil
+		return nil, 0, nil
 	}
 	base := readBase(path)
 	physical := offset - base
@@ -296,12 +320,12 @@ func readSourceFrom(path string, offset int64) ([]positionedMessage, error) {
 
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil
+		return nil, base, nil
 	}
 	defer f.Close()
 	if physical > 0 {
 		if _, err := f.Seek(physical, io.SeekStart); err != nil {
-			return nil, err
+			return nil, base, err
 		}
 	}
 
@@ -327,5 +351,5 @@ func readSourceFrom(path string, offset int64) ([]positionedMessage, error) {
 		}
 		out = append(out, positionedMessage{msg: m, end: offset})
 	}
-	return out, nil
+	return out, base, nil
 }

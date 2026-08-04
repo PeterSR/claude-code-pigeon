@@ -66,14 +66,12 @@ const readAtCursorPrefix = "readat:"
 func readCursorKey(source string) string   { return readCursorPrefix + source }
 func readAtCursorKey(source string) string { return readAtCursorPrefix + source }
 
-// maxUnreadBytes and maxUnreadAge bound how long a consumption cursor can hold
-// a topic log's compaction back. Without a bound, a session that pulls once
-// and then idles -- or never comes back -- would pin the log open forever,
-// which is worse than the message loss the cursor exists to prevent.
-const (
-	maxUnreadBytes = 1 << 20 // 1 MiB behind the monitor cursor counts as abandoned
-	maxUnreadAge   = 6 * time.Hour
-)
+// maxUnreadAge bounds how long a consumption cursor can hold a topic log's
+// compaction back. Without a bound, a session that pulls once and then idles --
+// or never comes back -- would pin the log open forever, which is worse than
+// the message loss the cursor exists to prevent. It is refreshed only by a real
+// consuming pull, never by a peek, so it measures reading rather than looking.
+const maxUnreadAge = 6 * time.Hour
 
 // effectiveOffset is the position pruneTopicDir treats one subscriber as
 // having reached, for the purpose of a compaction cut.
@@ -98,21 +96,50 @@ const (
 // abandoned is false when the fallback is simply "no consumption cursor
 // exists yet" -- that is the expected, unremarkable state for the entire
 // fleet on day one, not something worth counting as a problem.
-func effectiveOffset(cursors map[string]int64, topic string, now time.Time) (off int64, abandoned bool) {
+func effectiveOffset(cursors map[string]int64, topic string, now time.Time) (off int64, state cursorState) {
 	monitorOff := cursors[topic]
 	roff, ok := cursors[readCursorKey(topic)]
 	if !ok {
-		return monitorOff, false
-	}
-	if monitorOff-roff > maxUnreadBytes {
-		return monitorOff, true
+		return monitorOff, cursorAbsent
 	}
 	rat, hasAt := cursors[readAtCursorKey(topic)]
-	if !hasAt || rat <= 0 || now.Sub(time.Unix(rat, 0)) > maxUnreadAge {
-		return monitorOff, true
+	if !hasAt || rat <= 0 {
+		// Seeded by Subscribe but never advanced by a pull. This session takes
+		// notifications and does not use the pull path, so protecting its
+		// position would hold the log open for nothing.
+		return monitorOff, cursorNeverPulled
 	}
-	return roff, false
+	if now.Sub(time.Unix(rat, 0)) > maxUnreadAge {
+		return monitorOff, cursorStale
+	}
+	// Deliberately NOT bounded by how far behind the monitor this is.
+	//
+	// An earlier version cut once the gap passed a byte threshold, checked
+	// before the timestamp, and that destroyed exactly the case the cursor
+	// exists for: a session pulls at 11:58, a peer publishes a megabyte and a
+	// half at 12:00, prune runs at 12:01 and cuts the whole burst away before
+	// the session -- which is awake and reading on time -- ever asks for it.
+	// "Abandoned" has to mean "nobody is coming back", not "the burst was big".
+	// A session that keeps pulling keeps its cursor moving, so the gap closes
+	// on its own; one that stops pulling stops refreshing readat and ages out
+	// within maxUnreadAge. Peeking does not refresh it, so only real
+	// consumption counts as being alive.
+	return roff, cursorFresh
 }
+
+// cursorState says why pruneTopicDir used the offset it did, so the prune
+// result can report the one case worth reporting: a session that pulled, then
+// stopped, and is now holding a log open. A cursor that was never seeded, or
+// seeded and never used, is the unremarkable state of most of the fleet and is
+// not worth counting as a problem.
+type cursorState int
+
+const (
+	cursorFresh cursorState = iota
+	cursorAbsent
+	cursorNeverPulled
+	cursorStale
+)
 
 // ValidTopic keeps topic names safe as filenames and readable in a
 // notification line. It validates the bare name; the global prefix is stripped
@@ -471,7 +498,13 @@ func (n Namespace) seedCursor(sessionID string, ref TopicRef) error {
 	}
 	end := readBase(path) + size
 	return n.mutateCursors(sessionID, func(m map[string]int64) {
-		m[ref.String()] = end
+		// Only ever seed. Subscribe is not guarded against being called for a
+		// topic this session already follows, and re-seeding to the end there
+		// would skip whatever arrived since -- silently, and for a deaf session
+		// that means dropping mail already queued on the log.
+		if _, seen := m[ref.String()]; !seen {
+			m[ref.String()] = end
+		}
 		// Seed the consumption cursor to the same place, and only here.
 		//
 		// It cannot be left absent to fall back on the monitor's cursor at read
@@ -821,8 +854,8 @@ func pruneTopicDir(dir string, global bool, subscribers func(TopicRef) []*Entry,
 		now := time.Now()
 		for _, e := range subs {
 			cursors := cursorNS(e).readCursors(e.SessionID)
-			off, abandoned := effectiveOffset(cursors, ref.String(), now)
-			if abandoned {
+			off, state := effectiveOffset(cursors, ref.String(), now)
+			if state == cursorStale {
 				res.AbandonedCursors++
 			}
 			if off < slowest {

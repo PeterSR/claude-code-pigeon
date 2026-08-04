@@ -44,7 +44,7 @@ func ResolveInboxDetail(s string) (string, error) {
 // Newest message is printed LAST: ReadInbox already returns items oldest
 // first, so the text a caller most likely needs next sits closest to the end
 // of the output, nearest the model's next token.
-func RenderInbox(items []InboxItem, unreadOnly bool, detail, hint string) string {
+func RenderInbox(items []InboxItem, more int, unreadOnly bool, detail, hint string) string {
 	if len(items) == 0 {
 		if unreadOnly {
 			return fmt.Sprintf("No unread messages. Pass %s to see recent history.", hint)
@@ -57,6 +57,16 @@ func RenderInbox(items []InboxItem, unreadOnly bool, detail, hint string) string
 	b.WriteByte('\n')
 	for _, it := range items {
 		writeInboxItem(&b, it, detail)
+	}
+	// Without this a session that pulls ten of sixty unread reads the batch as
+	// the whole backlog and stops, which is the quiet half of a message never
+	// arriving at all.
+	if more > 0 {
+		if unreadOnly {
+			fmt.Fprintf(&b, "\n%d more unread. Call again to take the next batch.\n", more)
+		} else {
+			fmt.Fprintf(&b, "\n%d older message(s) not shown.\n", more)
+		}
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
@@ -116,31 +126,54 @@ func inboxSummary(items []InboxItem, unreadOnly bool) string {
 // Nothing here is truncated: a pull is a Read, not a push bound by
 // BodyBudget, and the whole point of the tool is that draining a burst this
 // way costs less than the notifications it replaces.
+// Every field below is peer-controlled and reaches a model as tool output, so
+// each is passed through Sanitize on the way out. Render already does this for
+// the notification line, on the stated grounds that a spool line can be
+// hand-written and never pass validation -- ParseMessage accepts any JSON. The
+// pull path has the same exposure and a longer-lived one: a newline in a
+// sender's name, subject or body would otherwise forge extra inbox entries,
+// fake SUBJECT lines, or a whole fabricated message inside a block the reader
+// treats as pigeon's own structure.
+//
+// Sanitize flattens to one line, which is right for the header fields. Bodies
+// may legitimately be long, so they are indented instead: every continuation
+// line is pushed inside the item block, where it cannot impersonate a header.
 func writeInboxItem(b *strings.Builder, it InboxItem, detail string) {
 	ts := "?"
 	if t, err := time.Parse(time.RFC3339, it.Message.TS); err == nil {
 		ts = t.Local().Format("15:04")
 	}
-	fmt.Fprintf(b, "%s  %s  %s", it.Message.ID, ts, it.Message.From.Display())
+	fmt.Fprintf(b, "%s  %s  %s", Sanitize(it.Message.ID), ts, Sanitize(it.Message.From.Display()))
 	if it.Source != "" {
 		// Direct messages show no topic column: there is nothing to name.
 		fmt.Fprintf(b, "  %s", TopicLabel(it.Source))
 	}
 	fmt.Fprintf(b, "  (%s)\n", formatAge(it.Age))
 	if it.Message.Subject != "" {
-		fmt.Fprintf(b, "  SUBJECT: %s\n", it.Message.Subject)
+		fmt.Fprintf(b, "  SUBJECT: %s\n", Sanitize(it.Message.Subject))
 	}
 	switch detail {
 	case "subject":
 		return
 	case "full":
-		fmt.Fprintf(b, "  %s\n", it.Message.Text)
+		writeIndentedBody(b, it.Message.Text)
 	default: // "brief"
 		if it.Message.Brief != "" {
-			fmt.Fprintf(b, "  %s\n", it.Message.Brief)
+			writeIndentedBody(b, it.Message.Brief)
 			return
 		}
-		fmt.Fprintf(b, "  (no brief written -- showing the full text)\n  %s\n", it.Message.Text)
+		b.WriteString("  (no brief written -- showing the full text)\n")
+		writeIndentedBody(b, it.Message.Text)
+	}
+}
+
+// writeIndentedBody prints a message body two spaces in, every line of it.
+// A body is the one field allowed to be long, so it is not flattened -- but an
+// unindented newline inside it would put attacker-chosen text at column zero,
+// where this format's own header lines live.
+func writeIndentedBody(b *strings.Builder, text string) {
+	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		fmt.Fprintf(b, "  %s\n", strings.TrimRight(line, "\r"))
 	}
 }
 

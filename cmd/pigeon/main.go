@@ -621,7 +621,7 @@ func cmdInbox(args []string, w, stderr io.Writer) error {
 		return err
 	}
 	unreadOnly := !*all
-	items, err := ns.ReadInbox(e.SessionID, pigeon.InboxQuery{
+	items, more, err := ns.ReadInbox(e.SessionID, pigeon.InboxQuery{
 		Limit:      *limit,
 		UnreadOnly: unreadOnly,
 		Topic:      topic,
@@ -630,7 +630,7 @@ func cmdInbox(args []string, w, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(w, pigeon.RenderInbox(items, unreadOnly, detail, "--all"))
+	fmt.Fprintln(w, pigeon.RenderInbox(items, more, unreadOnly, detail, "--all"))
 	return nil
 }
 

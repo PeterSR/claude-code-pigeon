@@ -55,9 +55,9 @@ const (
 // Conflating the two families would make a pull silently suppress a
 // notification, or a notification silently mark mail as pulled -- see the
 // cursor-family comment in topics.go.
-func (n Namespace) ReadInbox(sessionID string, q InboxQuery) ([]InboxItem, error) {
+func (n Namespace) ReadInbox(sessionID string, q InboxQuery) ([]InboxItem, int, error) {
 	if err := ValidSessionID(sessionID); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	limit := q.Limit
 	if limit <= 0 {
@@ -69,7 +69,7 @@ func (n Namespace) ReadInbox(sessionID string, q InboxQuery) ([]InboxItem, error
 
 	e, err := n.ReadEntry(sessionID)
 	if err != nil {
-		return nil, fmt.Errorf("session %s is not registered in namespace %q", Short(sessionID), n)
+		return nil, 0, fmt.Errorf("session %s is not registered in namespace %q", Short(sessionID), n)
 	}
 
 	type source struct {
@@ -102,13 +102,19 @@ func (n Namespace) ReadInbox(sessionID string, q InboxQuery) ([]InboxItem, error
 	if q.Topic != "" {
 		ref, err := ParseTopicRef(q.Topic)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		filtered := sources[:0]
 		for _, s := range sources {
 			if s.key == ref.String() {
 				filtered = append(filtered, s)
 			}
+		}
+		if len(filtered) == 0 {
+			// Reading back "No unread messages" for a topic this session does
+			// not follow is indistinguishable from the topic being quiet, and
+			// the caller would believe it had checked.
+			return nil, 0, fmt.Errorf("not subscribed to %s in namespace %q", TopicLabel(ref.String()), n)
 		}
 		sources = filtered
 	}
@@ -143,7 +149,7 @@ func (n Namespace) ReadInbox(sessionID string, q InboxQuery) ([]InboxItem, error
 		}
 		msgs, err := readSourceFrom(s.path, start)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		for _, pm := range msgs {
 			if pm.msg.From.SessionID != "" && pm.msg.From.SessionID == sessionID {
@@ -164,29 +170,34 @@ func (n Namespace) ReadInbox(sessionID string, q InboxQuery) ([]InboxItem, error
 	sort.SliceStable(all, func(i, j int) bool {
 		return all[i].item.Message.TS < all[j].item.Message.TS
 	})
-	kept := all
+	// Which end of the batch to keep depends on what the caller is doing, and
+	// getting it backwards wedges the whole pull path.
+	//
+	// An unread pull is DRAINING: it must take the OLDEST unread messages, so
+	// successive pulls walk forward and the backlog empties in order. Taking the
+	// newest instead looks reasonable and deadlocks -- the dropped messages and
+	// the kept ones come from the same source, so every kept message sits behind
+	// a gap, the cursor may not advance past any of them, and the next pull
+	// returns exactly the same batch. A backlog larger than Limit would then
+	// redeliver its tail forever while its head became permanently unreachable.
+	//
+	// A browse (UnreadOnly false) is the opposite: "show me what has been going
+	// on" wants the most RECENT messages.
+	more := 0
+	kept, dropped := all, []candidate(nil)
 	if len(kept) > limit {
-		kept = kept[len(kept)-limit:]
+		more = len(kept) - limit
+		if q.UnreadOnly {
+			kept, dropped = all[:limit], all[limit:]
+		} else {
+			kept, dropped = all[len(all)-limit:], all[:len(all)-limit]
+		}
 	}
 
-	// Per source, the earliest message the Limit cut threw away. Everything at
-	// or past it is unread no matter what else was returned.
-	//
-	// This is the whole reason the cursor cannot simply advance to the newest
-	// message a source contributed. The cut is taken over messages merged from
-	// every source and ordered by time, so it can land in the MIDDLE of one
-	// source's run: source A writes at 10:00 and 10:05, source B writes four
-	// times in between, Limit is 3, and the batch returned is B, B, A@10:05.
-	// Advancing A past 10:05 would step over A@10:00, which nobody has seen and
-	// nothing will show again -- the silent loss this pull path exists to end,
-	// reintroduced by the pull path itself.
 	firstDropped := map[string]int64{}
-	if len(kept) < len(all) {
-		cutoff := len(all) - len(kept)
-		for _, c := range all[:cutoff] {
-			if cur, ok := firstDropped[c.srcKey]; !ok || c.end < cur {
-				firstDropped[c.srcKey] = c.end
-			}
+	for _, c := range dropped {
+		if cur, ok := firstDropped[c.srcKey]; !ok || c.end < cur {
+			firstDropped[c.srcKey] = c.end
 		}
 	}
 
@@ -213,19 +224,29 @@ func (n Namespace) ReadInbox(sessionID string, q InboxQuery) ([]InboxItem, error
 		}
 	}
 
-	if q.MarkRead && len(advance) > 0 {
+	// A browse never consumes. Marking read on a "show me recent history" call
+	// would make the same flag mean different things depending on how much
+	// history happened to exist, and would let a glance at the log silently
+	// discard unread mail.
+	if q.MarkRead && q.UnreadOnly && len(advance) > 0 {
 		nowUnix := now.Unix()
 		if err := n.mutateCursors(sessionID, func(m map[string]int64) {
 			for key, off := range advance {
-				m[readCursorKey(key)] = off
+				// Never backwards. Two pulls overlapping in time can each
+				// compute a position from the same starting cursor, and the
+				// one that finishes last would otherwise rewind the other's
+				// progress and redeliver what it had already handed back.
+				if off > m[readCursorKey(key)] {
+					m[readCursorKey(key)] = off
+				}
 				m[readAtCursorKey(key)] = nowUnix
 			}
 		}); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 
-	return items, nil
+	return items, more, nil
 }
 
 // positionedMessage pairs a parsed message with the logical offset just past

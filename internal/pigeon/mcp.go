@@ -754,7 +754,7 @@ func mcpInbox(raw json.RawMessage) (string, error) {
 		markRead = *a.MarkRead
 	}
 
-	items, err := ns.ReadInbox(e.SessionID, InboxQuery{
+	items, more, err := ns.ReadInbox(e.SessionID, InboxQuery{
 		Limit:      a.Limit,
 		UnreadOnly: unreadOnly,
 		Topic:      a.Topic,
@@ -763,7 +763,7 @@ func mcpInbox(raw json.RawMessage) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return RenderInbox(items, unreadOnly, detail, "unread_only: false"), nil
+	return RenderInbox(items, more, unreadOnly, detail, "unread_only: false"), nil
 }
 
 func mcpWhoami() (string, error) {

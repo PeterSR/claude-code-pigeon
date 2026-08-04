@@ -867,6 +867,9 @@ func TestFollowSourceRecoversFromTruncation(t *testing.T) {
 
 // --- rate limiting --------------------------------------------------------
 
+// A pure flood of normal traffic is capped short of maxPerMinute: the last
+// alertReserve slots of the window stay off-limits to it, so an alert would
+// always have room even though none was sent in this test.
 func TestRateLimiterSuppressesFloods(t *testing.T) {
 	withHome(t)
 	var sb strings.Builder
@@ -875,8 +878,9 @@ func TestRateLimiterSuppressesFloods(t *testing.T) {
 		emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "line"})
 	}
 	got := strings.Count(sb.String(), "\n")
-	if got != maxPerMinute {
-		t.Errorf("emitted %d lines, want the cap of %d", got, maxPerMinute)
+	want := maxPerMinute - alertReserve
+	if got != want {
+		t.Errorf("emitted %d lines, want the normal-traffic cap of %d (the rest is reserved for alerts)", got, want)
 	}
 }
 
@@ -890,8 +894,9 @@ func TestRateLimiterNamesTheLogASuppressedMessageIsIn(t *testing.T) {
 	var sb strings.Builder
 	emit, flush := newRateLimiter(&sb, ns, ns.SpoolPath("aaaa1111"), time.Minute)
 
-	// Fill the window with direct messages, then suppress a topic message.
-	for i := 0; i < maxPerMinute; i++ {
+	// Fill exactly the normal-traffic budget with direct messages, then
+	// suppress a topic message.
+	for i := 0; i < maxPerMinute-alertReserve; i++ {
 		emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "direct"})
 	}
 	emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Topic: "deploys", Text: "topic"})
@@ -904,6 +909,57 @@ func TestRateLimiterNamesTheLogASuppressedMessageIsIn(t *testing.T) {
 	}
 	if strings.Contains(out, ns.SpoolPath("aaaa1111")) {
 		t.Errorf("the notice named the direct spool for a topic message:\n%s", out)
+	}
+}
+
+// The reserve exists so a flood of routine traffic can never crowd out an
+// alert entirely: once ordinary messages have used up the normal-traffic
+// budget, an alert must still get through rather than being suppressed like
+// everything else.
+func TestAlertSurvivesAFloodThatExhaustsTheNormalBudget(t *testing.T) {
+	withHome(t)
+	var sb strings.Builder
+	emit, _ := newRateLimiter(&sb, DefaultNamespace(), "/tmp/spool", time.Minute)
+
+	// Exhaust the normal-traffic budget and then some, so the flood alone
+	// would already be past what a plain cap could ever admit.
+	for i := 0; i < maxPerMinute; i++ {
+		emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "routine"})
+	}
+	emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Priority: PriorityAlert, Text: "the alert"})
+
+	if !strings.Contains(sb.String(), "the alert") {
+		t.Fatalf("an alert was suppressed by a flood of ordinary traffic it should have priority over:\n%s", sb.String())
+	}
+}
+
+// The suppression notice has to say which kind of message was dropped: a
+// suppressed alert is a materially worse event than a suppressed routine
+// message, and the notice is the only signal the recipient ever gets of
+// either.
+func TestSuppressionNoticeDistinguishesAlertsFromNormalMessages(t *testing.T) {
+	withHome(t)
+	var sb strings.Builder
+	emit, flush := newRateLimiter(&sb, DefaultNamespace(), "/tmp/spool", time.Minute)
+
+	// Fill the normal-traffic budget, then spend the whole alert reserve too,
+	// so both a normal message and an alert have nowhere left in the window.
+	for i := 0; i < maxPerMinute-alertReserve; i++ {
+		emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "routine"})
+	}
+	for i := 0; i < alertReserve; i++ {
+		emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Priority: PriorityAlert, Text: "alert"})
+	}
+	emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "one too many"})
+	emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Priority: PriorityAlert, Text: "alert overflow"})
+
+	flush()
+	out := sb.String()
+	if !strings.Contains(out, "ALERT") {
+		t.Errorf("no notice distinguishes a suppressed alert from a suppressed normal message:\n%s", out)
+	}
+	if !strings.Contains(out, "further message(s) suppressed") {
+		t.Errorf("the ordinary suppression notice is missing:\n%s", out)
 	}
 }
 

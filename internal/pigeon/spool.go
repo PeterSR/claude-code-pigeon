@@ -47,6 +47,25 @@ const SubjectLimit = 120
 // that is actually the whole message again.
 const BriefLimit = 600
 
+// PriorityAlert is the one non-default value Priority may hold.
+//
+// Exactly two levels exist on purpose: "" (normal) and "alert" -- nothing in
+// between. A three-level scheme just moves the SHOUTING problem down one rung:
+// give senders "high" and "urgent" and every routine message drifts up to
+// "high" the same way it used to arrive in capitals, and the level meant to
+// interrupt loses its meaning again. Two levels, with the second one scarce
+// and reserved (see newRateLimiter's alertReserve), is what keeps it scarce.
+const PriorityAlert = "alert"
+
+// validatePriority rejects anything but the two levels Priority may hold.
+// Shared by Send and Publish so the rule cannot drift between the two paths.
+func validatePriority(p string) error {
+	if p != "" && p != PriorityAlert {
+		return fmt.Errorf("priority %q is not valid; use \"\" (normal) or %q", p, PriorityAlert)
+	}
+	return nil
+}
+
 // Sender identifies who sent a message. Stamped automatically -- a session
 // never has to state its own address, so replies always have somewhere to go.
 type Sender struct {
@@ -101,18 +120,22 @@ type Message struct {
 	// It never reaches Render (see Render's doc comment) -- only `inbox`'s
 	// pull path shows it -- so it carries none of Subject's "must survive a
 	// hard clip" weight.
-	Brief   string `json:"brief,omitempty"`
-	Payload string `json:"payload,omitempty"`
-	ReplyTo string `json:"replyTo,omitempty"`
+	Brief string `json:"brief,omitempty"`
+	// Priority is "" for a normal message or PriorityAlert for the one level
+	// above it. See PriorityAlert's doc comment for why there are only two.
+	Priority string `json:"priority,omitempty"`
+	Payload  string `json:"payload,omitempty"`
+	ReplyTo  string `json:"replyTo,omitempty"`
 }
 
 // Draft is a message being composed. Text is required; everything else is
 // optional and validated before it reaches a spool.
 type Draft struct {
-	Text    string
-	Subject string
-	Brief   string
-	ReplyTo string
+	Text     string
+	Subject  string
+	Brief    string
+	Priority string
+	ReplyTo  string
 }
 
 // CurrentSender builds the `from` stamp for this process. Both the MCP server
@@ -355,16 +378,20 @@ func (n Namespace) Send(to *Entry, d Draft, from Sender) (*Message, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := validatePriority(d.Priority); err != nil {
+		return nil, err
+	}
 
 	msg := &Message{
-		ID:      newMessageID(),
-		TS:      time.Now().UTC().Format(time.RFC3339),
-		From:    from,
-		To:      to.SessionID,
-		Text:    body,
-		Subject: subject,
-		Brief:   brief,
-		ReplyTo: d.ReplyTo,
+		ID:       newMessageID(),
+		TS:       time.Now().UTC().Format(time.RFC3339),
+		From:     from,
+		To:       to.SessionID,
+		Text:     body,
+		Subject:  subject,
+		Brief:    brief,
+		Priority: d.Priority,
+		ReplyTo:  d.ReplyTo,
 	}
 
 	// Overflow goes to a file the recipient can Read on demand, in the
@@ -429,14 +456,28 @@ func (n Namespace) Render(m *Message) string {
 	foreign := m.From.Namespace != "" && m.From.Namespace != n.String()
 	sender := truncate(Sanitize(m.From.Namespace), maxNS)
 
+	// A spool line can be hand-written, so anything but the exact sentinel
+	// reads as normal -- the same bound-defensively rule as every other field
+	// here, and the reason this compares to the constant rather than echoing
+	// m.Priority into the line.
+	alert := m.Priority == PriorityAlert
+	bang := ""
+	if alert {
+		bang = "!"
+	}
+
 	var prefix string
 	switch {
 	case m.Topic == "":
-		prefix = "[pigeon] message from "
+		prefix = "[pigeon"
+		if alert {
+			prefix += " !"
+		}
+		prefix += "] message from "
 	case global:
-		prefix = "[pigeon " + truncate(Sanitize(m.Topic), maxTopic) + "] from "
+		prefix = "[pigeon " + bang + truncate(Sanitize(m.Topic), maxTopic) + "] from "
 	default:
-		prefix = "[pigeon #" + truncate(Sanitize(m.Topic), maxTopic) + "] from "
+		prefix = "[pigeon " + bang + "#" + truncate(Sanitize(m.Topic), maxTopic) + "] from "
 	}
 	prefix += truncate(Sanitize(m.From.Display()), maxName)
 

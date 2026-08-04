@@ -62,6 +62,21 @@ func namespaceArg(what string) map[string]any {
 	})
 }
 
+// priorityArg is the optional input shared by send_message and publish. Its
+// description is doing the real work: alert is scarce by construction (see
+// PriorityAlert), and the only thing that keeps it scarce is a model reading
+// this and deciding most messages do not qualify.
+func priorityArg() map[string]any {
+	return obj(map[string]any{
+		"type":    "string",
+		"enum":    []string{"normal", "alert"},
+		"default": "normal",
+		"description": "alert interrupts work already in progress and bypasses a recipient's " +
+			"digest setting. Use it to stop people, not to inform them. Anything that can wait " +
+			"for the next time they look is normal.",
+	})
+}
+
 func tools() []toolDef {
 	return []toolDef{
 		{
@@ -113,6 +128,7 @@ func tools() []toolDef {
 							"decide whether to read the rest. Max 600 characters. Readers see " +
 							"this by default, so write it as if it is all they will read.",
 					}),
+					"priority":  priorityArg(),
 					"namespace": namespaceArg("resolve the target in"),
 				}),
 				"required": []string{"to", "text"},
@@ -146,6 +162,7 @@ func tools() []toolDef {
 							"decide whether to read the rest. Max 600 characters. Readers see " +
 							"this by default, so write it as if it is all they will read.",
 					}),
+					"priority":  priorityArg(),
 					"namespace": namespaceArg("publish into"),
 				}),
 				"required": []string{"topic", "text"},
@@ -427,6 +444,7 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 			Text      string `json:"text"`
 			Subject   string `json:"subject"`
 			Brief     string `json:"brief"`
+			Priority  string `json:"priority"`
 			Namespace string `json:"namespace"`
 		}
 		_ = json.Unmarshal(raw, &a)
@@ -434,13 +452,18 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return mcpSend(ns, a.To, a.Text, a.Subject, a.Brief)
+		priority, err := mcpPriority(a.Priority)
+		if err != nil {
+			return "", err
+		}
+		return mcpSend(ns, a.To, a.Text, a.Subject, a.Brief, priority)
 	case "publish":
 		var a struct {
 			Topic     string `json:"topic"`
 			Text      string `json:"text"`
 			Subject   string `json:"subject"`
 			Brief     string `json:"brief"`
+			Priority  string `json:"priority"`
 			Namespace string `json:"namespace"`
 		}
 		_ = json.Unmarshal(raw, &a)
@@ -448,7 +471,11 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return mcpPublish(ns, a.Topic, a.Text, a.Subject, a.Brief)
+		priority, err := mcpPriority(a.Priority)
+		if err != nil {
+			return "", err
+		}
+		return mcpPublish(ns, a.Topic, a.Text, a.Subject, a.Brief, priority)
 	case "subscribe", "unsubscribe":
 		var a struct {
 			Topic     string `json:"topic"`
@@ -550,7 +577,22 @@ func elsewhereNote(ns Namespace) string {
 		"list_namespaces names them.", sessions, spaces)
 }
 
-func mcpSend(ns Namespace, to, text, subject, brief string) (string, error) {
+// mcpPriority maps the MCP-facing "normal"/"alert" enum onto the internal
+// Priority values ("" / PriorityAlert). Kept separate from validatePriority
+// so the wire vocabulary -- chosen to read well in a tool schema -- can differ
+// from the spool's own, without the send/publish paths having to know that a
+// model calls this any differently than the CLI does.
+func mcpPriority(p string) (string, error) {
+	switch p {
+	case "", "normal":
+		return "", nil
+	case PriorityAlert:
+		return PriorityAlert, nil
+	}
+	return "", fmt.Errorf("priority %q is not valid; use \"normal\" or \"alert\"", p)
+}
+
+func mcpSend(ns Namespace, to, text, subject, brief, priority string) (string, error) {
 	if strings.TrimSpace(to) == "" || strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("both 'to' and 'text' are required")
 	}
@@ -558,7 +600,7 @@ func mcpSend(ns Namespace, to, text, subject, brief string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	msg, err := ns.Send(target, Draft{Text: text, Subject: subject, Brief: brief}, CurrentSender())
+	msg, err := ns.Send(target, Draft{Text: text, Subject: subject, Brief: brief, Priority: priority}, CurrentSender())
 	if err != nil {
 		return "", err
 	}
@@ -575,11 +617,11 @@ func mcpSend(ns Namespace, to, text, subject, brief string) (string, error) {
 	return b.String(), nil
 }
 
-func mcpPublish(ns Namespace, topic, text, subject, brief string) (string, error) {
+func mcpPublish(ns Namespace, topic, text, subject, brief, priority string) (string, error) {
 	if strings.TrimSpace(topic) == "" || strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("both 'topic' and 'text' are required")
 	}
-	msg, err := ns.Publish(topic, Draft{Text: text, Subject: subject, Brief: brief}, CurrentSender())
+	msg, err := ns.Publish(topic, Draft{Text: text, Subject: subject, Brief: brief, Priority: priority}, CurrentSender())
 	if err != nil {
 		return "", err
 	}

@@ -590,6 +590,17 @@ func followSource(path string, offset int64, out chan<- *Message, stop <-chan st
 	}
 }
 
+// alertReserve is how many of maxPerMinute's slots stay off-limits to normal
+// traffic, so that once ordinary messages have used the rest of the window
+// only a PriorityAlert message may spend what remains.
+//
+// Without this a flood of routine traffic can fill the whole cap, and the one
+// message meant to interrupt gets suppressed exactly like everything else --
+// it is still in its log, but nothing wakes the session to say so. Alerts
+// still cannot exceed maxPerMinute; the reserve narrows who may use the tail
+// of the window, it does not raise the ceiling Claude Code enforces.
+const alertReserve = 10
+
 // newRateLimiter returns an emit function that caps output per minute and
 // reports suppression instead of silently dropping.
 //
@@ -605,14 +616,25 @@ func followSource(path string, offset int64, out chan<- *Message, stop <-chan st
 func newRateLimiter(w io.Writer, ns Namespace, spool string, window time.Duration) (emit func(*Message), flush func()) {
 	windowStart := time.Now()
 	count := 0
-	suppressed := map[string]int{}
+	// Suppression is tracked separately for alerts and normal traffic, per
+	// source, because a suppressed alert is a materially worse event than a
+	// suppressed routine message and the notice is the only signal the
+	// recipient gets of either.
+	suppressedNormal := map[string]int{}
+	suppressedAlert := map[string]int{}
 
 	flush = func() {
-		for _, src := range sortedKeys(suppressed) {
-			fmt.Fprintf(w, "[pigeon] %d further message(s) suppressed by rate limit; they are in %s\n",
-				suppressed[src], src)
+		// Alerts first: it is the worse of the two events, so it leads.
+		for _, src := range sortedKeys(suppressedAlert) {
+			fmt.Fprintf(w, "[pigeon] %d further ALERT message(s) suppressed by rate limit; they are in %s\n",
+				suppressedAlert[src], src)
 		}
-		clear(suppressed)
+		for _, src := range sortedKeys(suppressedNormal) {
+			fmt.Fprintf(w, "[pigeon] %d further message(s) suppressed by rate limit; they are in %s\n",
+				suppressedNormal[src], src)
+		}
+		clear(suppressedAlert)
+		clear(suppressedNormal)
 	}
 
 	emit = func(m *Message) {
@@ -621,14 +643,25 @@ func newRateLimiter(w io.Writer, ns Namespace, spool string, window time.Duratio
 			windowStart = time.Now()
 			count = 0
 		}
-		if count >= maxPerMinute {
+		alert := m.Priority == PriorityAlert
+		suppress := func(dest map[string]int) {
 			src := spool
 			if m.Topic != "" {
 				if p := ns.TopicPath(m.Topic); p != "" {
 					src = p
 				}
 			}
-			suppressed[src]++
+			dest[src]++
+		}
+		// The last alertReserve slots of the window are alert-only: normal
+		// traffic is cut off early so it can never crowd out the reserve, and
+		// an alert is cut off only at the true ceiling.
+		if !alert && count >= maxPerMinute-alertReserve {
+			suppress(suppressedNormal)
+			return
+		}
+		if count >= maxPerMinute {
+			suppress(suppressedAlert)
 			return
 		}
 		count++

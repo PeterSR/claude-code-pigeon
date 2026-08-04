@@ -243,15 +243,19 @@ func (n Namespace) Publish(topic string, d Draft, from Sender) (*Message, error)
 	if err != nil {
 		return nil, err
 	}
+	if err := validatePriority(d.Priority); err != nil {
+		return nil, err
+	}
 
 	msg := &Message{
-		ID:      newMessageID(),
-		TS:      nowRFC3339(),
-		From:    from,
-		Topic:   ref.String(),
-		Text:    body,
-		Subject: subject,
-		Brief:   brief,
+		ID:       newMessageID(),
+		TS:       nowRFC3339(),
+		From:     from,
+		Topic:    ref.String(),
+		Text:     body,
+		Subject:  subject,
+		Brief:    brief,
+		Priority: d.Priority,
 	}
 	if len([]rune(body)) > BodyBudget {
 		p := filepath.Join(ref.payloadsDir(n), msg.ID+".txt")

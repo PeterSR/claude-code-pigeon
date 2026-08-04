@@ -347,10 +347,12 @@ func cmdList(args []string, w, stderr io.Writer) error {
 func cmdSend(args []string, w, stderr io.Writer) error {
 	fs := flags("send", stderr)
 	var nsName, asName, subject, brief string
+	var alert bool
 	nsFlag(fs, &nsName)
 	asFlag(fs, &asName)
 	fs.StringVar(&subject, "subject", "", "one-line subject, max 120 characters; the only part guaranteed to arrive")
 	fs.StringVar(&brief, "brief", "", "a short summary, max 600 characters; what `pigeon inbox` shows by default")
+	fs.BoolVar(&alert, "alert", false, "mark this urgent: it interrupts work in progress and bypasses a digest. Use it to stop people, not to inform them")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -359,12 +361,17 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf("usage: pigeon send [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] <target> <text>")
+		return fmt.Errorf("usage: pigeon send [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] [--alert] <target> <text>")
 	}
 	if err := misplacedFlag(rest[1:]); err != nil {
 		return err
 	}
 	target, text := rest[0], strings.Join(rest[1:], " ")
+
+	priority := ""
+	if alert {
+		priority = pigeon.PriorityAlert
+	}
 
 	// Sending across a namespace is allowed rather than blocked: anyone who can
 	// write the state directory could append to that spool by hand, so refusing
@@ -377,7 +384,7 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	msg, err := ns.Send(to, pigeon.Draft{Text: text, Subject: subject, Brief: brief}, pigeon.ActingSender(asName))
+	msg, err := ns.Send(to, pigeon.Draft{Text: text, Subject: subject, Brief: brief, Priority: priority}, pigeon.ActingSender(asName))
 	if err != nil {
 		return err
 	}
@@ -416,7 +423,7 @@ func misplacedFlag(rest []string) error {
 			name = name[:i]
 		}
 		switch name {
-		case "subject", "brief", "n", "namespace", "as":
+		case "subject", "brief", "alert", "n", "namespace", "as":
 			return fmt.Errorf("%q came after a positional argument, so it was read as message text rather than as a flag; put flags before the target and the body", a)
 		}
 	}
@@ -426,10 +433,12 @@ func misplacedFlag(rest []string) error {
 func cmdPublish(args []string, w, stderr io.Writer) error {
 	fs := flags("publish", stderr)
 	var nsName, asName, subject, brief string
+	var alert bool
 	nsFlag(fs, &nsName)
 	asFlag(fs, &asName)
 	fs.StringVar(&subject, "subject", "", "one-line subject, max 120 characters; the only part guaranteed to arrive")
 	fs.StringVar(&brief, "brief", "", "a short summary, max 600 characters; what `pigeon inbox` shows by default")
+	fs.BoolVar(&alert, "alert", false, "mark this urgent: it interrupts work in progress and bypasses a digest. Use it to stop people, not to inform them")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -438,17 +447,23 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf("usage: pigeon publish [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] <topic> <text>")
+		return fmt.Errorf("usage: pigeon publish [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] [--alert] <topic> <text>")
 	}
 	if err := misplacedFlag(rest[1:]); err != nil {
 		return err
 	}
 	topic, text := rest[0], strings.Join(rest[1:], " ")
+
+	priority := ""
+	if alert {
+		priority = pigeon.PriorityAlert
+	}
+
 	ns, err := namespaceOf(nsName)
 	if err != nil {
 		return err
 	}
-	msg, err := ns.Publish(topic, pigeon.Draft{Text: text, Subject: subject, Brief: brief}, pigeon.ActingSender(asName))
+	msg, err := ns.Publish(topic, pigeon.Draft{Text: text, Subject: subject, Brief: brief, Priority: priority}, pigeon.ActingSender(asName))
 	if err != nil {
 		return err
 	}

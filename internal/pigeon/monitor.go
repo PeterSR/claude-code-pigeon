@@ -703,22 +703,23 @@ func register(ns Namespace, sid string, logf func(string, ...any)) error {
 	now := nowRFC3339()
 	claude := LookupClaudeSession(pid, sid)
 	if err := ns.WriteEntry(&Entry{
-		SessionID:        sid,
-		Namespace:        ns.String(),
-		Name:             name,
-		Description:      desc,
-		PID:              pid,
-		ProcStart:        ProcStart(pid),
-		Cwd:              cwd,
-		Host:             hostname(),
-		StartedAt:        now,
-		HeartbeatAt:      now,
-		Subscriptions:    subs,
-		CCVersion:        os.Getenv(EnvVersion),
-		ClaudeName:       claude.Name,
-		ClaudeNameSource: claude.Source,
-		Driven:           os.Getenv(EnvChild) == "1",
-		Private:          cfg != nil && cfg.Private,
+		SessionID:      sid,
+		Namespace:      ns.String(),
+		Name:           name,
+		Description:    desc,
+		PID:            pid,
+		ProcStart:      ProcStart(pid),
+		Cwd:            cwd,
+		Host:           hostname(),
+		StartedAt:      now,
+		HeartbeatAt:    now,
+		Subscriptions:  subs,
+		Runtime:        RuntimeClaudeCode,
+		RuntimeVersion: os.Getenv(EnvVersion),
+		Label:          claude.Name,
+		LabelSource:    claude.Source,
+		Driven:         os.Getenv(EnvChild) == "1",
+		Private:        cfg != nil && cfg.Private,
 	}); err != nil {
 		return err
 	}
@@ -828,7 +829,7 @@ func heartbeat(ns Namespace, sid string, done <-chan struct{}) {
 				// peers can already see. WriteEntry re-blanks it for a private
 				// session, so this cannot resurrect a withheld one.
 				if claude := LookupClaudeSession(e.PID, sid); claude.Name != "" {
-					e.ClaudeName, e.ClaudeNameSource = claude.Name, claude.Source
+					e.Label, e.LabelSource = claude.Name, claude.Source
 				}
 				return nil
 			})

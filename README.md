@@ -163,9 +163,9 @@ has to be escaped.
 | `.Short` | its first 8 characters, the form `pigeon ls` shows |
 | `.Seq` | 1 plus the number of live sessions already in this directory |
 | `.Name` | in `onNameTaken` only: the name that was already taken |
-| `.ClaudeName` | Claude Code's own session name, the one `/status` shows. Filled in only for the current session; empty otherwise. See [below](#the-pid-and-claude-codes-own-session-name) |
-| `.Label` | an alias for `.ClaudeName`, for templates that prefer the shorter word |
-| `.ClaudeNameSource` | how Claude Code arrived at it: `derived` from the cwd, or a value that marks it user-set |
+| `.Label` | the host's own session name, the one `/status` shows for Claude Code. Filled in only for the current session; empty otherwise. See [below](#the-pid-and-claude-codes-own-session-name) |
+| `.LabelSource` | how the host arrived at it: `derived` from the cwd, or a value that marks it user-set |
+| `.ClaudeName`, `.ClaudeNameSource` | deprecated aliases for `.Label` and `.LabelSource`, kept working for a project config written before the rename |
 
 | Function | What it does |
 |---|---|
@@ -244,8 +244,8 @@ declare, never on this, and it is not accepted as a send target. By default
 Claude Code derives it from the working directory, so it mostly echoes what
 `cwd` already says; it earns its column when you rename a session in Claude
 Code, which is the one name pigeon cannot derive for you. Templates can read it
-as `{{.ClaudeName}}`, so a workflow built around those renames can adopt it with
-`"name": "{{.ClaudeName}}"`.
+as `{{.Label}}`, so a workflow built around those renames can adopt it with
+`"name": "{{.Label}}"` (`{{.ClaudeName}}` still works, as a deprecated alias).
 
 pigeon reads it from Claude Code's own per-session index, which is another piece
 of shipped-but-undocumented behaviour (see [How it works](#how-it-works)), so it

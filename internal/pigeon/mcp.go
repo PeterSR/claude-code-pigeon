@@ -122,8 +122,8 @@ func tools() []toolDef {
 		{
 			Name: "list_sessions",
 			Description: "List live Claude Code sessions reachable via pigeon, with their " +
-				"name, description, working directory, namespace, status, pid, and Claude " +
-				"Code's own session name (the one /status shows, shown as claude=). Status " +
+				"name, description, working directory, namespace, status, pid, and the " +
+				"host's own session label (the one /status shows, shown as claude=). Status " +
 				"'deaf' means the session is running but not listening, so messages to it " +
 				"will not arrive. A row marked [shell inbox] is a plain shell holding an " +
 				"inbox open with `pigeon listen`, not a Claude Code session, but is " +
@@ -354,9 +354,9 @@ func tools() []toolDef {
 				"{{.Dir}} the working directory's basename, {{.Cwd}} its full path, " +
 				"{{.Branch}} the checked-out git branch, {{.Host}}, {{.User}}, {{.Session}}, " +
 				"{{.Short}} the 8-character session id, {{.Seq}}, which counts this " +
-				"session among those already in the same directory, and {{.ClaudeName}} " +
-				"(alias {{.Label}}), Claude Code's own session name from /status. Functions: " +
-				"snake, kebab, lower, upper, trunc N, default \"fallback\".",
+				"session among those already in the same directory, and {{.Label}} " +
+				"(deprecated alias {{.ClaudeName}}), the host's own session name from " +
+				"/status. Functions: snake, kebab, lower, upper, trunc N, default \"fallback\".",
 			InputSchema: obj(map[string]any{
 				"type": "object",
 				"properties": obj(map[string]any{
@@ -702,9 +702,9 @@ func mcpList(ns Namespace) (string, error) {
 			fmt.Fprintf(&b, "  pid=%d", e.PID)
 		}
 		fmt.Fprintf(&b, "  status=%s  ns=%s  cwd=%s", e.Status, e.Namespace, e.Cwd)
-		if e.ClaudeName != "" {
-			// Claude Code's own /status name. Informational, not an address.
-			fmt.Fprintf(&b, "  claude=%s", e.ClaudeName)
+		if e.Label != "" {
+			// The host's own /status name. Informational, not an address.
+			fmt.Fprintf(&b, "  claude=%s", e.Label)
 		}
 		if e.Ephemeral {
 			// A shell holding an inbox open with `pigeon listen`, not a Claude
@@ -1032,7 +1032,7 @@ func mcpWhoami() (string, error) {
 		fmt.Fprintf(&b, "pid:         %d\n", e.PID)
 	}
 	fmt.Fprintf(&b, "name:        %s\n", orDash(e.Name))
-	fmt.Fprintf(&b, "claude name: %s\n", claudeNameLine(e))
+	fmt.Fprintf(&b, "claude name: %s\n", labelLine(e))
 	fmt.Fprintf(&b, "description: %s\n", orDash(e.Description))
 	fmt.Fprintf(&b, "cwd:         %s\n", e.Cwd)
 	fmt.Fprintf(&b, "status:      %s\n", e.Status)
@@ -1118,14 +1118,14 @@ func orDash(s string) string {
 	return s
 }
 
-// claudeNameLine renders Claude Code's own session name with its source, so a
+// labelLine renders the host's own session label with its source, so a
 // model reading whoami can tell a derived name (cwd echo) from a chosen one.
-func claudeNameLine(e *Entry) string {
-	if strings.TrimSpace(e.ClaudeName) == "" {
+func labelLine(e *Entry) string {
+	if strings.TrimSpace(e.Label) == "" {
 		return "-"
 	}
-	if e.ClaudeNameSource != "" {
-		return e.ClaudeName + " (" + e.ClaudeNameSource + ")"
+	if e.LabelSource != "" {
+		return e.Label + " (" + e.LabelSource + ")"
 	}
-	return e.ClaudeName
+	return e.Label
 }

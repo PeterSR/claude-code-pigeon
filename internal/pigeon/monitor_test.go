@@ -237,9 +237,10 @@ func TestMonitorRegistersEntryAndHoldsTheLock(t *testing.T) {
 	}
 }
 
-// register() reflects Claude Code's own session name into the entry, so peers
-// see the /status label without reading Claude Code's internals themselves.
-func TestMonitorPopulatesClaudeName(t *testing.T) {
+// register() reflects Claude Code's own session name into the entry's Label,
+// so peers see the /status label without reading Claude Code's internals
+// themselves.
+func TestMonitorPopulatesLabel(t *testing.T) {
 	withHome(t)
 	const sid = "mon-claude-name-1"
 	// Plant the index register() will read, and point EnvConfigDir at it so the
@@ -248,13 +249,16 @@ func TestMonitorPopulatesClaudeName(t *testing.T) {
 	startMonitor(t, sid)
 
 	var e *Entry
-	eventually(t, 5*time.Second, "the entry to carry the claude name", func() bool {
+	eventually(t, 5*time.Second, "the entry to carry the label", func() bool {
 		var err error
 		e, err = ReadEntry(sid)
-		return err == nil && e.ClaudeName != ""
+		return err == nil && e.Label != ""
 	})
-	if e.ClaudeName != "chosen-here" || e.ClaudeNameSource != "user" {
-		t.Fatalf("claude name = %q (%q), want chosen-here (user)", e.ClaudeName, e.ClaudeNameSource)
+	if e.Label != "chosen-here" || e.LabelSource != "user" {
+		t.Fatalf("label = %q (%q), want chosen-here (user)", e.Label, e.LabelSource)
+	}
+	if e.Runtime != RuntimeClaudeCode {
+		t.Fatalf("runtime = %q, want %q", e.Runtime, RuntimeClaudeCode)
 	}
 }
 

@@ -39,9 +39,9 @@ All notable changes to this project are documented here. Format follows
   claude process, ahead of the fuzzier name, prefix and cwd tiers, since a pid is exact and
   unique among live sessions. Useful when a session is unnamed and you already have its pid.
 - Claude Code's own session name -- the one `/status` shows -- is surfaced as a new `CLAUDE`
-  column in `pigeon ls`, in `list_sessions` and `whoami`, and as a `{{.ClaudeName}}`
-  (and `{{.ClaudeNameSource}}`) template field for project configs. It is a host label, not
-  an address: routing still keys on the pigeon `name`, and the Claude name is not a send
+  column in `pigeon ls`, in `list_sessions` and `whoami`, and as a `{{.Label}}`
+  (and `{{.LabelSource}}`) template field for project configs. It is a host label, not
+  an address: routing still keys on the pigeon `name`, and the label is not a send
   target. A derived name mostly echoes the cwd; it earns its place when a session is renamed
   in Claude Code, which pigeon cannot derive on its own.
 
@@ -51,6 +51,14 @@ All notable changes to this project are documented here. Format follows
   mislabel a session. Like every other undocumented host behaviour pigeon leans on, `pigeon
   doctor` checks it and it degrades to empty rather than failing. A private session withholds
   it along with its cwd, because a derived name would leak the directory.
+
+  The registry entry stores this as `label`/`labelSource`, alongside a new `runtime`/
+  `runtimeVersion` pair replacing the earlier `ccVersion` (`runtime` is `claude-code` for
+  every entry pigeon writes today). An entry already on disk under the previous
+  `claudeName`/`claudeNameSource`/`ccVersion` keys is still read correctly, and self-heals
+  onto the new keys the next time its heartbeat rewrites it; `{{.ClaudeName}}` and
+  `{{.ClaudeNameSource}}` keep working in a project config as deprecated aliases for
+  `{{.Label}}` and `{{.LabelSource}}`.
 - `pigeon ls` also shows a `PID` column, and `whoami` a `pid:` line.
 - `pigeon weaverbird spec|value`, which publishes pigeon's state to
   [weaverbird](https://github.com/PeterSR/claude-code-weaverbird) rather than rendering a

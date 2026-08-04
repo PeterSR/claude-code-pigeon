@@ -54,17 +54,41 @@ type Entry struct {
 	StartedAt     string   `json:"startedAt,omitempty"`
 	HeartbeatAt   string   `json:"heartbeatAt,omitempty"`
 	Subscriptions []string `json:"subscriptions,omitempty"`
-	CCVersion     string   `json:"ccVersion,omitempty"`
-	// ClaudeName is Claude Code's own session name, the one /status shows, and
-	// ClaudeNameSource is how Claude Code arrived at it ("derived" from the cwd,
-	// or user-set). Both are a host label pigeon merely reflects, never an
-	// address -- Name is what routing uses. They are filled in best-effort from
-	// Claude Code's session index and refreshed by the heartbeat, so a mid-session
-	// rename shows up within about 15s; empty when the index cannot be read.
-	// Withheld for private sessions, because a derived name echoes the cwd.
-	ClaudeName       string `json:"claudeName,omitempty"`
-	ClaudeNameSource string `json:"claudeNameSource,omitempty"`
-	Driven           bool   `json:"driven,omitempty"`
+
+	// Runtime names the agent host that wrote this entry; RuntimeVersion is
+	// that host's own version string. RuntimeClaudeCode is the only value
+	// pigeon writes today, but the field exists so a host is recorded as a
+	// fact rather than assumed -- see doctor.go's minCCVersion/testedCCVersion
+	// for the Claude-Code-specific version floor this is not.
+	Runtime        string `json:"runtime,omitempty"`
+	RuntimeVersion string `json:"runtimeVersion,omitempty"`
+	// Deprecated: written by pigeon before the runtime/label rename. Read,
+	// never written -- folded into RuntimeVersion when that key is absent (see
+	// Entry.migrateLegacy).
+	LegacyCCVersion string `json:"ccVersion,omitempty"`
+
+	// Label is a display name the host assigns -- the one /status shows, for
+	// Claude Code -- and LabelSource is how the host arrived at it ("derived"
+	// from the cwd, or a value marking it user-set). Both are a label pigeon
+	// merely reflects, never an address -- Name is what routing uses. They are
+	// filled in best-effort from the host's own session state (see
+	// claudesession.go for how Claude Code's is read) and refreshed by the
+	// heartbeat, so a mid-session rename shows up within about 15s; empty when
+	// that state cannot be read. Withheld for private sessions, because a
+	// derived label echoes the cwd.
+	Label       string `json:"label,omitempty"`
+	LabelSource string `json:"labelSource,omitempty"`
+	// Deprecated: written by pigeon before the rename. Read, never written --
+	// folded into Label/LabelSource when the new keys are absent (see
+	// Entry.migrateLegacy). The exposure of keeping the old reader around is
+	// small: a heartbeat rewrites a live entry every 15s, so a session whose
+	// monitor is from this build self-heals onto the new keys within one tick;
+	// one still running an older monitor keeps writing these for its own
+	// lifetime, and the worst consequence is a blank column in a listing,
+	// because the label is never an address and nothing routes on it.
+	LegacyClaudeName       string `json:"claudeName,omitempty"`
+	LegacyClaudeNameSource string `json:"claudeNameSource,omitempty"`
+	Driven                 bool   `json:"driven,omitempty"`
 	// Delivery maps a subscribed topic to how it reaches this session: absent
 	// (or "push") notifies per message, "digest" collapses routine traffic
 	// into one line a minute (an alert or a message naming this session in
@@ -79,15 +103,39 @@ type Entry struct {
 	// Private sessions publish no cwd and no description. The flag itself is
 	// published so this session can be told why its own entry looks bare.
 	Private bool `json:"private,omitempty"`
-	// Ephemeral marks a session that is not a Claude Code session at all: a plain
+	// Ephemeral marks a session that is not an agent session at all: a plain
 	// shell holding an inbox open with `pigeon listen`. Its pid is that shell, it
-	// has no ClaudeName to reflect, and it vanishes the moment the shell exits, so
-	// listings mark it as a shell rather than reporting a blank Claude name as
+	// has no Label to reflect, and it vanishes the moment the shell exits, so
+	// listings mark it as a shell rather than reporting a blank label as
 	// something to fix.
 	Ephemeral bool `json:"ephemeral,omitempty"`
 
 	// Derived at read time, never persisted.
 	Status Status `json:"-"`
+}
+
+// RuntimeClaudeCode is the only Runtime value pigeon writes today.
+const RuntimeClaudeCode = "claude-code"
+
+// migrateLegacy folds an entry's pre-rename keys into their replacements
+// whenever the new key is absent, so an entry an older pigeon wrote reads the
+// same as one this build wrote. It never overwrites a new key that is already
+// set: that value is what wrote the entry most recently, and a legacy key
+// sitting next to it must not win back over a change made under this key.
+//
+// Called once, right after every raw JSON entry is unmarshalled -- see
+// ReadEntry, ListSessions and pruneDeadEntries -- so every reader downstream
+// of those sees the new shape regardless of which shape is actually on disk.
+func (e *Entry) migrateLegacy() {
+	if e.Label == "" {
+		e.Label = e.LegacyClaudeName
+	}
+	if e.LabelSource == "" {
+		e.LabelSource = e.LegacyClaudeNameSource
+	}
+	if e.RuntimeVersion == "" {
+		e.RuntimeVersion = e.LegacyCCVersion
+	}
 }
 
 // Display is the best short human handle for this session.
@@ -152,6 +200,7 @@ func (n Namespace) ReadEntry(sessionID string) (*Entry, error) {
 	if err := json.Unmarshal(b, &e); err != nil {
 		return nil, err
 	}
+	e.migrateLegacy()
 	// The directory is the truth about which namespace this session is in; the
 	// field is a convenience for whoever reads the JSON afterwards.
 	e.Namespace = n.String()
@@ -179,12 +228,16 @@ func (n Namespace) WriteEntry(e *Entry) error {
 	// cannot receive mail.
 	rec.Namespace = n.String()
 	if rec.Private {
-		// The Claude name goes too: a derived one is the cwd basename with a
+		// The label goes too: a derived one is the cwd basename with a
 		// suffix, so publishing it would leak exactly the directory Private is
 		// meant to keep off the bus.
 		rec.Cwd, rec.Description = "", ""
-		rec.ClaudeName, rec.ClaudeNameSource = "", ""
+		rec.Label, rec.LabelSource = "", ""
 	}
+	// Legacy keys are read, never written: whatever put them on rec -- a
+	// migrateLegacy fold-in from ReadEntry, or a hand-edited file -- must not
+	// be carried forward by a write this build makes.
+	rec.LegacyClaudeName, rec.LegacyClaudeNameSource, rec.LegacyCCVersion = "", "", ""
 	b, err := json.MarshalIndent(&rec, "", "  ")
 	if err != nil {
 		return err
@@ -293,6 +346,7 @@ func (n Namespace) ListSessions(includeDead, prune bool) ([]*Entry, error) {
 		if err := json.Unmarshal(b, &e); err != nil {
 			continue
 		}
+		e.migrateLegacy()
 		// A planted entry file must not be able to steer prune at a path
 		// outside the state tree.
 		if ValidSessionID(e.SessionID) != nil ||
@@ -339,6 +393,7 @@ func (n Namespace) pruneDeadEntries(exceptSID string) int {
 		if err := json.Unmarshal(b, &e); err != nil {
 			continue
 		}
+		e.migrateLegacy()
 		// A planted entry file must not be able to steer this at a path
 		// outside the state tree, same guard as ListSessions.
 		if ValidSessionID(e.SessionID) != nil || filepath.Base(p) != e.SessionID+".json" {

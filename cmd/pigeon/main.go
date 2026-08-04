@@ -1313,14 +1313,14 @@ func pidCol(pid int) string {
 	return fmt.Sprintf("%d", pid)
 }
 
-// claudeCol renders the CLAUDE column of `pigeon ls`. A shell inbox is not a
-// Claude Code session and has no such name, so it is labelled as what it is
-// rather than shown as a blank waiting to be filled.
+// claudeCol renders the CLAUDE column of `pigeon ls`. A shell inbox is not an
+// agent session and has no such label, so it is labelled as what it is rather
+// than shown as a blank waiting to be filled.
 func claudeCol(e *pigeon.Entry) string {
 	if e.Ephemeral {
 		return "shell"
 	}
-	return dash(truncate(e.ClaudeName, 24))
+	return dash(truncate(e.Label, 24))
 }
 
 // isTerminal reports whether w is a terminal, so `pigeon listen` can default to
@@ -1337,16 +1337,16 @@ func isTerminal(w io.Writer) bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }
 
-// claudeNameCol renders Claude Code's own session name for whoami, noting how it
+// claudeNameCol renders the host's own session label for whoami, noting how it
 // was arrived at so a mostly-cosmetic "derived" name is not read as a chosen one.
 func claudeNameCol(e *pigeon.Entry) string {
-	if strings.TrimSpace(e.ClaudeName) == "" {
+	if strings.TrimSpace(e.Label) == "" {
 		return "-"
 	}
-	if e.ClaudeNameSource != "" {
-		return fmt.Sprintf("%s (%s)", e.ClaudeName, e.ClaudeNameSource)
+	if e.LabelSource != "" {
+		return fmt.Sprintf("%s (%s)", e.Label, e.LabelSource)
 	}
-	return e.ClaudeName
+	return e.Label
 }
 
 func truncate(s string, n int) string {

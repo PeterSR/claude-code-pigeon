@@ -594,6 +594,92 @@ func TestEntryPersistence(t *testing.T) {
 	}
 }
 
+// An entry an older pigeon wrote carries claudeName/claudeNameSource/ccVersion
+// rather than label/labelSource/runtimeVersion. Reading it must still populate
+// the new fields, since a live fleet upgrades one session at a time and every
+// reader -- ls, whoami, list_sessions -- has to make sense of whichever shape
+// is actually on disk.
+func TestReadEntryFoldsLegacyKeysIntoNewFields(t *testing.T) {
+	withHome(t)
+	sid := "1eaa1111-2222-3333-4444-555555555555"
+	legacy := `{
+		"sessionId": "` + sid + `",
+		"pid": 1,
+		"claudeName": "legacy-title",
+		"claudeNameSource": "user",
+		"ccVersion": "2.1.100"
+	}`
+	if err := os.WriteFile(filepath.Join(SessionsDir(), sid+".json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e, err := ReadEntry(sid)
+	if err != nil {
+		t.Fatalf("ReadEntry: %v", err)
+	}
+	if e.Label != "legacy-title" || e.LabelSource != "user" || e.RuntimeVersion != "2.1.100" {
+		t.Fatalf("Label=%q LabelSource=%q RuntimeVersion=%q; want legacy-title/user/2.1.100",
+			e.Label, e.LabelSource, e.RuntimeVersion)
+	}
+}
+
+// A freshly written entry must carry only the new keys: the legacy ones are
+// read, never written, however they got into the in-memory copy (a
+// migrateLegacy fold-in from a prior read, or a caller that set them by hand).
+func TestWriteEntryOmitsLegacyKeys(t *testing.T) {
+	withHome(t)
+	sid := "2eaa1111-2222-3333-4444-555555555555"
+	if err := WriteEntry(&Entry{
+		SessionID:              sid,
+		PID:                    1,
+		Label:                  "current-title",
+		LabelSource:            "user",
+		Runtime:                RuntimeClaudeCode,
+		RuntimeVersion:         "2.1.200",
+		LegacyClaudeName:       "should-not-be-written",
+		LegacyClaudeNameSource: "should-not-be-written",
+		LegacyCCVersion:        "should-not-be-written",
+	}); err != nil {
+		t.Fatalf("WriteEntry: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(SessionsDir(), sid+".json"))
+	if err != nil {
+		t.Fatalf("read entry file: %v", err)
+	}
+	for _, key := range []string{"claudeName", "claudeNameSource", "ccVersion"} {
+		if strings.Contains(string(raw), `"`+key+`"`) {
+			t.Errorf("written entry still carries legacy key %q:\n%s", key, raw)
+		}
+	}
+	for _, key := range []string{"label", "labelSource", "runtime", "runtimeVersion"} {
+		if !strings.Contains(string(raw), `"`+key+`"`) {
+			t.Errorf("written entry is missing new key %q:\n%s", key, raw)
+		}
+	}
+}
+
+// `pigeon ls`'s claude= column (see claudeCol in cmd/pigeon) and list_sessions'
+// equivalent both read Entry.Label, so a legacy entry must still surface a
+// label after ReadEntry folds claudeName in -- this is what keeps that column
+// non-blank for a session an older monitor is still heartbeating.
+func TestLegacyEntryStillPopulatesLabelForDisplay(t *testing.T) {
+	withHome(t)
+	sid := "3eaa1111-2222-3333-4444-555555555555"
+	legacy := `{"sessionId": "` + sid + `", "pid": 1, "claudeName": "old-style-label"}`
+	if err := os.WriteFile(filepath.Join(SessionsDir(), sid+".json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e, err := ReadEntry(sid)
+	if err != nil {
+		t.Fatalf("ReadEntry: %v", err)
+	}
+	if e.Label == "" {
+		t.Fatal("a legacy entry's label read back empty; the claude= column would show a dash")
+	}
+	if e.Label != "old-style-label" {
+		t.Fatalf("Label = %q, want old-style-label", e.Label)
+	}
+}
+
 func TestStatusDeadWhenProcessGone(t *testing.T) {
 	withHome(t)
 	e := &Entry{SessionID: "gone-1111", PID: 0, StartedAt: nowRFC3339()}

@@ -332,18 +332,55 @@ func (n Namespace) ReadThread(sessionID, id string) ([]InboxItem, error) {
 		}
 	}
 
+	// Ordered by the reply chain, parent before child, not by timestamp.
+	//
+	// TS is RFC3339 at one-second resolution, and a thread is exactly the case
+	// where several messages land inside one second -- so sorting on it leaves
+	// ties, and the ties used to be broken by Go's randomised map iteration.
+	// The same three messages came back in a different order run to run. Reply
+	// order is also simply the right order for reading a conversation: it is
+	// what the participants meant, and it survives clock skew between the
+	// sessions that wrote the lines.
+	roots := make([]string, 0, len(seen))
+	for mid := range seen {
+		parent := byID[mid].Message.ReplyTo
+		if parent == "" || !seen[parent] {
+			roots = append(roots, mid)
+		}
+	}
+	// Siblings, and multiple roots, fall back to time and then to id, so the
+	// result is fully determined whatever order the logs were read in.
+	bySiblingOrder := func(ids []string) {
+		sort.Slice(ids, func(i, j int) bool {
+			a, b := byID[ids[i]].Message, byID[ids[j]].Message
+			if a.TS != b.TS {
+				return a.TS < b.TS
+			}
+			return a.ID < b.ID
+		})
+	}
+	bySiblingOrder(roots)
+
 	now := time.Now()
 	items := make([]InboxItem, 0, len(seen))
-	for mid := range seen {
-		it := byID[mid]
+	var walk func(id string)
+	walk = func(id string) {
+		it := byID[id]
 		if t, terr := time.Parse(time.RFC3339, it.Message.TS); terr == nil {
 			it.Age = now.Sub(t)
 		}
 		items = append(items, it)
+		kids := append([]string(nil), children[id]...)
+		bySiblingOrder(kids)
+		for _, child := range kids {
+			if seen[child] {
+				walk(child)
+			}
+		}
 	}
-	sort.SliceStable(items, func(i, j int) bool {
-		return items[i].Message.TS < items[j].Message.TS
-	})
+	for _, r := range roots {
+		walk(r)
+	}
 	return items, nil
 }
 

@@ -71,8 +71,13 @@ capabilities; the plugin just saves you doing it per session.
 pigeon ls [--all] [--json]      list sessions and whether they are listening
 pigeon send <target> <text>     send to one session
 pigeon publish <topic> <text>   publish to everyone subscribed
+pigeon inbox [--all] [--full]   read your own mail, in full, without a notification
+pigeon ask <topic> <text>       ask, and block until the answers are in
+pigeon answer <id> <verdict>    ok | object | blocked, with an optional note
+pigeon thread <id>              print one conversation end to end
 pigeon subscribe <topic>        join a topic (takes effect in ~1s, no restart)
 pigeon unsubscribe <topic>
+pigeon delivery [<topic> <mode>]  push | digest | quiet, per topic
 pigeon listen [topic...]        receive messages in this shell, blocking
 pigeon topics                   topics and subscriber counts
 pigeon namespaces               namespaces and their session counts
@@ -95,6 +100,12 @@ replies to work; a message from a plain shell is stamped `shell:user@host` and c
 reply handle, because there is nowhere to reply to. From a shell that is
 [acting as an inbox](#listening-from-a-shell-automation) it is stamped as that inbox, so a
 reply reaches it.
+
+`send` and `publish` take `--subject`, `--brief`, `--alert`, `--reply-to`, `--supersedes` and
+`--attach`; `publish` also takes a repeatable `--for`. Flags must come before the target and the
+body -- Go's flag parsing stops at the first positional argument, so `pigeon publish topic
+--subject x body` would file the subject away as message text. pigeon refuses that rather than
+sending a message quietly missing the part you meant.
 
 `name` and `describe` also take `--template '{{.Dir}}-{{.Seq}}'`, rendered against this
 session. The fields and functions are the ones in [Project defaults](#project-defaults)
@@ -315,6 +326,123 @@ can do all of this itself. `set_identity` takes `nameTemplate` and `descriptionT
 alongside the literal fields, with the same context and functions as the project config.
 `list_sessions`, `send_message`, `publish`, `subscribe` and `unsubscribe` take an optional
 `namespace`; leaving it out means this session's own.
+
+## Messages that cost the reader less
+
+A notification is clipped at about 512 characters by Claude Code, so roughly 300 of body
+survives and the rest goes to a payload file. Measured across a real five-session run, that
+clipped **every** message on the topic -- median 2,019 characters -- and the pointer to the rest
+was followed under three times in ten. Most messages were read as a prefix cut mid-sentence.
+
+So a message has three tiers, and the sender writes all of them:
+
+```console
+$ pigeon publish --subject "ws2 has NO orders at all -- every forecast screen is empty and correct" \
+                 --brief "Zero rows in orders, so the forecast answers 200 with order_count 0.
+                          An empty screen is exactly what a broken one looks like. Confirm your
+                          fixture rows EXIST before reading a result as a pass." \
+                 inventory-chain "...the full detail, including what I checked while I was in there..."
+```
+
+`subject` is the only part guaranteed to arrive, so it should be the conclusion rather than the
+topic. It is never what the notification line drops. `brief` is what `pigeon inbox` shows by
+default. `text` is everything.
+
+pigeon does not write these for you and will not try -- it is a static binary with no model
+behind it. That the sender is one is the whole reason this design is available here and would
+not be on a message bus for people.
+
+## Reading your own mail
+
+The notification is a doorbell. `inbox` is the door:
+
+```console
+$ pigeon inbox
+3 unread (2 on #inventory-chain, 1 direct):
+m_b04fc3046ecb  15:11  ad-hoc            #inventory-chain  (4 min ago)
+  SUBJECT: RELEASING api/inventory.py, models.py and the migrations
+  Timezone rework is in at 268ce1341. All 23 columns are timestamptz from birth...
+m_88b0c1f2a3d4  15:12  inv-invoices      #inventory-chain  -> you  (2 min ago)
+  SUBJECT: CLAIMING backend/app/api/inventory.py for Defect 2
+  ...
+```
+
+One call drains a whole burst, in full, with no payload paths to chase. `--full` for whole
+bodies, `--subjects` for one line each, `--all` to browse history without consuming it.
+
+Reading is tracked separately from notification. The monitor's cursor records what it has told
+you about; a second cursor records what you have actually read. Conflating them would let a
+pull silently suppress a notification, or a notification mark mail as read that nobody saw.
+
+## Attention, and who gets to take it
+
+| | |
+|---|---|
+| `pigeon delivery <topic> digest` | one line a minute instead of one per message |
+| `pigeon delivery <topic> quiet` | only that line; nothing interrupts |
+| `--alert` | interrupts a `digest` topic. Never a `quiet` one |
+| `--for <name>` | names who a broadcast is actually for; also interrupts a digest topic |
+
+A digest looks like:
+
+```
+[pigeon] 6 waiting on #inventory-chain from indkoeb-ui, ad-hoc, project-overview -- read with the inbox tool
+```
+
+**`quiet` is absolute.** A peer's opinion of its own urgency does not override a session that
+asked not to be interrupted; the most an alert earns there is a line at the next tick. A mute a
+sufficiently insistent sender can override is not a mute.
+
+There are exactly two priorities. A third would make the scarce one common, which is what
+happened to shouting in capitals.
+
+## Asking, when the answer has to arrive first
+
+```console
+$ pigeon ask --deadline 30s ops "Removing a stale index.lock -- anyone mid-git?"
+ask m_9f2c1a2b3c4d closed after 18s: 2 ok, 1 object, 1 no answer (of 4 asked)
+  object  inv-purchaseplan -- it was not stale, I hold it
+  ok      indkoeb-ui
+  ok      ad-hoc
+  no answer  inv-invoices (live)
+```
+
+`ask` **blocks**. It publishes the question as an alert, then waits for the answers itself and
+returns the tally, so the asker cannot act before the window closes -- it is inside a tool call.
+The deadline lives in the asking process rather than in the monitor, because the monitor is the
+part that dies on resume, and an ask that depended on it would hang exactly when it mattered.
+
+The audience is fixed when the question is asked, and every non-answer is named along with what
+that session's status was at close. **Nothing in the output ever reads as "no objections":** a
+session that says nothing may be deaf, busy, or gone, and the one incident this exists for was a
+coordinator reading silence as consent and removing a lock that was live.
+
+## Correcting a message instead of sending another one
+
+```console
+$ pigeon publish --supersedes m_2a71... ops "NOTHING WAS DESTROYED. I was wrong."
+```
+
+A recipient who has seen the original is told this is a correction before reading a word of it.
+One who has not -- because the topic is on digest and the window has not closed -- never sees
+the original at all: it is dropped from the buffer and the alarm simply never happens.
+
+Only the original sender may supersede a message. Otherwise any peer could cancel someone else's
+alarm inside a digest window, or stamp a false retraction on a claim nobody withdrew.
+
+## Threads, catch-up and attachments
+
+`--reply-to <id>` links a message to its parent; `pigeon inbox` groups a run of them under one
+header, and `pigeon thread <id>` prints a conversation end to end. The notification line is
+deliberately untouched -- the budget cannot afford a thread tag and it would not help at doorbell
+time.
+
+`pigeon subscribe --catchup 20 <topic>` joins an in-flight topic with the last 20 messages
+waiting. They land in the **inbox**, not as twenty notifications: the monitor's cursor stays at
+the end of the log and only the read position moves back.
+
+`--attach <path>` sends files alongside a message, up to five and 256 KiB each. An attachment is
+a file a peer chose: read it, do not run it.
 
 ## Skills
 
@@ -676,7 +804,15 @@ are written to `payloads/` and the recipient gets a path instead.
   sessions still works; only the space reclaim is skipped.
 - One machine. No network transport.
 - 30 notifications per minute per session; beyond that pigeon reports suppression rather
-  than being stopped by Claude Code.
+  than being stopped by Claude Code. Ten of those slots are reserved for alerts, so routine
+  traffic cannot crowd out a message that meant to stop you, and digest lines spend from that
+  reserve since one of them stands in for many messages.
+- A digest holds messages for up to a minute. If the monitor is killed in that window the line
+  is written best-effort and the read position is left alone, so a rearmed monitor re-reads
+  rather than resuming past messages nothing announced. The cost is a possible duplicate digest
+  line after a restart, which is the cheap side of that trade.
+- `ask` blocks the calling tool for up to its deadline (30s by default, 300s maximum). That is
+  the point of it, but it does mean the asking session does nothing else meanwhile.
 - Namespaces are organisation, not a security boundary. They keep unrelated work out of
   each other's listings and broadcasts; they do not stop anything that can write the state
   directory from reaching across, and `-n` exists precisely so you can.

@@ -333,7 +333,7 @@ func TestRegisterSkipsPruningADeadLookingSessionWhoseLockIsHeld(t *testing.T) {
 	}
 
 	t.Setenv(EnvClaudePID, strconv.Itoa(os.Getpid()))
-	if err := register(ns, newSID, func(string, ...any) {}); err != nil {
+	if err := register(ns, newSID, CurrentRuntime(), func(string, ...any) {}); err != nil {
 		t.Fatalf("register(%s): %v", newSID, err)
 	}
 

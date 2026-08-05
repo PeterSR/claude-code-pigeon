@@ -105,8 +105,8 @@ func Diagnose() []Check {
 // Code internal, so when a host upgrade moves it, this is where the silence gets
 // a name rather than the label just quietly going blank everywhere.
 func checkClaudeSession() Check {
-	sid := CurrentSessionID()
-	if sid == "" {
+	sid, err := CurrentRuntime().SessionID()
+	if err != nil {
 		return ok("claude name", "not inside a session; nothing to read")
 	}
 	pid := CurrentClaudePID()
@@ -115,14 +115,14 @@ func checkClaudeSession() Check {
 			"harmless unless you want the /status name; pigeon falls back to its own")
 	}
 	path := filepath.Join(claudeConfigDir(), "sessions", strconv.Itoa(pid)+".json")
-	cs := LookupClaudeSession(pid, sid)
-	if cs.Name == "" {
+	name, source := CurrentRuntime().Label(pid, sid)
+	if name == "" {
 		return warn("claude name", "no readable session index at "+path,
 			"Claude Code may have moved or renamed it; pigeon shows its own derived name instead")
 	}
-	detail := cs.Name
-	if cs.Source != "" {
-		detail += " (" + cs.Source + ")"
+	detail := name
+	if source != "" {
+		detail += " (" + source + ")"
 	}
 	return ok("claude name", detail)
 }
@@ -230,7 +230,7 @@ func checkOptOut() Check {
 }
 
 func checkVersion() Check {
-	v := strings.TrimSpace(os.Getenv(EnvVersion))
+	v := strings.TrimSpace(CurrentRuntime().Version())
 	if v == "" {
 		return warn("claude code", "version unknown ("+EnvVersion+" is unset)", "")
 	}

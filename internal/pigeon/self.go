@@ -23,8 +23,8 @@ import "fmt"
 // It fails for a plain shell, which has no session to resolve, and for a
 // session with no entry anywhere -- one whose monitor never armed.
 func Self() (Namespace, *Entry, error) {
-	sid := CurrentSessionID()
-	if sid == "" {
+	sid, err := CurrentRuntime().SessionID()
+	if err != nil {
 		return CurrentNamespace(), nil, fmt.Errorf("not inside a Claude Code session")
 	}
 	return locateSession(sid)

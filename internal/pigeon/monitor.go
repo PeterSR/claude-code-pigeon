@@ -52,7 +52,9 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 		fmt.Fprintf(stderr, "[pigeon] "+format+"\n", a...)
 	}
 
-	if !MonitorSupported {
+	rt := CurrentRuntime()
+
+	if !rt.Supported() {
 		logf("plugin monitors are not available on this platform; pigeon can send")
 		logf("from here, but cannot receive. Standing down.")
 		block()
@@ -74,10 +76,10 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 		return nil
 	}
 
-	// CurrentSessionID validates the value, so an unsubstituted "${...}"
-	// literal or anything else unsafe already arrives here as "".
-	sid := CurrentSessionID()
-	if sid == "" {
+	// rt.SessionID validates the value, so an unsubstituted "${...}" literal
+	// or anything else unsafe already arrives here as an error, not a guess.
+	sid, err := rt.SessionID()
+	if err != nil {
 		// Fail loudly. Guessing which session we belong to is worse than not
 		// running: a wrong guess delivers another session's mail.
 		logf("FATAL: %s is unset -- cannot identify this session.", EnvSessionID)
@@ -116,7 +118,7 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	}
 	defer lock.Close()
 
-	if err := register(ns, sid, logf); err != nil {
+	if err := register(ns, sid, rt, logf); err != nil {
 		logf("registration failed: %v", err)
 	}
 
@@ -138,7 +140,7 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 
 	lines := make(chan followedMessage, 256)
 
-	go heartbeat(ns, sid, done)
+	go heartbeat(ns, sid, rt, done)
 	go watchdog(CurrentClaudePID(), sigc, done, logf)
 
 	// Direct inbox: resume from our own cursor so mail queued while no monitor
@@ -155,7 +157,8 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	// for this session should survive until a monitor actually reads it.
 	defer ns.RemoveEntry(sid)
 
-	emit, emitLine, flushSuppressed, rollWindow := newRateLimiter(stdout, ns, sid, spool, time.Minute)
+	_, _, perMinute := rt.Budget()
+	emit, emitLine, flushSuppressed, rollWindow := newRateLimiter(stdout, ns, sid, spool, time.Minute, perMinute)
 	defer flushSuppressed()
 
 	// persistCursor advances source's monitor cursor to at, and only ever
@@ -653,7 +656,7 @@ func (n Namespace) tryMonitorLock(sessionID string) (io.Closer, bool, error) {
 	return tryExclusive(n.LockPath(sessionID))
 }
 
-func register(ns Namespace, sid string, logf func(string, ...any)) error {
+func register(ns Namespace, sid string, rt Runtime, logf func(string, ...any)) error {
 	// A session hard-killed before its monitor's deferred RemoveEntry runs
 	// leaves a dead entry behind -- otherwise only `pigeon prune` clears it.
 	// Sweeping here means the namespace tidies itself as sessions come and go,
@@ -701,7 +704,7 @@ func register(ns Namespace, sid string, logf func(string, ...any)) error {
 		subs = defaultSubscriptions(ns)
 	}
 	now := nowRFC3339()
-	claude := LookupClaudeSession(pid, sid)
+	labelName, labelSource := rt.Label(pid, sid)
 	if err := ns.WriteEntry(&Entry{
 		SessionID:      sid,
 		Namespace:      ns.String(),
@@ -714,10 +717,10 @@ func register(ns Namespace, sid string, logf func(string, ...any)) error {
 		StartedAt:      now,
 		HeartbeatAt:    now,
 		Subscriptions:  subs,
-		Runtime:        RuntimeClaudeCode,
-		RuntimeVersion: os.Getenv(EnvVersion),
-		Label:          claude.Name,
-		LabelSource:    claude.Source,
+		Runtime:        rt.Name(),
+		RuntimeVersion: rt.Version(),
+		Label:          labelName,
+		LabelSource:    labelSource,
 		Driven:         os.Getenv(EnvChild) == "1",
 		Private:        cfg != nil && cfg.Private,
 	}); err != nil {
@@ -810,7 +813,7 @@ func hostname() string {
 
 // heartbeat refreshes the entry so a wedged monitor -- still holding the lock
 // but no longer working -- is still reported as not delivering.
-func heartbeat(ns Namespace, sid string, done <-chan struct{}) {
+func heartbeat(ns Namespace, sid string, rt Runtime, done <-chan struct{}) {
 	t := time.NewTicker(heartbeatInterval)
 	defer t.Stop()
 	for {
@@ -828,8 +831,8 @@ func heartbeat(ns Namespace, sid string, done <-chan struct{}) {
 				// on a successful read: a transient miss must not blank a name
 				// peers can already see. WriteEntry re-blanks it for a private
 				// session, so this cannot resurrect a withheld one.
-				if claude := LookupClaudeSession(e.PID, sid); claude.Name != "" {
-					e.Label, e.LabelSource = claude.Name, claude.Source
+				if name, source := rt.Label(e.PID, sid); name != "" {
+					e.Label, e.LabelSource = name, source
 				}
 				return nil
 			})
@@ -1002,15 +1005,15 @@ func followSource(path string, offset int64, source string, out chan<- followedM
 	}
 }
 
-// alertReserve is how many of maxPerMinute's slots stay off-limits to normal
-// traffic, so that once ordinary messages have used the rest of the window
-// only a PriorityAlert message may spend what remains.
+// alertReserve is how many of the per-minute cap's slots stay off-limits to
+// normal traffic, so that once ordinary messages have used the rest of the
+// window only a PriorityAlert message may spend what remains.
 //
 // Without this a flood of routine traffic can fill the whole cap, and the one
 // message meant to interrupt gets suppressed exactly like everything else --
 // it is still in its log, but nothing wakes the session to say so. Alerts
-// still cannot exceed maxPerMinute; the reserve narrows who may use the tail
-// of the window, it does not raise the ceiling Claude Code enforces.
+// still cannot exceed the cap; the reserve narrows who may use the tail of
+// the window, it does not raise the ceiling the host enforces.
 const alertReserve = 10
 
 // newRateLimiter returns an emit function that caps output per minute and
@@ -1041,7 +1044,12 @@ const alertReserve = 10
 // from the alert reserve, since one of them stands in for many messages and is
 // the opposite of chatter. tick rolls the window from outside, so a suppression
 // notice does not wait on traffic that may never come.
-func newRateLimiter(w io.Writer, ns Namespace, sid, spool string, window time.Duration) (emit func(followedMessage), emitLine func(string) bool, flush func(), tick func()) {
+//
+// perMinute is the host's own tolerance -- CurrentRuntime().Budget()'s third
+// value in production -- rather than a package constant read from inside this
+// function, so the cap has exactly one source (Budget) and this is a
+// consumer of it like any other caller, not a second place the number lives.
+func newRateLimiter(w io.Writer, ns Namespace, sid, spool string, window time.Duration, perMinute int) (emit func(followedMessage), emitLine func(string) bool, flush func(), tick func()) {
 	windowStart := time.Now()
 	count := 0
 	// Suppression is tracked separately for alerts and normal traffic, per
@@ -1076,7 +1084,7 @@ func newRateLimiter(w io.Writer, ns Namespace, sid, spool string, window time.Du
 
 	emitLine = func(line string) bool {
 		roll()
-		if count >= maxPerMinute {
+		if count >= perMinute {
 			return false
 		}
 		count++
@@ -1106,11 +1114,11 @@ func newRateLimiter(w io.Writer, ns Namespace, sid, spool string, window time.Du
 		// The last alertReserve slots of the window are alert-only: normal
 		// traffic is cut off early so it can never crowd out the reserve, and
 		// an alert is cut off only at the true ceiling.
-		if !alert && count >= maxPerMinute-alertReserve {
+		if !alert && count >= perMinute-alertReserve {
 			suppress(suppressedNormal)
 			return
 		}
-		if count >= maxPerMinute {
+		if count >= perMinute {
 			suppress(suppressedAlert)
 			return
 		}

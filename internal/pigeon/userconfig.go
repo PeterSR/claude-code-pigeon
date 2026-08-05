@@ -218,7 +218,7 @@ func checkPrivateAccess(target Namespace) error {
 	if !target.IsPrivate() {
 		return nil
 	}
-	if !InsideClaudeSession() {
+	if !CurrentRuntime().IsAgentSpawned() {
 		return nil
 	}
 	if CurrentNamespace().Is(target) {

@@ -1165,7 +1165,7 @@ func TestFollowSourceRecoversFromTruncation(t *testing.T) {
 func TestRateLimiterSuppressesFloods(t *testing.T) {
 	withHome(t)
 	var sb strings.Builder
-	emit, _, _, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute)
+	emit, _, _, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute, maxPerMinute)
 	for i := 0; i < maxPerMinute+25; i++ {
 		emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "line"}, source: inboxCursorKey})
 	}
@@ -1184,7 +1184,7 @@ func TestRateLimiterNamesTheLogASuppressedMessageIsIn(t *testing.T) {
 	withHome(t)
 	ns := DefaultNamespace()
 	var sb strings.Builder
-	emit, _, flush, _ := newRateLimiter(&sb, ns, "", ns.SpoolPath("aaaa1111"), time.Minute)
+	emit, _, flush, _ := newRateLimiter(&sb, ns, "", ns.SpoolPath("aaaa1111"), time.Minute, maxPerMinute)
 
 	// Fill exactly the normal-traffic budget with direct messages, then
 	// suppress a topic message.
@@ -1211,7 +1211,7 @@ func TestRateLimiterNamesTheLogASuppressedMessageIsIn(t *testing.T) {
 func TestAlertSurvivesAFloodThatExhaustsTheNormalBudget(t *testing.T) {
 	withHome(t)
 	var sb strings.Builder
-	emit, _, _, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute)
+	emit, _, _, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute, maxPerMinute)
 
 	// Exhaust the normal-traffic budget and then some, so the flood alone
 	// would already be past what a plain cap could ever admit.
@@ -1232,7 +1232,7 @@ func TestAlertSurvivesAFloodThatExhaustsTheNormalBudget(t *testing.T) {
 func TestSuppressionNoticeDistinguishesAlertsFromNormalMessages(t *testing.T) {
 	withHome(t)
 	var sb strings.Builder
-	emit, _, flush, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute)
+	emit, _, flush, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute, maxPerMinute)
 
 	// Fill the normal-traffic budget, then spend the whole alert reserve too,
 	// so both a normal message and an alert have nowhere left in the window.

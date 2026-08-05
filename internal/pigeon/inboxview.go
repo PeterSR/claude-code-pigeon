@@ -283,6 +283,15 @@ func writeInboxItem(b *strings.Builder, it InboxItem, detail string, self *Entry
 	if it.Message.Subject != "" {
 		fmt.Fprintf(b, "  SUBJECT: %s\n", Sanitize(it.Message.Subject))
 	}
+	// A question is unanswerable unless the pull path says how to answer it.
+	// The notification line carries this hint, but a session on digest or quiet
+	// is told to read its mail instead of being shown that line -- so without
+	// this the only recipients who could answer are the ones who did not need
+	// the inbox. Shape-checked like Render does, because the field arrives off
+	// disk.
+	if messageIDRe.MatchString(it.Message.AskID) {
+		fmt.Fprintf(b, "  ASK: pigeon answer %s ok|object|blocked\n", it.Message.AskID)
+	}
 	switch detail {
 	case "subject":
 		// Nothing further; the header and SUBJECT line are all this tier gives.

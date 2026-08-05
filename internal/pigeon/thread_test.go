@@ -83,7 +83,7 @@ func TestReplyToRejectsSelfReference(t *testing.T) {
 func inboxItem(id, replyTo, thread, text string) InboxItem {
 	m := &Message{
 		ID: id, TS: nowRFC3339(), Thread: thread, ReplyTo: replyTo,
-		From: Sender{Kind: "session", SessionID: "aaaa1111", Name: "alpha"},
+		From:  Sender{Kind: "session", SessionID: "aaaa1111", Name: "alpha"},
 		Topic: "deploys", Text: text,
 	}
 	return InboxItem{Message: m, Source: "deploys"}

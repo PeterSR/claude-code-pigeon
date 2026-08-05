@@ -234,6 +234,15 @@ func (n Namespace) askAudience(ref TopicRef, exceptSessionID string) []AskMember
 		if e.Status != StatusLive {
 			continue
 		}
+		// A session with this topic on quiet is never interrupted, not even by
+		// an alert -- that is what quiet means. Counting it would hold quorum
+		// open for the whole deadline and then report it as "no answer
+		// (live)", which reads as a session that saw the question and chose
+		// silence. Misreading silence is the exact failure this primitive
+		// exists to prevent, so it must not be reintroduced by the tally.
+		if e.Delivery[ref.String()] == DeliveryQuiet {
+			continue
+		}
 		out = append(out, AskMember{SessionID: e.SessionID, Name: e.Name, Namespace: e.Namespace})
 	}
 	return out

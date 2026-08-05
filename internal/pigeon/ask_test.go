@@ -355,3 +355,60 @@ func TestRenderIgnoresAMalformedAskID(t *testing.T) {
 		t.Errorf("Render trusted a hand-written, malformed AskID:\n%s", got)
 	}
 }
+
+// A session that has the topic on quiet is never interrupted, not even by an
+// alert. Counting it in the audience would hold quorum open for the whole
+// deadline and then report it as having said nothing, which is the silence
+// misreading this primitive exists to prevent.
+func TestAskAudienceExcludesAQuietSubscriber(t *testing.T) {
+	withHome(t)
+	asker := armed(t, "aaaa1111", "asker")
+	quiet := armed(t, "bbbb2222", "quiet-one")
+	loud := armed(t, "cccc3333", "loud-one")
+	ns := CurrentNamespace()
+	for _, e := range []*Entry{asker, quiet, loud} {
+		if err := ns.Subscribe(e.SessionID, "ops"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ns.SetDelivery(quiet.SessionID, "ops", DeliveryQuiet); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := ParseTopicRef("ops")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := ns.askAudience(ref, asker.SessionID)
+	for _, m := range got {
+		if m.SessionID == quiet.SessionID {
+			t.Fatalf("a quiet subscriber was asked a question it will never be shown: %+v", got)
+		}
+	}
+	if len(got) != 1 || got[0].SessionID != loud.SessionID {
+		t.Fatalf("audience = %+v, want only the non-quiet subscriber", got)
+	}
+}
+
+// Catch-up may only plant a cursor that does not exist yet, so it must not
+// report a window it declined to plant.
+func TestSubscribeCatchupReportsNothingWhenACursorAlreadyExists(t *testing.T) {
+	withHome(t)
+	sid := "aaaa1111-2222"
+	liveEntry(t, sid, "alpha", "/tmp/a")
+	if err := Subscribe(sid, "ops"); err != nil {
+		t.Fatal(err)
+	}
+	from := Sender{Kind: "shell", Name: "sh"}
+	for i := 0; i < 5; i++ {
+		if _, err := Publish("ops", Draft{Text: "history"}, from); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waiting, err := CurrentNamespace().SubscribeCatchup(sid, "ops", "20")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waiting != 0 {
+		t.Fatalf("catch-up claimed %d messages are waiting, but it did not move the existing cursor", waiting)
+	}
+}

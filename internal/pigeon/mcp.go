@@ -841,8 +841,18 @@ func mcpAsk(topic, text, subject string, deadlineSec int) (string, error) {
 	if strings.TrimSpace(topic) == "" || strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("both 'topic' and 'text' are required")
 	}
+	// Through selfEntry, like every other tool that acts on this session's
+	// behalf: the namespace resolved from this process's working directory
+	// need not be the one holding the entry a monitor is serving. Asking in
+	// the wrong namespace snapshots an empty audience, which makes quorum
+	// vacuously true and returns "nobody was there to ask" while the real
+	// topic has live subscribers on it.
+	ns, _, err := selfEntry()
+	if err != nil {
+		return "", err
+	}
 	deadline := time.Duration(deadlineSec) * time.Second
-	res, err := CurrentNamespace().Ask(topic, Draft{Text: text, Subject: subject}, CurrentSender(), deadline)
+	res, err := ns.Ask(topic, Draft{Text: text, Subject: subject}, CurrentSender(), deadline)
 	if err != nil {
 		return "", err
 	}
@@ -853,7 +863,11 @@ func mcpAnswer(askID, verdict, note string) (string, error) {
 	if strings.TrimSpace(askID) == "" {
 		return "", fmt.Errorf("'ask' is required")
 	}
-	if err := CurrentNamespace().Answer(askID, CurrentSender(), verdict, note); err != nil {
+	ns, _, err := selfEntry()
+	if err != nil {
+		return "", err
+	}
+	if err := ns.Answer(askID, CurrentSender(), verdict, note); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("Recorded %s on %s.", verdict, askID), nil

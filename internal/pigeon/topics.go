@@ -692,6 +692,18 @@ func (n Namespace) seedCursor(sessionID string, ref TopicRef, catchup string) (i
 		readStart, waiting = start, count
 	}
 
+	// Catch-up only applies to a topic this session has never read. seedCursor
+	// deliberately never moves an existing cursor, so counting a window that
+	// was not planted would report "20 messages are waiting" to a session whose
+	// inbox will show none -- reachable simply by subscribing twice, or by
+	// unsubscribing and coming back, since Unsubscribe leaves cursors behind.
+	if catchup != "" {
+		if _, seen := n.readCursors(sessionID)[readCursorKey(ref.String())]; seen {
+			readStart, waiting = end, 0
+			catchup = ""
+		}
+	}
+
 	err := n.mutateCursors(sessionID, func(m map[string]int64) {
 		// Only ever seed. Subscribe is not guarded against being called for a
 		// topic this session already follows, and re-seeding to the end there

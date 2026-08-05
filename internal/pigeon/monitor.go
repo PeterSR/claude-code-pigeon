@@ -253,10 +253,13 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	// it is still "handled" and still must not jump the cursor past a peer's
 	// message still waiting on the same buffer.
 	advanceCursor := func(fm followedMessage) {
-		if fm.msg.Topic != "" {
-			if _, pending := digests[fm.msg.Topic]; pending {
-				return
-			}
+		// Keyed on fm.source, never on the message's own topic field. Buffers
+		// are filed under the source the follower read, so a hand-written line
+		// omitting or misnaming its topic would otherwise skip this check
+		// entirely and carry that topic's cursor past a peer's message still
+		// sitting unflushed in its buffer.
+		if _, pending := digests[fm.source]; pending {
+			return
 		}
 		persistCursor(fm.source, fm.offset)
 	}

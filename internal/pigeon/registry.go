@@ -572,7 +572,12 @@ func collectPayloadRefs(logPath string, into map[string]bool) {
 }
 
 func reclaimPayloadsIn(dir string, referenced map[string]bool) (removed int, bytes int64) {
-	paths, err := filepath.Glob(filepath.Join(dir, "*.txt"))
+	// Every file in the directory, not just *.txt. Bodies spill as
+	// "<id>.txt", but an attachment keeps its own extension, so a .patch or a
+	// .go copied in here was invisible to reclamation and leaked forever. The
+	// referenced-set check below is what decides safety; the glob only decides
+	// what gets considered.
+	paths, err := filepath.Glob(filepath.Join(dir, "*"))
 	if err != nil {
 		return 0, 0
 	}

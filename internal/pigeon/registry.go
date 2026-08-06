@@ -605,11 +605,31 @@ func reclaimPayloadsIn(dir string, referenced map[string]bool) (removed int, byt
 // ReconcileOrphans is the exported entry point for the sweep. It covers one
 // namespace; a session whose project config changed namespace leaves its old
 // entry behind, and only sweeping every namespace clears that.
+//
+// This form sweeps every orphan regardless of age, which is what `pigeon prune`
+// asks for: the person typing it is present and has decided. The automatic
+// sweep uses reconcileOrphans(orphanGrace) instead -- see the hazard there.
 func ReconcileOrphans() int { return CurrentNamespace().ReconcileOrphans() }
 
-func (n Namespace) ReconcileOrphans() int { return n.reconcileOrphans() }
+func (n Namespace) ReconcileOrphans() int { return n.reconcileOrphans(0) }
 
-func (n Namespace) reconcileOrphans() int {
+// orphanGrace is how long leftover state survives after its entry disappears,
+// for the sweep that runs unattended at registration.
+//
+// The guard exists because "no entry" does not mean "gone". A monitor removes
+// the entry on its way out but deliberately leaves the spool, so mail queued
+// while nothing was listening survives until a monitor comes back for it --
+// and on this machine monitors do die and rearm without the claude process
+// ever exiting. An unguarded sweep at registration would therefore delete a
+// live session's unread mail the moment any other session started.
+//
+// Exactness is not available here: an orphan has no entry, so it has no pid to
+// test for liveness, which is precisely why this sweep is blunt. A day is far
+// longer than any monitor gap and far shorter than the months of debris this
+// was written to clear.
+const orphanGrace = 24 * time.Hour
+
+func (n Namespace) reconcileOrphans(minAge time.Duration) int {
 	known := map[string]bool{}
 	entries, err := filepath.Glob(filepath.Join(n.SessionsDir(), "*.json"))
 	if err == nil {
@@ -628,6 +648,12 @@ func (n Namespace) reconcileOrphans() int {
 			id := strings.TrimSuffix(filepath.Base(p), suffix)
 			if id == "" || known[id] || ValidSessionID(id) != nil {
 				continue
+			}
+			if minAge > 0 {
+				fi, err := os.Stat(p)
+				if err != nil || time.Since(fi.ModTime()) < minAge {
+					continue
+				}
 			}
 			if os.Remove(p) == nil {
 				removed++

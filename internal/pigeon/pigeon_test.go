@@ -1812,3 +1812,45 @@ func TestPruneRemovesOrphanedStateFiles(t *testing.T) {
 		}
 	}
 }
+
+// TestUnattendedSweepSparesRecentOrphans covers the hazard that keeps the
+// automatic sweep from being the same call `pigeon prune` makes.
+//
+// A monitor removes its entry on the way out but leaves the spool, so mail
+// queued while nothing was listening survives until a monitor comes back for
+// it. Such a session is indistinguishable from a dead one -- no entry, so no
+// pid to test -- and sweeping it at the next registration would delete a live
+// session's unread mail. Age is the only signal available, so recent orphans
+// have to be spared even though the attended sweep takes them.
+func TestUnattendedSweepSparesRecentOrphans(t *testing.T) {
+	withHome(t)
+	ns := CurrentNamespace()
+
+	recent := "cccc3333-4444"
+	stale := "dddd4444-5555"
+	for _, id := range []string{recent, stale} {
+		if err := os.WriteFile(SpoolPath(id), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(SpoolPath(stale), old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	ns.reconcileOrphans(orphanGrace)
+
+	if _, err := os.Stat(SpoolPath(recent)); err != nil {
+		t.Error("the unattended sweep took a fresh orphan; a monitor that dies and rearms loses its mail")
+	}
+	if _, err := os.Stat(SpoolPath(stale)); !os.IsNotExist(err) {
+		t.Error("the unattended sweep spared an orphan two days old, so nothing ever collects the debris")
+	}
+
+	// The attended sweep is deliberately not age-guarded: someone typed
+	// `pigeon prune` and has decided.
+	ns.ReconcileOrphans()
+	if _, err := os.Stat(SpoolPath(recent)); !os.IsNotExist(err) {
+		t.Error("`pigeon prune` left a fresh orphan behind")
+	}
+}

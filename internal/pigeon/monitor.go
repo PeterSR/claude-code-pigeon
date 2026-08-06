@@ -668,6 +668,16 @@ func register(ns Namespace, sid string, rt Runtime, logf func(string, ...any)) e
 		logf("pruned %d dead session entry/entries left by earlier sessions", pruned)
 	}
 
+	// The sweep above only finds sessions that still have an entry, i.e. ones
+	// killed before they could deregister. A session that exits *cleanly*
+	// removes its own entry and orphans its spool and cursor, which nothing
+	// then searches by -- so the tidy path leaked and the messy one did not.
+	// Age-guarded because an entry can also be missing for a session that is
+	// still alive; see orphanGrace.
+	if swept := ns.reconcileOrphans(orphanGrace); swept > 0 {
+		logf("swept %d orphaned state file(s) from sessions long gone", swept)
+	}
+
 	pid := CurrentClaudePID()
 	cwd := CurrentCwd()
 

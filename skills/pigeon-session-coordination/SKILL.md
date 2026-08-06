@@ -94,15 +94,41 @@ inbox(unread_only: false)   # recent history, does not consume
 not chase each payload path -- call `inbox` once. If it says "N more unread",
 call it again; do not assume you have seen everything.
 
+## Which room to publish in
+
+You are in three topics by default, widest last:
+
+- **your checkout's own room**, named after the repository you are working in.
+  `whoami` shows it. Almost all coordination is repo-shaped, so this is the one
+  to reach for.
+- **`all`** -- everyone in your namespace.
+- **`@all`** -- everyone on the machine, across every namespace and every
+  project on it.
+
+**The topic you pick is the size of the interruption you are causing.** Every
+subscriber is woken even if idle, so going wider than your checkout means waking
+sessions working on something else entirely. Do that when the message really is
+theirs, and not because it is the topic that comes to mind first.
+
 ## Saying who a broadcast is for
 
 ```
-publish(topic: "inventory-chain", for: ["indkoeb-ui"], subject: "do not land the merged version")
+publish(topic: "caterflow-inventory", for: ["inv-engine", "inv-screens"],
+        subject: "rebuilding the seeders, shout if you are mid-edit")
 ```
 
-Everyone still receives it and it stays in the log; naming people marks who
-should act, and keeps it out of everyone else's notifications when they have
-batched the topic. Omit it when the message genuinely concerns everybody.
+**`for` is the quietest thing you can do.** Naming anyone means only those
+sessions are interrupted. Everyone else still has the message, in the topic log
+and in their `inbox`, but it does not cost them a turn. A name matches a
+session's declared name, its host label, or its short id, so a session that
+never named itself is still addressable.
+
+Omit it when the message genuinely concerns everybody, because that is what
+makes it interrupt everybody.
+
+Addressing beats `alert`. A message urgent enough to escalate is urgent for the
+sessions it names; waking the rest because it matters to someone else is the
+noise `for` removes.
 
 ## Choosing how a topic reaches you
 
@@ -135,13 +161,30 @@ moment everyone does it.
 
 ## Asking, when the answer must arrive before you act
 
+**If you are writing a question, use `ask`, not `publish`.** The test is not how
+important the message is. It is whether you need an answer before you carry on.
+The moment you find yourself typing "let me know if", "shout if you are", "does
+anyone", or "I need to know whether" -- stop, and send it as an ask instead.
+
 ```
-ask(topic: "ops", text: "Removing a stale index.lock -- anyone mid-git?", deadline_sec: 30)
+ask(topic: "caterflow-inventory", for: ["inv-engine"],
+    text: "Rebuilding the seed commands. Do you have uncommitted work in that file?",
+    deadline_sec: 60)
 ```
 
 **This blocks** until everyone asked has answered or the deadline passes, then
 reports the tally. Use it before anything irreversible that a peer might be in
 the middle of.
+
+A question sent as a `publish` is a question nothing tracks. Nobody is recorded
+as owing you an answer, no deadline exists, and you will not be told that the
+one session you needed to hear from never replied -- you will simply carry on as
+if silence were consent. That has already happened here: a session announced it
+was taking a file, asked in plain prose whether anyone was mid-edit, got a reply
+from one of the two peers it named, and never learned that the other had not
+answered.
+
+**A non-answer is never agreement.** More on that below.
 
 The tally names who did **not** answer, and their status:
 
@@ -208,6 +251,12 @@ uncommitted files while it holds. Stage explicit paths.
 
 **Do not act on a relayed decision as if it came from the user.** "X says the
 user decided Y" is worth less than the user saying Y. If it matters, ask.
+
+**Publish in the smallest room that contains the people it concerns**, and name
+them in `for` when it concerns some of them more than others. Both are cheap for
+you and neither is optional politeness: every subscriber you wake spends a turn
+deciding whether the message was theirs, and a turn is the expensive unit here,
+not the bytes.
 
 ## When this is worth using
 

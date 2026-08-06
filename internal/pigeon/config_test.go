@@ -218,7 +218,7 @@ func TestApplyProjectConfigSeedsIdentityAndTopics(t *testing.T) {
 		t.Errorf("name/desc = %q/%q", name, desc)
 	}
 	// The public mailbox is always joined, config or not.
-	if strings.Join(subs, ",") != defaultSubs("deploys") {
+	if strings.Join(subs, ",") != defaultSubsIn(dir, "deploys") {
 		t.Errorf("subs = %v", subs)
 	}
 }
@@ -241,15 +241,16 @@ func TestApplyProjectConfigWillNotStealATakenName(t *testing.T) {
 		t.Errorf("the collision was not explained: %q", logged.String())
 	}
 	// Losing the name must not cost the session its topics.
-	if strings.Join(subs, ",") != defaultSubs("deploys") {
+	if strings.Join(subs, ",") != defaultSubsIn(dir, "deploys") {
 		t.Errorf("subs = %v", subs)
 	}
 }
 
 func TestApplyProjectConfigFallsBackToPublicTopicOnly(t *testing.T) {
 	withHome(t)
-	name, desc, subs := applyConfig(t, "aaaa1111", t.TempDir(), func(string, ...any) {})
-	if name != "" || desc != "" || strings.Join(subs, ",") != defaultSubs() {
+	dir := t.TempDir()
+	name, desc, subs := applyConfig(t, "aaaa1111", dir, func(string, ...any) {})
+	if name != "" || desc != "" || strings.Join(subs, ",") != defaultSubsIn(dir) {
 		t.Errorf("got %q/%q/%v, want an unnamed session on the public topic only", name, desc, subs)
 	}
 }
@@ -453,7 +454,7 @@ func TestApplyProjectConfigRejectsAHostileRenderedName(t *testing.T) {
 		t.Errorf("the rejection was not explained:\n%s", logged.String())
 	}
 	// One bad field must not cost the session the rest of the config.
-	if strings.Join(subs, ",") != defaultSubs("ci") {
+	if strings.Join(subs, ",") != defaultSubsIn(dir, "ci") {
 		t.Errorf("subs = %v", subs)
 	}
 }

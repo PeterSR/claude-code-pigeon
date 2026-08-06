@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -773,7 +774,7 @@ func register(ns Namespace, sid string, rt Runtime, logf func(string, ...any)) e
 	// and `pigeon unsubscribe @all` closes it for a session that would rather
 	// not hear it.
 	if subs == nil {
-		subs = defaultSubscriptions(ns)
+		subs = defaultSubscriptions(ns, cwd)
 	}
 	now := nowRFC3339()
 	labelName, labelSource := rt.Label(pid, sid)
@@ -835,16 +836,99 @@ func register(ns Namespace, sid string, rt Runtime, logf func(string, ...any)) e
 
 // defaultSubscriptions is what a session comes up listening to before any
 // config or command has a say.
-func defaultSubscriptions(ns Namespace) []string {
+//
+// Three rooms, widest last: the checkout this session started in, the
+// namespace, the machine. The checkout one is the addition, and it is an
+// ordinary namespaced topic whose name happens to be derived rather than
+// typed -- no new tree, no new prefix, nothing that cuts across namespaces.
+//
+// It exists because the narrow room has to be the one you are already in. A
+// project topic was available to the run that prompted this and two of the
+// three sessions in that checkout had joined it; the third had not, and
+// broadcast to the whole machine instead. Joining was a deliberate act nobody
+// prompted, which is the same reason nobody set a delivery preference and
+// nobody used the tool built for asking a question. Defaults are the only
+// instructions a session reliably follows.
+func defaultSubscriptions(ns Namespace, cwd string) []string {
+	subs := []string{PublicTopic}
 	// A private namespace joins its own mailbox only. @all is the one place
 	// isolation is deliberately not absolute, and a namespace declared private
 	// is precisely the one that opted out of that.
-	if ns.IsPrivate() {
-		return []string{PublicTopic}
+	if !ns.IsPrivate() {
+		subs = append(subs, GlobalPublicTopic)
 	}
-	subs := []string{PublicTopic, GlobalPublicTopic}
+	// Safe in a private namespace too: it is namespace-local, so it discloses
+	// nothing outward. That is the property that lets this be a derived name
+	// rather than a third tier.
+	if t := CheckoutTopic(cwd); t != "" && t != PublicTopic {
+		subs = append(subs, t)
+	}
 	sort.Strings(subs)
 	return subs
+}
+
+// CheckoutTopic is the topic name a session in dir joins by default: the
+// basename of the git repository it is in, or of dir itself when it is not in
+// one, folded to what ValidTopic accepts. "" when nothing usable survives.
+//
+// The repository root rather than the directory, so that a session started in
+// a subdirectory lands with its peers rather than in a room of its own. Two
+// worktrees of the same repository sit at different roots and so get different
+// rooms, which is right when they are different lines of work and wrong when
+// they are the same one; the basename gets the common case and does not
+// attempt the rest.
+func CheckoutTopic(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return ""
+	}
+	if root := repoRoot(dir); root != "" {
+		dir = root
+	}
+	return topicNameFrom(filepath.Base(dir))
+}
+
+// repoRoot walks up from dir looking for a .git entry, and returns "" if it
+// reaches the filesystem root without finding one. A file rather than a
+// directory counts: that is what a linked worktree has.
+func repoRoot(dir string) string {
+	for {
+		if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
+
+// topicNameFrom folds a directory name into a valid topic name, or "" if it
+// cannot. Anything outside the charset becomes a dash, runs collapse, and the
+// result is trimmed to a leading alphanumeric because that is what topicRe
+// demands of the first character.
+func topicNameFrom(s string) string {
+	var b strings.Builder
+	lastDash := false
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_':
+			b.WriteRune(r)
+			lastDash = false
+		case !lastDash:
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-._")
+	if len(out) > 64 {
+		out = strings.Trim(out[:64], "-._")
+	}
+	if ValidTopic(out) != nil {
+		return ""
+	}
+	return out
 }
 
 // applyProjectConfig seeds a brand-new session's identity from the project it
@@ -853,7 +937,7 @@ func defaultSubscriptions(ns Namespace) []string {
 // what to do when the config asks for something this machine cannot give it --
 // most often a name another live session already answers to.
 func applyProjectConfig(ns Namespace, sid, cwd string, cfg *ProjectConfig, logf func(string, ...any)) (name, desc string, subs []string) {
-	subs = defaultSubscriptions(ns)
+	subs = defaultSubscriptions(ns, cwd)
 	if cfg == nil {
 		return "", "", subs
 	}

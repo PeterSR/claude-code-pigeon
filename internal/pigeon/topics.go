@@ -200,13 +200,31 @@ type TopicRef struct {
 	Global bool
 }
 
+// DisplayPrefix is what TopicLabel prints in front of a namespaced topic. It is
+// decoration, not part of the name: the stored name, the subscription entry,
+// the cursor key and the log filename are all bare.
+//
+// It is accepted on input all the same, because the asymmetry with GlobalPrefix
+// was a trap. Every notification says "#chat", `pigeon topics` says "#chat",
+// and typing "#chat" back failed validation, since "#" is not in the charset a
+// name may use. Output that is not valid input only ever bites whoever copies
+// what they were shown, which is exactly what an agent does.
+const DisplayPrefix = "#"
+
 // ParseTopicRef validates a topic as typed.
 func ParseTopicRef(s string) (TopicRef, error) {
 	s = strings.TrimSpace(s)
-	ref := TopicRef{Name: s}
 	if rest, ok := strings.CutPrefix(s, GlobalPrefix); ok {
-		ref = TopicRef{Name: rest, Global: true}
+		ref := TopicRef{Name: rest, Global: true}
+		if err := ValidTopic(ref.Name); err != nil {
+			return TopicRef{}, err
+		}
+		return ref, nil
 	}
+	// Stripped only here, in the namespaced branch, so "#@ops" stays invalid
+	// rather than quietly resolving to the global log: one canonical way to
+	// name each tree, plus the decoration this one is printed with.
+	ref := TopicRef{Name: strings.TrimPrefix(s, DisplayPrefix)}
 	if err := ValidTopic(ref.Name); err != nil {
 		return TopicRef{}, err
 	}
@@ -231,7 +249,7 @@ func TopicLabel(topic string) string {
 	if strings.HasPrefix(topic, GlobalPrefix) {
 		return topic
 	}
-	return "#" + topic
+	return DisplayPrefix + topic
 }
 
 func (r TopicRef) path(n Namespace) string {

@@ -535,6 +535,85 @@ func TestABroadcastNamingYouStillInterrupts(t *testing.T) {
 	}
 }
 
+// TestCheckoutTopicIsTheRepositoryNotTheDirectory: a session started in a
+// subdirectory has to land with its peers, not in a room of its own.
+func TestCheckoutTopicIsTheRepositoryNotTheDirectory(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "caterflow-inventory")
+	sub := filepath.Join(repo, "backend", "app")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := CheckoutTopic(repo); got != "caterflow-inventory" {
+		t.Errorf("CheckoutTopic(repo) = %q", got)
+	}
+	if got := CheckoutTopic(sub); got != "caterflow-inventory" {
+		t.Errorf("CheckoutTopic(subdir) = %q, want the repository's room", got)
+	}
+	// A linked worktree has a .git FILE, not a directory.
+	wt := filepath.Join(root, "inventory-wt")
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: /elsewhere\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := CheckoutTopic(wt); got != "inventory-wt" {
+		t.Errorf("CheckoutTopic(worktree) = %q", got)
+	}
+	// Outside a repository, the directory itself.
+	if got := CheckoutTopic(root); got != topicNameFrom(filepath.Base(root)) {
+		t.Errorf("CheckoutTopic(non-repo) = %q", got)
+	}
+}
+
+func TestCheckoutTopicFoldsNamesIntoTheCharset(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"Caterflow Inventory", "caterflow-inventory"},
+		{"my.project_v2", "my.project_v2"},
+		{"---weird---", "weird"},
+		{"Ærø", "r"},
+		{"", ""},
+		{"...", ""},
+	} {
+		if got := topicNameFrom(tc.in); got != tc.want {
+			t.Errorf("topicNameFrom(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestPrintedTopicNameCanBeTypedBackIn: every notification says "#chat" and
+// typing "#chat" used to fail validation, because "#" is decoration and not
+// part of the name. Output that is not valid input only bites whoever copies
+// what they were shown.
+func TestPrintedTopicNameCanBeTypedBackIn(t *testing.T) {
+	printed := TopicLabel("chat")
+	if printed != "#chat" {
+		t.Fatalf("TopicLabel(chat) = %q", printed)
+	}
+	ref, err := ParseTopicRef(printed)
+	if err != nil {
+		t.Fatalf("ParseTopicRef(%q): %v", printed, err)
+	}
+	if ref.Name != "chat" || ref.Global {
+		t.Errorf("ParseTopicRef(%q) = %+v, want the bare namespaced topic", printed, ref)
+	}
+	// The global form is unchanged: "@" is part of the name and selects a
+	// different tree.
+	if g, err := ParseTopicRef(TopicLabel("@ops")); err != nil || g.Name != "ops" || !g.Global {
+		t.Errorf("ParseTopicRef(@ops) = %+v, %v", g, err)
+	}
+	// One canonical spelling per tree: "#@ops" is not a way to reach the
+	// global log.
+	if _, err := ParseTopicRef("#@ops"); err == nil {
+		t.Error(`"#@ops" was accepted; it must not resolve to the global tree`)
+	}
+}
+
 func TestMonitorDeliversMailQueuedBeforeItStarted(t *testing.T) {
 	withHome(t)
 	const sid = "mon-queued-1"

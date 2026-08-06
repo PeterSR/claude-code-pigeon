@@ -133,8 +133,15 @@ func mustNS(t *testing.T, name string) Namespace {
 
 // defaultSubs is what a session comes up subscribed to, plus whatever a config
 // added, in the order the entry stores them.
-func defaultSubs(extra ...string) string {
-	subs := append(defaultSubscriptions(DefaultNamespace()), extra...)
+//
+// Takes the cwd because the default set now includes a topic derived from it
+// (see CheckoutTopic): a session registering from a checkout joins that
+// checkout's room, so a helper that assumed "" would disagree with every test
+// that registers for real.
+func defaultSubs(extra ...string) string { return defaultSubsIn(CurrentCwd(), extra...) }
+
+func defaultSubsIn(cwd string, extra ...string) string {
+	subs := append(defaultSubscriptions(DefaultNamespace(), cwd), extra...)
 	sort.Strings(subs)
 	return strings.Join(subs, ",")
 }

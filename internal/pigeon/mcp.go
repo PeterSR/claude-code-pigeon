@@ -180,10 +180,15 @@ func tools() []toolDef {
 		{
 			Name: "publish",
 			Description: "Publish a message to a topic. Every session subscribed to that " +
-				"topic is woken, even if idle. A plain topic name resolves inside one " +
-				"namespace; a name starting with '@' is machine-wide and reaches every " +
-				"namespace. Every session subscribes to 'all' and '@all' by default, so " +
-				"'all' broadcasts to this namespace and '@all' to the whole machine.",
+				"topic is woken, even if idle -- so the topic you pick is the size of " +
+				"the interruption you are causing. Three rooms are joined by default, " +
+				"widest last. Your CHECKOUT's room, named after the repository you are " +
+				"in (use whoami to see it): almost all coordination is repo-shaped, and " +
+				"this is the one to reach for. 'all', everyone in this namespace. " +
+				"'@all', everyone on the machine, across every namespace and every " +
+				"project on it. Going wider than your checkout means waking sessions " +
+				"working on something else entirely, so do it when the message really " +
+				"is theirs, and name the sessions it is for in 'for' when it is not.",
 			InputSchema: obj(map[string]any{
 				"type": "object",
 				"properties": obj(map[string]any{
@@ -304,7 +309,8 @@ func tools() []toolDef {
 		{
 			Name: "whoami",
 			Description: "Show this session's pigeon identity: session id, namespace, pid, " +
-				"declared name, Claude Code's own session name, description, and the address " +
+				"declared name, Claude Code's own session name, description, the topics it " +
+				"is subscribed to (including its checkout's own room), and the address " +
 				"other sessions use to reach it.",
 			InputSchema: obj(map[string]any{
 				"type":       "object",

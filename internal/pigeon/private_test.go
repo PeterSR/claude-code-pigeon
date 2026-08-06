@@ -228,11 +228,11 @@ func TestPrivateNamespaceDoesNotJoinTheMachineWideMailbox(t *testing.T) {
 	withHome(t)
 	withUserConfig(t, `{"namespaces": {"acme": {"private": true}}}`)
 
-	got := strings.Join(defaultSubscriptions(mustNS(t, "acme")), ",")
+	got := strings.Join(defaultSubscriptions(mustNS(t, "acme"), ""), ",")
 	if strings.Contains(got, GlobalPublicTopic) {
 		t.Errorf("default subscriptions %q include the machine-wide mailbox", got)
 	}
-	open := strings.Join(defaultSubscriptions(DefaultNamespace()), ",")
+	open := strings.Join(defaultSubscriptions(DefaultNamespace(), ""), ",")
 	if !strings.Contains(open, GlobalPublicTopic) {
 		t.Errorf("a public namespace lost the machine-wide mailbox: %q", open)
 	}

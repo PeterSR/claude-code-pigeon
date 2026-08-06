@@ -13,9 +13,15 @@ import (
 	"time"
 )
 
-// PublicTopic is the mailbox every session joins by default, so a broadcast
-// reaches the whole namespace without anyone configuring anything.
-const PublicTopic = "all"
+// PublicTopic is the mailbox every session in a namespace joins by default, so
+// a broadcast reaches the whole namespace without anyone configuring anything.
+//
+// Named for its scope rather than its size. It was "all", which reads as
+// "everyone" and means "everyone in this namespace" -- and since almost nobody
+// runs more than one namespace, the two were the same set in practice and the
+// name taught the wrong lesson about which room was which. Nothing is called
+// "all" now, so nothing claims to be everyone while being something narrower.
+const PublicTopic = "namespace"
 
 // GlobalPrefix marks a topic that lives outside every namespace, so `@ops` is
 // one log the whole machine shares while `ops` is one log per namespace.
@@ -27,11 +33,47 @@ const PublicTopic = "all"
 const GlobalPrefix = "@"
 
 // GlobalPublicTopic is the machine-wide mailbox. Every session subscribes to it
-// as well as to its own namespace's `all`: this is the one place isolation is
+// as well as to its own namespace's, and this is the one place isolation is
 // deliberately not absolute, because a broadcast meant for everyone on the
-// machine has to reach everyone on the machine. `pigeon unsubscribe @all`
+// machine has to reach everyone on the machine. `pigeon unsubscribe @global`
 // opts out.
-const GlobalPublicTopic = GlobalPrefix + PublicTopic
+//
+// Deliberately not GlobalPrefix + PublicTopic. They were one string with a
+// prefix, which made the pair look like two spellings of one room rather than
+// the two different logs they are.
+const GlobalPublicTopic = GlobalPrefix + "global"
+
+// CheckoutTopicAlias is what a session calls its own checkout's room without
+// having to know its name.
+//
+// The room itself is named after the repository, which is what makes it useful
+// to everyone else: a peer reading the log later can see which checkout it
+// belonged to. But that leaves a session unable to name its own room without
+// looking it up first, and leaves every document unable to name it at all --
+// so the tier that carries most of the traffic was the only one with no word
+// for it. This is that word. It resolves to the real name before anything is
+// written, so nothing downstream ever sees the alias.
+const CheckoutTopicAlias = "here"
+
+// ResolveTopicAlias expands CheckoutTopicAlias against a working directory,
+// and passes everything else through untouched.
+//
+// Resolved at the edges -- the CLI and the MCP server -- rather than inside
+// ParseTopicRef, because a topic name is also read back from places with no
+// session and no cwd behind them: a subscription list, a cursor key, a prune
+// pass walking log files. Only a live caller has a "here" to mean.
+func ResolveTopicAlias(topic, cwd string) string {
+	if !strings.EqualFold(strings.TrimSpace(topic), CheckoutTopicAlias) {
+		return topic
+	}
+	if t := CheckoutTopic(cwd); t != "" {
+		return t
+	}
+	// Outside a checkout there is no room to mean, so leave it alone and let
+	// the caller fail on a topic literally named "here" rather than silently
+	// widening to something else.
+	return topic
+}
 
 var topicRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 

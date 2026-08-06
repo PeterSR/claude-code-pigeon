@@ -15,8 +15,8 @@ $ pigeon ls
 $ pigeon send alpha "the build is green"
 sent -> aaaa1111 (alpha)
 
-$ pigeon publish all "deploying to staging in 5"
-published to #all (2 subscriber(s) besides you)
+$ pigeon publish here "deploying to staging in 5"
+published to #api-server (2 subscriber(s) besides you)
 ```
 
 The receiving session wakes about a second later:
@@ -125,7 +125,7 @@ A project can declare what sessions started in it should look like, in
 ```
 
 A session opened in that checkout comes up already named `api`, already described, and
-already listening to `#deploys` and `#ci` alongside the default `#all` and `@all`. Commit
+already listening to `#deploys` and `#ci` alongside the defaults `#here`, `#namespace` and `@global`. Commit
 the file and everyone working on the repo gets the same wiring without configuring
 anything.
 
@@ -267,8 +267,9 @@ directory the session asked to keep off the bus.
 
 ### Topics
 
-Every session joins `all` by default, so `pigeon publish all "…"` broadcasts to your
-namespace, and `@all` for the whole machine. Topics are append-only logs and each
+Every session joins three rooms by default: `here` (its own checkout, named after the
+repository), `namespace` (everyone in its namespace) and `@global` (everyone on the
+machine). `pigeon publish here "…"` is the one to reach for; the other two are wider. Topics are append-only logs and each
 subscriber keeps its own cursor, so publishing is O(1) regardless of how many sessions
 listen, and nobody consumes anyone else's messages. Subscribing starts from now --
 history is not replayed into your context.
@@ -526,10 +527,10 @@ history-expands in a shell, and `~` gets tilde-expanded, so those would fail in 
 have nothing to do with pigeon; `@` is shell-safe and reads differently from the `#` a
 namespaced topic renders with.
 
-**Every session subscribes to `@all` as well as `all`, and that is deliberate.** It is the
+**Every session subscribes to `@global` as well as `namespace`, and that is deliberate.** It is the
 one place the isolation is not absolute: a broadcast meant for everyone on the machine has
 to reach everyone on the machine. If you would rather not hear it, `pigeon unsubscribe
-@all`.
+@global`.
 
 A notification names the sender's namespace exactly when the message could have come from
 outside yours, because that is when it changes how you should read it and where a reply
@@ -703,9 +704,9 @@ A private namespace is:
   see or reach it at all.
 - **Entirely normal from inside.** Its members see each other, message each other, and
   see the other (non-private) namespaces around them, exactly as any session does.
-- **Sealed against machine-wide topics, both ways.** Its sessions do not join `@all`, do
+- **Sealed against machine-wide topics, both ways.** Its sessions do not join `@global`, do
   not receive any `@topic`, and cannot publish to one. A private namespace that could
-  still broadcast to `@all` would publish exactly what it was made private to keep in.
+  still broadcast to `@global` would publish exactly what it was made private to keep in.
 
 The escape hatch is your own terminal. The rule keys on `CLAUDE_CODE_SESSION_ID`, which
 Claude Code injects into everything it spawns -- the MCP server and the agent's shell

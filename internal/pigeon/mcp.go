@@ -182,10 +182,11 @@ func tools() []toolDef {
 			Description: "Publish a message to a topic. Every session subscribed to that " +
 				"topic is woken, even if idle -- so the topic you pick is the size of " +
 				"the interruption you are causing. Three rooms are joined by default, " +
-				"widest last. Your CHECKOUT's room, named after the repository you are " +
-				"in (use whoami to see it): almost all coordination is repo-shaped, and " +
-				"this is the one to reach for. 'all', everyone in this namespace. " +
-				"'@all', everyone on the machine, across every namespace and every " +
+				"widest last. 'here', your CHECKOUT's room: the topic is named after " +
+				"the repository so peers can see which checkout it was, but 'here' " +
+				"always means your own. Almost all coordination is repo-shaped, so " +
+				"this is the one to reach for. 'namespace', everyone in this namespace. " +
+				"'@global', everyone on the machine, across every namespace and every " +
 				"project on it. Going wider than your checkout means waking sessions " +
 				"working on something else entirely, so do it when the message really " +
 				"is theirs, and name the sessions it is for in 'for' when it is not.",
@@ -257,7 +258,7 @@ func tools() []toolDef {
 		},
 		{
 			Name:        "unsubscribe",
-			Description: "Stop receiving a topic in this session. '@all' opts out of machine-wide broadcasts.",
+			Description: "Stop receiving a topic in this session. '@global' opts out of machine-wide broadcasts.",
 			InputSchema: obj(map[string]any{
 				"type": "object",
 				"properties": obj(map[string]any{
@@ -629,7 +630,7 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return mcpPublish(ns, a.Topic, a.Text, a.Subject, a.Brief, priority, a.For, a.Supersedes, a.ReplyTo, a.Attach)
+		return mcpPublish(ns, ResolveTopicAlias(a.Topic, CurrentCwd()), a.Text, a.Subject, a.Brief, priority, a.For, a.Supersedes, a.ReplyTo, a.Attach)
 	case "subscribe", "unsubscribe":
 		var a struct {
 			Topic     string `json:"topic"`
@@ -641,14 +642,14 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return mcpSubscription(ns, name, a.Topic, a.Catchup)
+		return mcpSubscription(ns, name, ResolveTopicAlias(a.Topic, CurrentCwd()), a.Catchup)
 	case "set_delivery":
 		var a struct {
 			Topic string `json:"topic"`
 			Mode  string `json:"mode"`
 		}
 		_ = json.Unmarshal(raw, &a)
-		return mcpSetDelivery(a.Topic, a.Mode)
+		return mcpSetDelivery(ResolveTopicAlias(a.Topic, CurrentCwd()), a.Mode)
 	case "inbox":
 		return mcpInbox(raw)
 	case "list_topics":
@@ -674,7 +675,7 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 			DeadlineSec int    `json:"deadline_sec"`
 		}
 		_ = json.Unmarshal(raw, &a)
-		return mcpAsk(a.Topic, a.Text, a.Subject, a.DeadlineSec)
+		return mcpAsk(ResolveTopicAlias(a.Topic, CurrentCwd()), a.Text, a.Subject, a.DeadlineSec)
 	case "answer":
 		var a struct {
 			Ask     string `json:"ask"`

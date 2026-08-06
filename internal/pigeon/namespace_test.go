@@ -246,7 +246,7 @@ func TestParseTopicRef(t *testing.T) {
 		{"deploys", "deploys", false},
 		{"@deploys", "deploys", true},
 		{PublicTopic, PublicTopic, false},
-		{GlobalPublicTopic, PublicTopic, true},
+		{GlobalPublicTopic, strings.TrimPrefix(GlobalPublicTopic, GlobalPrefix), true},
 	}
 	for _, c := range cases {
 		ref, err := ParseTopicRef(c.in)
@@ -885,7 +885,10 @@ func TestFlatLayoutIsMigratedIntoTheDefaultNamespace(t *testing.T) {
 	if got := ns.Pending("aaaa1111"); got != 1 {
 		t.Errorf("Pending = %d, want the queued message to have survived", got)
 	}
-	if _, err := os.Stat(ns.TopicPath(PublicTopic)); err != nil {
+	// "all" by name, not PublicTopic: the fixture is a layout from an older
+	// build, and migration moves the files it finds rather than renaming the
+	// topics inside them.
+	if _, err := os.Stat(ns.TopicPath("all")); err != nil {
 		t.Errorf("the topic log did not move: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(ns.PayloadsDir(), "m_1.txt")); err != nil {

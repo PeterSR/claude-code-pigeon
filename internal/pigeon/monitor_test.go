@@ -597,6 +597,59 @@ func TestCheckoutTopicFoldsNamesIntoTheCharset(t *testing.T) {
 	}
 }
 
+// TestHereResolvesToTheCheckoutsOwnRoom: the room carrying most of the traffic
+// was the only tier with no word for it. It is named after the repository,
+// which is what makes it legible to everyone else, and that left a session
+// unable to name its own room without looking it up first.
+func TestHereResolvesToTheCheckoutsOwnRoom(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "caterflow-inventory")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := ResolveTopicAlias("here", repo); got != "caterflow-inventory" {
+		t.Errorf(`ResolveTopicAlias("here") = %q, want the checkout's room`, got)
+	}
+	if got := ResolveTopicAlias("HERE", repo); got != "caterflow-inventory" {
+		t.Errorf("the alias should be case-insensitive, got %q", got)
+	}
+	// It resolves to the real name before anything is written, so what lands
+	// in the log and in a peer's notification says which checkout it was.
+	if got := ResolveTopicAlias("deploys", repo); got != "deploys" {
+		t.Errorf("an ordinary topic was rewritten: %q", got)
+	}
+	if got := ResolveTopicAlias("@global", repo); got != "@global" {
+		t.Errorf("a global topic was rewritten: %q", got)
+	}
+	// Nowhere to mean: left alone rather than silently widened to a room the
+	// caller did not ask for.
+	if got := ResolveTopicAlias("here", ""); got != "here" {
+		t.Errorf("outside a checkout the alias should stay put, got %q", got)
+	}
+}
+
+// The three default rooms are three different logs, and the two well-known
+// ones are no longer one string with a prefix.
+func TestTheThreeDefaultRoomsAreDistinct(t *testing.T) {
+	if PublicTopic != "namespace" {
+		t.Errorf("PublicTopic = %q", PublicTopic)
+	}
+	if GlobalPublicTopic != "@global" {
+		t.Errorf("GlobalPublicTopic = %q", GlobalPublicTopic)
+	}
+	if strings.TrimPrefix(GlobalPublicTopic, GlobalPrefix) == PublicTopic {
+		t.Error("the machine room is still the namespace room with a prefix, so they share a name")
+	}
+	// Nothing is called "all" any more: the name read as "everyone" while
+	// meaning "everyone in this namespace".
+	for _, n := range []string{PublicTopic, GlobalPublicTopic} {
+		if strings.Contains(n, "all") {
+			t.Errorf("%q still claims to be everyone", n)
+		}
+	}
+}
+
 // TestPrintedTopicNameCanBeTypedBackIn: every notification says "#chat" and
 // typing "#chat" used to fail validation, because "#" is decoration and not
 // part of the name. Output that is not valid input only bites whoever copies

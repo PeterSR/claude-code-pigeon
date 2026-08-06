@@ -842,7 +842,7 @@ func TestPublishToAGlobalTopic(t *testing.T) {
 
 	r = invoke(t, "topics")
 	wantContains(t, r, "stdout", "@ops")
-	wantContains(t, r, "stdout", "@all")
+	wantContains(t, r, "stdout", pigeon.GlobalPublicTopic)
 }
 
 func TestTopicsAcrossNamespaces(t *testing.T) {

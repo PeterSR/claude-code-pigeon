@@ -98,11 +98,12 @@ call it again; do not assume you have seen everything.
 
 You are in three topics by default, widest last:
 
-- **your checkout's own room**, named after the repository you are working in.
-  `whoami` shows it. Almost all coordination is repo-shaped, so this is the one
-  to reach for.
-- **`all`** -- everyone in your namespace.
-- **`@all`** -- everyone on the machine, across every namespace and every
+- **`here`** -- your checkout's own room. The topic is named after the
+  repository, so peers see which checkout it was, but you can always call it
+  `here` without looking the name up. Almost all coordination is repo-shaped,
+  so this is the one to reach for.
+- **`namespace`** -- everyone in your namespace.
+- **`@global`** -- everyone on the machine, across every namespace and every
   project on it.
 
 **The topic you pick is the size of the interruption you are causing.** Every
@@ -113,7 +114,7 @@ theirs, and not because it is the topic that comes to mind first.
 ## Saying who a broadcast is for
 
 ```
-publish(topic: "caterflow-inventory", for: ["inv-engine", "inv-screens"],
+publish(topic: "here", for: ["inv-engine", "inv-screens"],
         subject: "rebuilding the seeders, shout if you are mid-edit")
 ```
 
@@ -167,14 +168,14 @@ The moment you find yourself typing "let me know if", "shout if you are", "does
 anyone", or "I need to know whether" -- stop, and send it as an ask instead.
 
 ```
-ask(topic: "caterflow-inventory",
+ask(topic: "here",
     text: "Rebuilding the seed commands. Do you have uncommitted work in that file?",
     deadline_sec: 60)
 ```
 
 **An ask takes no `for`.** It goes to everyone on the topic and waits on all of
 them, which is why the topic you pick matters even more here than for a publish:
-ask in your checkout's room, not in `all`.
+ask in `here`, not in `namespace`.
 
 **This blocks** until everyone asked has answered or the deadline passes, then
 reports the tally. Use it before anything irreversible that a peer might be in
@@ -288,7 +289,7 @@ Sessions are grouped into namespaces and see only their own, so `list_sessions`
 is not a list of everything running. `list_namespaces` names the others; every
 tool that addresses a session takes an optional `namespace`.
 
-A topic written with a leading `@` is machine-wide: `@all` reaches every session
+A topic written with a leading `@` is machine-wide: `@global` reaches every session
 on the box. Prefer a namespaced topic unless the message genuinely concerns
 everybody.
 

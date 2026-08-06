@@ -816,6 +816,14 @@ func mcpPublish(ns Namespace, topic, text, subject, brief, priority string, forN
 	live, deaf := ns.SubscriberBreakdown(topic, CurrentSessionID())
 	out := fmt.Sprintf("Published to %s. %d other live session(s) subscribe to it.",
 		TopicLabel(msg.Topic), live)
+	// A For list now decides who is interrupted, so a name that matches nobody
+	// is no longer cosmetic: it means the message woke no one, and silence
+	// would read as "nobody objected". Say so where the sender will see it.
+	if unmatched := ns.UnmatchedFor(msg); len(unmatched) > 0 {
+		out += fmt.Sprintf(" WARNING: no live session answers to %s, so nobody was interrupted by this."+
+			" Check the name against list_sessions; a name matches a declared name, a host label,"+
+			" or a session id.", strings.Join(unmatched, ", "))
+	}
 	if strings.HasPrefix(msg.Topic, GlobalPrefix) {
 		out += " That topic is machine-wide, so subscribers in every namespace received it."
 	}

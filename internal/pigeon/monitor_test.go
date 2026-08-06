@@ -569,6 +569,17 @@ func TestCheckoutTopicIsTheRepositoryNotTheDirectory(t *testing.T) {
 	if got := CheckoutTopic(root); got != topicNameFrom(filepath.Base(root)) {
 		t.Errorf("CheckoutTopic(non-repo) = %q", got)
 	}
+
+	// Reached by a symlink, it is still the same working tree and so must be
+	// the same room: two sessions in a room they disagree about would each
+	// believe they had announced themselves to the other.
+	link := filepath.Join(root, "link-to-inventory")
+	if err := os.Symlink(repo, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if got := CheckoutTopic(link); got != "caterflow-inventory" {
+		t.Errorf("CheckoutTopic(symlink) = %q, want the room of the tree it points at", got)
+	}
 }
 
 func TestCheckoutTopicFoldsNamesIntoTheCharset(t *testing.T) {

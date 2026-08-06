@@ -273,7 +273,61 @@ func (n Namespace) RemoveEntry(sessionID string) {
 	if ValidSessionID(sessionID) != nil {
 		return
 	}
+	// Leave a tombstone naming the process that owned this session, so the
+	// unattended sweep can tell "the monitor exited" from "the session is
+	// gone". Those are not the same thing and the difference is a mailbox:
+	// a monitor can die and rearm while its claude process runs on, and the
+	// spool it deliberately leaves behind is that session's unread mail.
+	//
+	// Written before the entry is removed, from the entry itself, because the
+	// entry is the only place the pid lives. Best effort: a failure here costs
+	// the sweep its exact signal and falls back to the age guard, which is the
+	// behaviour orphans from older builds get anyway.
+	if e, err := n.ReadEntry(sessionID); err == nil && e.PID > 0 {
+		if b, err := json.Marshal(tombstone{PID: e.PID, ProcStart: e.ProcStart}); err == nil {
+			_ = os.WriteFile(n.tombstonePath(sessionID), b, 0o600)
+		}
+	}
 	_ = os.Remove(n.entryPath(sessionID))
+}
+
+// tombstone records who owned a session whose entry has been removed. It exists
+// so the sweep has the one fact an orphan otherwise cannot supply: whether the
+// process that owned this state is still running.
+type tombstone struct {
+	PID       int    `json:"pid"`
+	ProcStart string `json:"procStart,omitempty"`
+}
+
+// tombstoneSuffix is deliberately not ".json": the sessions directory is
+// globbed for "*.json" by both pruneDeadEntries and reconcileOrphans, and a
+// tombstone must never be mistaken for an entry.
+const tombstoneSuffix = ".gone"
+
+func (n Namespace) tombstonePath(sessionID string) string {
+	return filepath.Join(n.SessionsDir(), sessionID+tombstoneSuffix)
+}
+
+// clearTombstone drops the record left by a previous exit of this session.
+func (n Namespace) clearTombstone(sessionID string) {
+	if ValidSessionID(sessionID) != nil {
+		return
+	}
+	_ = os.Remove(n.tombstonePath(sessionID))
+}
+
+// ownerAlive reports whether the process that owned sessionID is still running,
+// and whether a tombstone was found to ask at all.
+func (n Namespace) ownerAlive(sessionID string) (alive, known bool) {
+	b, err := os.ReadFile(n.tombstonePath(sessionID))
+	if err != nil {
+		return false, false
+	}
+	var t tombstone
+	if err := json.Unmarshal(b, &t); err != nil || t.PID <= 0 {
+		return false, false
+	}
+	return ProcessAlive(t.PID, t.ProcStart), true
 }
 
 // monitorListening reports whether a monitor currently holds the session lock.
@@ -508,6 +562,7 @@ func (n Namespace) removeSessionFiles(sessionID, entryFile string) {
 	_ = os.Remove(entryFile)
 	_ = os.Remove(n.SpoolPath(sessionID))
 	_ = os.Remove(n.cursorPath(sessionID))
+	_ = os.Remove(n.tombstonePath(sessionID))
 }
 
 // reclaimPayloads removes payload files no surviving log still points at.
@@ -611,25 +666,32 @@ func reclaimPayloadsIn(dir string, referenced map[string]bool) (removed int, byt
 // sweep uses reconcileOrphans(orphanGrace) instead -- see the hazard there.
 func ReconcileOrphans() int { return CurrentNamespace().ReconcileOrphans() }
 
-func (n Namespace) ReconcileOrphans() int { return n.reconcileOrphans(0) }
+func (n Namespace) ReconcileOrphans() int { return n.reconcileOrphans(0, "") }
 
-// orphanGrace is how long leftover state survives after its entry disappears,
-// for the sweep that runs unattended at registration.
+// orphanGrace bounds how long leftover state survives when nothing can say who
+// owned it. It is the FALLBACK, not the rule: see ownerAlive.
 //
-// The guard exists because "no entry" does not mean "gone". A monitor removes
-// the entry on its way out but deliberately leaves the spool, so mail queued
-// while nothing was listening survives until a monitor comes back for it --
-// and on this machine monitors do die and rearm without the claude process
-// ever exiting. An unguarded sweep at registration would therefore delete a
-// live session's unread mail the moment any other session started.
+// "No entry" does not mean "gone". A monitor removes the entry on its way out
+// but deliberately leaves the spool, so mail queued while nothing was listening
+// survives until a monitor comes back for it, and monitors do die and rearm
+// without the claude process ever exiting. Deleting such a session's state
+// costs it every message published while it was away: its cursors are re-seeded
+// at the END of each log on the next registration, so the gap is not
+// redelivered, it is skipped.
 //
-// Exactness is not available here: an orphan has no entry, so it has no pid to
-// test for liveness, which is precisely why this sweep is blunt. A day is far
-// longer than any monitor gap and far shorter than the months of debris this
-// was written to clear.
+// Which is why an mtime is not good enough on its own, and this originally
+// shipped believing it was. A cursor file is written when messages flow, not
+// while a session merely lives, so a quiet session's cursors can be older than
+// any grace period while the session is running perfectly well. The tombstone
+// RemoveEntry leaves is the exact signal; age only decides orphans that predate
+// it, which by definition come from a build that never wrote one and are
+// therefore genuinely old.
 const orphanGrace = 24 * time.Hour
 
-func (n Namespace) reconcileOrphans(minAge time.Duration) int {
+// reconcileOrphans clears state whose session has no registry entry. exceptSID
+// is never touched: its caller may be registering that session right now, and
+// its entry does not exist yet.
+func (n Namespace) reconcileOrphans(minAge time.Duration, exceptSID string) int {
 	known := map[string]bool{}
 	entries, err := filepath.Glob(filepath.Join(n.SessionsDir(), "*.json"))
 	if err == nil {
@@ -649,15 +711,30 @@ func (n Namespace) reconcileOrphans(minAge time.Duration) int {
 			if id == "" || known[id] || ValidSessionID(id) != nil {
 				continue
 			}
+			if id == exceptSID {
+				continue
+			}
 			if minAge > 0 {
-				fi, err := os.Stat(p)
-				if err != nil || time.Since(fi.ModTime()) < minAge {
-					continue
+				// The tombstone answers exactly, so age is never consulted when
+				// there is one: a session whose monitor exited an hour ago but
+				// whose claude process is still running keeps its mail, and one
+				// whose process is gone is collected immediately rather than
+				// after a day.
+				if alive, known := n.ownerAlive(id); known {
+					if alive {
+						continue
+					}
+				} else {
+					fi, err := os.Stat(p)
+					if err != nil || time.Since(fi.ModTime()) < minAge {
+						continue
+					}
 				}
 			}
 			if os.Remove(p) == nil {
 				removed++
 			}
+			_ = os.Remove(n.tombstonePath(id))
 		}
 	}
 	sweep(n.InboxDir(), ".ndjson")

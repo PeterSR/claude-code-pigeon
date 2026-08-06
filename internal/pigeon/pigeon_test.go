@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -141,7 +142,7 @@ func mustNS(t *testing.T, name string) Namespace {
 func defaultSubs(extra ...string) string { return defaultSubsIn(CurrentCwd(), extra...) }
 
 func defaultSubsIn(cwd string, extra ...string) string {
-	subs := append(defaultSubscriptions(DefaultNamespace(), cwd), extra...)
+	subs := append(defaultSubscriptions(DefaultNamespace(), cwd, false), extra...)
 	sort.Strings(subs)
 	return strings.Join(subs, ",")
 }
@@ -1845,7 +1846,7 @@ func TestUnattendedSweepSparesRecentOrphans(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ns.reconcileOrphans(orphanGrace)
+	ns.reconcileOrphans(orphanGrace, "")
 
 	if _, err := os.Stat(SpoolPath(recent)); err != nil {
 		t.Error("the unattended sweep took a fresh orphan; a monitor that dies and rearms loses its mail")
@@ -1860,4 +1861,98 @@ func TestUnattendedSweepSparesRecentOrphans(t *testing.T) {
 	if _, err := os.Stat(SpoolPath(recent)); !os.IsNotExist(err) {
 		t.Error("`pigeon prune` left a fresh orphan behind")
 	}
+}
+
+// TestUnattendedSweepSparesASessionWhoseProcessIsStillAlive is the guard that
+// age alone could not give.
+//
+// A cursor file is written when messages flow, not while a session merely
+// lives, so a quiet session's state can be older than any grace period while
+// the session is running perfectly well. Age would collect it, and its cursors
+// are re-seeded at the END of each log on the next registration, so everything
+// published during the gap is skipped rather than redelivered. The tombstone
+// RemoveEntry leaves names the owning process, which answers exactly.
+func TestUnattendedSweepSparesASessionWhoseProcessIsStillAlive(t *testing.T) {
+	withHome(t)
+	ns := CurrentNamespace()
+
+	const alive = "eeee5555-6666"
+	const departed = "ffff6666-7777"
+	for _, id := range []string{alive, departed} {
+		if err := os.WriteFile(SpoolPath(id), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().Add(-72 * time.Hour)
+		if err := os.Chtimes(SpoolPath(id), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// This process stands in for a claude that is still running while its
+	// monitor is between lives.
+	writeTombstone(t, ns, alive, os.Getpid())
+	// A pid that cannot be running: 0 is never a real process, and the reader
+	// rejects it, so use one that parses but is long gone.
+	writeTombstone(t, ns, departed, deadPID(t))
+
+	ns.reconcileOrphans(orphanGrace, "")
+
+	if _, err := os.Stat(SpoolPath(alive)); err != nil {
+		t.Error("swept the mail of a session whose process is still running; " +
+			"it will resume at the end of every log and skip the gap")
+	}
+	if _, err := os.Stat(SpoolPath(departed)); !os.IsNotExist(err) {
+		t.Error("kept state for a session whose process is gone, despite a tombstone saying so")
+	}
+}
+
+// TestUnattendedSweepNeverTakesTheRegisteringSession: register() sweeps before
+// it writes its own entry, so without the exclusion a session rearming after a
+// gap qualifies as an orphan and deletes the very spool it is about to follow.
+func TestUnattendedSweepNeverTakesTheRegisteringSession(t *testing.T) {
+	withHome(t)
+	ns := CurrentNamespace()
+
+	const sid = "aaaa7777-8888"
+	if err := os.WriteFile(SpoolPath(sid), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-72 * time.Hour)
+	if err := os.Chtimes(SpoolPath(sid), old, old); err != nil {
+		t.Fatal(err)
+	}
+	writeTombstone(t, ns, sid, deadPID(t))
+
+	// Everything says "collect me": no entry, ancient, owner gone. It is still
+	// spared, because it is the session registering right now.
+	ns.reconcileOrphans(orphanGrace, sid)
+	if _, err := os.Stat(SpoolPath(sid)); err != nil {
+		t.Fatal("the registering session's own spool was swept during its own registration")
+	}
+	// And it is genuinely collectable otherwise, or the assertion above proves
+	// nothing.
+	ns.reconcileOrphans(orphanGrace, "")
+	if _, err := os.Stat(SpoolPath(sid)); !os.IsNotExist(err) {
+		t.Error("the spool survived a sweep that did not exclude it, so the test above is vacuous")
+	}
+}
+
+func writeTombstone(t *testing.T, ns Namespace, sid string, pid int) {
+	t.Helper()
+	b, err := json.Marshal(tombstone{PID: pid, ProcStart: ProcStart(pid)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ns.tombstonePath(sid), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// deadPID returns a pid that is not running: a child that has already exited.
+func deadPID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	return cmd.Process.Pid
 }

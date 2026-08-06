@@ -268,7 +268,7 @@ func registerEphemeral(ns Namespace, sid, name string, topics []TopicRef, replay
 		private = true
 	}
 
-	subs := defaultSubscriptions(ns, cwd)
+	subs := defaultSubscriptions(ns, cwd, private)
 	for _, ref := range topics {
 		subs = append(subs, ref.String())
 	}

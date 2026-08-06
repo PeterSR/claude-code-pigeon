@@ -167,10 +167,14 @@ The moment you find yourself typing "let me know if", "shout if you are", "does
 anyone", or "I need to know whether" -- stop, and send it as an ask instead.
 
 ```
-ask(topic: "caterflow-inventory", for: ["inv-engine"],
+ask(topic: "caterflow-inventory",
     text: "Rebuilding the seed commands. Do you have uncommitted work in that file?",
     deadline_sec: 60)
 ```
+
+**An ask takes no `for`.** It goes to everyone on the topic and waits on all of
+them, which is why the topic you pick matters even more here than for a publish:
+ask in your checkout's room, not in `all`.
 
 **This blocks** until everyone asked has answered or the deadline passes, then
 reports the tally. Use it before anything irreversible that a peer might be in

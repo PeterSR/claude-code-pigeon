@@ -732,11 +732,21 @@ func register(ns Namespace, sid string, rt Runtime, logf func(string, ...any)) e
 	// killed before they could deregister. A session that exits *cleanly*
 	// removes its own entry and orphans its spool and cursor, which nothing
 	// then searches by -- so the tidy path leaked and the messy one did not.
-	// Age-guarded because an entry can also be missing for a session that is
-	// still alive; see orphanGrace.
-	if swept := ns.reconcileOrphans(orphanGrace); swept > 0 {
-		logf("swept %d orphaned state file(s) from sessions long gone", swept)
+	//
+	// Guarded, because an entry can also be missing for a session that is very
+	// much alive; see orphanGrace and ownerAlive. Excludes this session by name
+	// on top of that: its own entry does not exist yet -- it is written further
+	// down -- so without this it would qualify as an orphan and delete the very
+	// spool it is about to start following, three lines before recreating it
+	// empty. A monitor rearming after a gap is exactly the case that has mail
+	// waiting.
+	if swept := ns.reconcileOrphans(orphanGrace, sid); swept > 0 {
+		logf("swept %d orphaned state file(s) from sessions that are gone", swept)
 	}
+	// This session is back, so whatever its last exit recorded is no longer
+	// true. Left in place it would outlive the entry it describes and answer
+	// for a pid that has since been recycled onto some unrelated process.
+	ns.clearTombstone(sid)
 
 	pid := CurrentClaudePID()
 	cwd := CurrentCwd()
@@ -774,7 +784,7 @@ func register(ns Namespace, sid string, rt Runtime, logf func(string, ...any)) e
 	// and `pigeon unsubscribe @all` closes it for a session that would rather
 	// not hear it.
 	if subs == nil {
-		subs = defaultSubscriptions(ns, cwd)
+		subs = defaultSubscriptions(ns, cwd, cfg != nil && cfg.Private)
 	}
 	now := nowRFC3339()
 	labelName, labelSource := rt.Label(pid, sid)
@@ -849,7 +859,7 @@ func register(ns Namespace, sid string, rt Runtime, logf func(string, ...any)) e
 // prompted, which is the same reason nobody set a delivery preference and
 // nobody used the tool built for asking a question. Defaults are the only
 // instructions a session reliably follows.
-func defaultSubscriptions(ns Namespace, cwd string) []string {
+func defaultSubscriptions(ns Namespace, cwd string, private bool) []string {
 	subs := []string{PublicTopic}
 	// A private namespace joins its own mailbox only. @all is the one place
 	// isolation is deliberately not absolute, and a namespace declared private
@@ -857,11 +867,26 @@ func defaultSubscriptions(ns Namespace, cwd string) []string {
 	if !ns.IsPrivate() {
 		subs = append(subs, GlobalPublicTopic)
 	}
-	// Safe in a private namespace too: it is namespace-local, so it discloses
-	// nothing outward. That is the property that lets this be a derived name
-	// rather than a third tier.
-	if t := CheckoutTopic(cwd); t != "" && t != PublicTopic {
-		subs = append(subs, t)
+	// Not for a private checkout, and this is the one place the checkout topic
+	// has to be suppressed rather than merely scoped.
+	//
+	// The name IS the directory basename, and a subscription list is published
+	// in the entry every peer reads. WriteEntry already blanks Cwd, Label and
+	// Description for a private session for exactly this reason, in a comment
+	// that names the hazard: "a derived one is the cwd basename, so publishing
+	// it would leak exactly the directory Private is meant to keep off the
+	// bus." Subscriptions are not blanked, so joining this room would put that
+	// basename back on the bus by another route -- and publishing into it would
+	// hang the hidden directory's name in `list_topics` for the whole
+	// namespace.
+	//
+	// A private NAMESPACE is a different matter: its topics are namespace-local
+	// and nobody outside can see them, so the room is safe there. It is the
+	// per-project `private: true` that has to opt out.
+	if !private {
+		if t := CheckoutTopic(cwd); t != "" && t != PublicTopic {
+			subs = append(subs, t)
+		}
 	}
 	sort.Strings(subs)
 	return subs
@@ -881,6 +906,13 @@ func CheckoutTopic(dir string) string {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
 		return ""
+	}
+	// Resolved first, so two sessions reaching one checkout by different paths
+	// land in the same room. A symlinked route and the physical one are the
+	// same working tree, and a room they disagree about is worse than no room:
+	// each would believe it had announced itself to the other.
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = real
 	}
 	if root := repoRoot(dir); root != "" {
 		dir = root
@@ -937,7 +969,7 @@ func topicNameFrom(s string) string {
 // what to do when the config asks for something this machine cannot give it --
 // most often a name another live session already answers to.
 func applyProjectConfig(ns Namespace, sid, cwd string, cfg *ProjectConfig, logf func(string, ...any)) (name, desc string, subs []string) {
-	subs = defaultSubscriptions(ns, cwd)
+	subs = defaultSubscriptions(ns, cwd, cfg != nil && cfg.Private)
 	if cfg == nil {
 		return "", "", subs
 	}

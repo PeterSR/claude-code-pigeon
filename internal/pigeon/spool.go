@@ -216,8 +216,47 @@ func (m *Message) IsFor(e *Entry) bool {
 		if strings.EqualFold(f, short) {
 			return true
 		}
+		// The full id as well as the short one. list_sessions prints both, and
+		// a sender that copies the long form must not silently address nobody
+		// now that For decides who is interrupted.
+		if strings.EqualFold(f, e.SessionID) {
+			return true
+		}
 	}
 	return false
+}
+
+// UnmatchedFor returns the entries of m.For that no live session in n answers
+// to, so a sender can be told it addressed nobody.
+//
+// Worth reporting because For is no longer advisory: a typo, a stale name off
+// an older listing, or a session that exited between the listing and the
+// publish all now mean the message interrupted no one at all. The sender would
+// otherwise be told only how many sessions subscribe to the topic, carry on,
+// and read the resulting silence as consent.
+func (n Namespace) UnmatchedFor(m *Message) []string {
+	if m == nil || len(m.For) == 0 {
+		return nil
+	}
+	entries, err := n.ListSessions(false, false)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, f := range m.For {
+		probe := &Message{For: []string{f}}
+		matched := false
+		for _, e := range entries {
+			if probe.IsFor(e) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // CurrentSender builds the `from` stamp for this process. Both the MCP server

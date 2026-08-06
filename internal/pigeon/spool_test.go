@@ -272,6 +272,57 @@ func TestForDeduplicatesCaseInsensitively(t *testing.T) {
 	}
 }
 
+// TestUnmatchedForIsReportedToTheSender: a For entry matching no live session
+// now means the message interrupted nobody. Silence would then read as consent,
+// which is exactly the failure the addressing work exists to prevent, so the
+// sender has to be told at the moment it publishes.
+func TestUnmatchedForIsReportedToTheSender(t *testing.T) {
+	withHome(t)
+	ns := DefaultNamespace()
+	liveEntry(t, "aaaa1111-2222", "inv-engine", "/tmp/a")
+
+	m := &Message{For: []string{"inv-engine", "inv-screens", Short("aaaa1111-2222")}}
+	got := ns.UnmatchedFor(m)
+	if len(got) != 1 || got[0] != "inv-screens" {
+		t.Errorf("UnmatchedFor = %v, want only the name nobody answers to", got)
+	}
+	if n := ns.UnmatchedFor(&Message{}); n != nil {
+		t.Errorf("UnmatchedFor on a message for everyone = %v, want nothing to report", n)
+	}
+}
+
+// TestIsForMatchesEveryHandleASessionAnswersTo covers the handles that are not
+// a declared name, which is what most sessions have.
+//
+// Six of the nine sessions live when the addressing gate was written had never
+// declared a name. Since For now decides who is interrupted rather than merely
+// annotating a line, a handle it fails to match is a session that cannot be
+// addressed at all -- and the sender is not the one who finds out.
+func TestIsForMatchesEveryHandleASessionAnswersTo(t *testing.T) {
+	full := "aaaabbbb-cccc-dddd-eeee-ffff00001111"
+	e := &Entry{SessionID: full, Label: "caterflow-inventory-14"}
+
+	for _, handle := range []string{
+		"caterflow-inventory-14", // the host label, for a session with no name
+		"CATERFLOW-INVENTORY-14", // and case-insensitively
+		Short(full),              // the short id list_sessions leads with
+		full,                     // the full id it also prints
+		strings.ToUpper(full),
+	} {
+		m := &Message{Topic: "deploys", For: []string{handle}}
+		if !m.IsFor(e) {
+			t.Errorf("IsFor did not match %q, so a session addressed that way is never interrupted", handle)
+		}
+	}
+
+	// A declared name still wins where there is one, and a label belonging to
+	// somebody else does not match.
+	other := &Message{Topic: "deploys", For: []string{"some-other-session-99"}}
+	if other.IsFor(e) {
+		t.Error("IsFor matched a label that is not this session's")
+	}
+}
+
 // IsFor is the one place a For list is matched against a viewer: empty means
 // everyone, and a real entry matches by its declared name or its short
 // session id, both case-insensitively.

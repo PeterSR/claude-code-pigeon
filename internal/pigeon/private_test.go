@@ -3,6 +3,7 @@ package pigeon
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -223,16 +224,50 @@ func TestAGlobalTopicDoesNotReachIntoAPrivateNamespace(t *testing.T) {
 	}
 }
 
+// A private CHECKOUT does not join a room named after itself.
+//
+// WriteEntry already blanks Cwd, Label and Description for a private session,
+// because a derived label is the directory basename and publishing it would
+// leak exactly the directory `private: true` exists to keep off the bus. The
+// checkout room's name IS that basename, and Subscriptions are not blanked, so
+// joining it would put the name back on the bus in every peer's copy of the
+// entry -- and publishing into it would hang the hidden directory's name in
+// list_topics for the whole namespace.
+func TestAPrivateCheckoutDoesNotJoinARoomNamedAfterItself(t *testing.T) {
+	withHome(t)
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "secret-client-work")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	open := defaultSubscriptions(DefaultNamespace(), repo, false)
+	if !slices.Contains(open, "secret-client-work") {
+		t.Fatalf("an ordinary checkout lost its room: %v", open)
+	}
+	private := defaultSubscriptions(DefaultNamespace(), repo, true)
+	for _, s := range private {
+		if strings.Contains(s, "secret-client-work") {
+			t.Errorf("a private checkout published its directory name as a subscription: %v", private)
+		}
+	}
+	// It still gets the ordinary mailboxes; private is about not naming the
+	// directory, not about being cut off.
+	if !slices.Contains(private, PublicTopic) {
+		t.Errorf("a private checkout lost the public mailbox: %v", private)
+	}
+}
+
 // A session in a private namespace does not join @all in the first place.
 func TestPrivateNamespaceDoesNotJoinTheMachineWideMailbox(t *testing.T) {
 	withHome(t)
 	withUserConfig(t, `{"namespaces": {"acme": {"private": true}}}`)
 
-	got := strings.Join(defaultSubscriptions(mustNS(t, "acme"), ""), ",")
+	got := strings.Join(defaultSubscriptions(mustNS(t, "acme"), "", false), ",")
 	if strings.Contains(got, GlobalPublicTopic) {
 		t.Errorf("default subscriptions %q include the machine-wide mailbox", got)
 	}
-	open := strings.Join(defaultSubscriptions(DefaultNamespace(), ""), ",")
+	open := strings.Join(defaultSubscriptions(DefaultNamespace(), "", false), ",")
 	if !strings.Contains(open, GlobalPublicTopic) {
 		t.Errorf("a public namespace lost the machine-wide mailbox: %q", open)
 	}

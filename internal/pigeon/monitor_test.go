@@ -463,6 +463,78 @@ func itemTexts(items []InboxItem) []string {
 	return out
 }
 
+// TestABroadcastNamingOthersDoesNotInterruptYou is the addressing gate.
+//
+// A For list said who a message was for and then changed nothing about who it
+// woke. One broadcast naming two sessions was pushed into nine, and the seven
+// bystanders each spent a turn deciding it was none of their business.
+func TestABroadcastNamingOthersDoesNotInterruptYou(t *testing.T) {
+	withHome(t)
+	const sid = "mon-forgate-1"
+	m := startMonitor(t, sid)
+	if err := Subscribe(sid, "chat"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 5*time.Second, "the monitor to pick up the subscription", func() bool {
+		_, ok := readCursors(sid)["chat"]
+		return ok
+	})
+
+	if _, err := Publish("chat", Draft{
+		Text: "the seeders are mine, shout if mid-edit",
+		For:  []string{"inv-engine", "inv-screens"},
+	}, peer()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	// Handled, so the monitor cursor crosses it. That is also what makes the
+	// absence below real rather than merely early.
+	eventually(t, 5*time.Second, "the monitor to handle the message", func() bool {
+		return readCursors(sid)["chat"] > 0
+	})
+	if m.stdout.has("the seeders are mine") {
+		t.Errorf("a broadcast naming other sessions interrupted this one:\n%s", m.stdout.String())
+	}
+
+	// Held for the inbox, not dropped: not being interrupted is not the same
+	// as not being able to find it.
+	items, _, err := DefaultNamespace().ReadInbox(sid, InboxQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("got %d inbox items, want the message held for reading", len(items))
+	}
+}
+
+func TestABroadcastNamingYouStillInterrupts(t *testing.T) {
+	withHome(t)
+	const sid = "mon-forgate-2"
+	m := startMonitor(t, sid)
+	if err := Subscribe(sid, "chat"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 5*time.Second, "the monitor to pick up the subscription", func() bool {
+		_, ok := readCursors(sid)["chat"]
+		return ok
+	})
+
+	// By short session id, which is the handle every session has: most never
+	// declare a name.
+	if _, err := Publish("chat", Draft{
+		Text: "this one is yours",
+		For:  []string{Short(sid)},
+	}, peer()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	eventually(t, 5*time.Second, "the addressed session to be woken", func() bool {
+		return m.stdout.has("this one is yours")
+	})
+	if !m.stdout.has("-> you") {
+		t.Errorf("an addressed message lost its marker:\n%s", m.stdout.String())
+	}
+}
+
 func TestMonitorDeliversMailQueuedBeforeItStarted(t *testing.T) {
 	withHome(t)
 	const sid = "mon-queued-1"

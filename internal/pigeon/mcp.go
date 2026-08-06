@@ -209,10 +209,12 @@ func tools() []toolDef {
 					"for": obj(map[string]any{
 						"type":  "array",
 						"items": obj(map[string]any{"type": "string"}),
-						"description": "Session names this message is actually for. Everyone " +
-							"still receives it and it stays in the topic log; naming people marks " +
-							"who should act on it, and later lets everyone else keep it out of " +
-							"their notifications. Omit when it genuinely concerns everybody.",
+						"description": "Who this message is actually for: session names, host " +
+							"labels or short session ids. Naming anyone means ONLY those sessions " +
+							"are interrupted by it. Everyone else still has it, in the topic log " +
+							"and in their inbox, but it does not cost them a turn. Omit when it " +
+							"genuinely concerns everybody, which is what makes it interrupt " +
+							"everybody.",
 					}),
 					"supersedes": supersedesArg(),
 					"reply_to":   replyToArg(),

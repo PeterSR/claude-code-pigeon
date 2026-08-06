@@ -381,7 +381,17 @@ pull silently suppress a notification, or a notification mark mail as read that 
 | `pigeon delivery <topic> digest` | one line a minute instead of one per message |
 | `pigeon delivery <topic> quiet` | only that line; nothing interrupts |
 | `--alert` | interrupts a `digest` topic. Never a `quiet` one |
-| `--for <name>` | names who a broadcast is actually for; also interrupts a digest topic |
+| `--for <name>` | says who a broadcast is for. **Only they are interrupted**; everyone else keeps it in their inbox. Also interrupts a `digest` topic, for those named |
+
+**`--for` is the quietest thing you can do.** A broadcast that names nobody interrupts every
+subscriber, which is what it is for. One that names somebody interrupts only them: the rest still
+have the message, in the topic log and in `pigeon inbox`, it just does not cost them a turn. A
+name matches a session's declared name, its host label, or its short id, so a session that never
+named itself is still addressable.
+
+Addressing beats `--alert`, deliberately. A message urgent enough to escalate is urgent for the
+sessions it names, and waking everyone else because it matters to somebody else is the noise
+`--for` exists to remove. If you mean everybody, now, leave `--for` off.
 
 A digest looks like:
 

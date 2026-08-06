@@ -331,6 +331,32 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 		// this session is.
 		namedFor := len(m.For) > 0 && m.IsFor(self)
 
+		// The addressing gate: a broadcast that says who it is for does not
+		// interrupt anyone else. It is still delivered -- the monitor cursor
+		// crosses it, the consumption cursor does not -- so it is sitting in
+		// the inbox for whoever wants to look. It just does not cost a turn.
+		//
+		// This is the whole point of the For list. On the run that prompted it,
+		// one message naming two sessions was pushed into nine, across six
+		// repositories, and the seven bystanders each had to spend a turn
+		// working out it was none of their business. Nothing failed; the
+		// message simply cost seven interruptions to reach two.
+		//
+		// Addressing beats alert, deliberately. A message urgent enough to
+		// escalate is urgent FOR THE SESSIONS IT NAMES; waking everyone else
+		// because it matters to somebody else is the exact noise this removes.
+		// A sender who means "everyone, now" says so by leaving For empty.
+		//
+		// Fails open when the entry cannot be read: IsFor(nil) is false for any
+		// non-empty For, and treating an unreadable entry as "not addressed"
+		// would silently mute a session whose registry file was momentarily
+		// unavailable. Redeliver over drop, the same rule the followers use.
+		if self != nil && len(m.For) > 0 && !namedFor {
+			logf("holding a message on %q for the inbox: it names other sessions", topic)
+			advanceCursor(fm)
+			return
+		}
+
 		switch mode {
 		case DeliveryQuiet:
 			logf("holding a message on %q for the digest (mode %s)", topic, mode)

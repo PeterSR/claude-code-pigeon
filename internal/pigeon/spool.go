@@ -190,9 +190,14 @@ type Draft struct {
 
 // IsFor reports whether a topic message is addressed to e: true when m.For is
 // empty (a message for everyone), or when e answers to one of the named
-// entries -- by its declared name or its short session id, both
-// case-insensitively, the same two handles ResolveTarget accepts as an
-// address.
+// entries -- by its declared name, its host label, or its short session id,
+// all case-insensitively.
+//
+// The label is in there because most sessions never declare a name. Six of the
+// nine live on the machine this was written on had none, so a For list that
+// only matched declared names could not address two thirds of the fleet, and
+// once For decides who gets interrupted (see the addressing gate in
+// RunMonitor) "cannot be named" would quietly mean "never notified".
 func (m *Message) IsFor(e *Entry) bool {
 	if len(m.For) == 0 {
 		return true
@@ -203,6 +208,9 @@ func (m *Message) IsFor(e *Entry) bool {
 	short := Short(e.SessionID)
 	for _, f := range m.For {
 		if e.Name != "" && strings.EqualFold(f, e.Name) {
+			return true
+		}
+		if e.Label != "" && strings.EqualFold(f, e.Label) {
 			return true
 		}
 		if strings.EqualFold(f, short) {

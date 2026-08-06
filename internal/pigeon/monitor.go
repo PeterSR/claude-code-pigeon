@@ -264,6 +264,33 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 		persistCursor(fm.source, fm.offset)
 	}
 
+	// markOwnAsRead carries the session's CONSUMPTION cursor over its own
+	// broadcast, so publishing does not leave a session with unread mail from
+	// itself.
+	//
+	// The monitor cursor moving is not enough. The two cursors are deliberately
+	// separate (see readCursorPrefix): the monitor's says how far notifications
+	// have got, this one says how far the session has actually read, and
+	// nothing was advancing the second for a message the first deliberately
+	// never showed anyone. So a session that published to a topic it was up to
+	// date on was told, by its own inbox, that it had mail waiting -- and the
+	// mail was its own broadcast, which it wrote.
+	//
+	// Guarded on start, and this is the whole reason start exists. Jumping the
+	// consumption cursor to fm.offset unconditionally would carry it over
+	// anything unread sitting in front of this message: publish once to a busy
+	// topic and every peer message you had not read yet silently stops being
+	// unread. Only a cursor already sitting exactly where this message begins
+	// has read everything before it, and only that one may move.
+	markOwnAsRead := func(fm followedMessage) {
+		key := readCursorKey(fm.source)
+		_ = ns.mutateCursors(sid, func(m map[string]int64) {
+			if m[key] == fm.start {
+				m[key] = fm.offset
+			}
+		})
+	}
+
 	// deliver routes one handled-off-the-log message according to its topic's
 	// delivery mode, and is the one place that decides push vs. digest vs.
 	// quiet. The direct spool never reaches the mode switch at all: it has no
@@ -355,6 +382,7 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 			// reconsidered forever.
 			if fm.msg.From.SessionID != "" && fm.msg.From.SessionID == sid {
 				advanceCursor(fm)
+				markOwnAsRead(fm)
 				continue
 			}
 			deliver(fm)
@@ -371,6 +399,11 @@ type followedMessage struct {
 	msg    *Message
 	source string
 	offset int64
+	// start is the logical offset immediately BEFORE this message, i.e. where
+	// a cursor sitting on it would be. Only markOwnAsRead needs it, to tell
+	// "this session had read everything up to its own broadcast" from "it has
+	// unread mail sitting in front of it", which are the same fm.offset.
+	start int64
 }
 
 // digestState buffers what a digest or quiet topic has accumulated since its
@@ -998,6 +1031,7 @@ func followSource(path string, offset int64, source string, out chan<- followedM
 				// next pass picks it up whole.
 				break
 			}
+			start := offset
 			offset += int64(len(line))
 			s := strings.TrimSpace(line)
 			if s == "" {
@@ -1008,7 +1042,7 @@ func followSource(path string, offset int64, source string, out chan<- followedM
 				continue
 			}
 			select {
-			case out <- followedMessage{msg: m, source: source, offset: offset}:
+			case out <- followedMessage{msg: m, source: source, offset: offset, start: start}:
 			case <-stop:
 				f.Close()
 				return

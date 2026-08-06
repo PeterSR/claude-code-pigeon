@@ -378,6 +378,91 @@ func TestMonitorEmitsDirectMessagesButNeverItsOwn(t *testing.T) {
 	}
 }
 
+// TestOwnBroadcastCarriesTheConsumptionCursorWithIt covers the second cursor.
+//
+// The monitor already refuses to wake a session with its own broadcast and
+// advances the monitor cursor to say so. Nothing advanced the consumption
+// cursor, so a session that published to a topic it was up to date on was left
+// sitting behind its own message forever: a compaction floor pinned by a line
+// the session wrote itself, and a cursor whose meaning ("everything before
+// here is dealt with") was false about the one message it could be surest of.
+func TestOwnBroadcastCarriesTheConsumptionCursorWithIt(t *testing.T) {
+	withHome(t)
+	const sid = "mon-selfread-1"
+	startMonitor(t, sid)
+	if err := Subscribe(sid, "chat"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 5*time.Second, "the monitor to pick up the subscription", func() bool {
+		_, ok := readCursors(sid)["chat"]
+		return ok
+	})
+
+	if _, err := Publish("chat", Draft{Text: "my own claim"}, Sender{Kind: "session", SessionID: sid}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	eventually(t, 5*time.Second, "the monitor cursor to cross the session's own message", func() bool {
+		return readCursors(sid)["chat"] > 0
+	})
+	eventually(t, 5*time.Second, "the consumption cursor to follow it", func() bool {
+		c := readCursors(sid)
+		return c[readCursorKey("chat")] == c["chat"]
+	})
+}
+
+// TestOwnBroadcastDoesNotSkipAPeersUnreadMessage is the guard on the above.
+//
+// Advancing the consumption cursor to the end of the session's own message
+// unconditionally would carry it over anything unread sitting in front: publish
+// once to a busy topic and every peer message not yet pulled silently stops
+// being unread. Only a cursor already sitting exactly where the session's own
+// message begins has read everything before it.
+func TestOwnBroadcastDoesNotSkipAPeersUnreadMessage(t *testing.T) {
+	withHome(t)
+	const sid = "mon-selfread-2"
+	m := startMonitor(t, sid)
+	if err := Subscribe(sid, "chat"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 5*time.Second, "the monitor to pick up the subscription", func() bool {
+		_, ok := readCursors(sid)["chat"]
+		return ok
+	})
+
+	if _, err := Publish("chat", Draft{Text: "a peer said something first"}, peer()); err != nil {
+		t.Fatalf("Publish (peer): %v", err)
+	}
+	eventually(t, 5*time.Second, "the peer's message to be notified", func() bool {
+		return m.stdout.has("a peer said something first")
+	})
+	// Notified, but never pulled -- so it is still unread, and publishing must
+	// not change that.
+	if _, err := Publish("chat", Draft{Text: "and then I claimed a file"}, Sender{Kind: "session", SessionID: sid}); err != nil {
+		t.Fatalf("Publish (self): %v", err)
+	}
+	eventually(t, 5*time.Second, "the monitor to handle the session's own message", func() bool {
+		return readCursors(sid)["chat"] > 0
+	})
+
+	items, _, err := DefaultNamespace().ReadInbox(sid, InboxQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Message.Text != "a peer said something first" {
+		t.Fatalf("got %d items (%v), want the peer's message still unread: publishing swallowed it",
+			len(items), itemTexts(items))
+	}
+}
+
+func itemTexts(items []InboxItem) []string {
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.Message.Text)
+	}
+	return out
+}
+
 func TestMonitorDeliversMailQueuedBeforeItStarted(t *testing.T) {
 	withHome(t)
 	const sid = "mon-queued-1"

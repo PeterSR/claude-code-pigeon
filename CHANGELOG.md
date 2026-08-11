@@ -7,6 +7,167 @@ All notable changes to this project are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- A message can carry a `subject` and a `brief` alongside its body, so a reader has three
+  tiers instead of two. A notification clips the body at about 300 characters, which in the
+  run this came from cut every single message on the topic -- the median was 2019 characters
+  and roughly three quarters were never read past the prefix -- and sessions had started
+  writing shouted opening sentences hoping the cut fell after them. A subject renders whole
+  or not at all, ahead of the body, and is never what the give-up ladder drops, so the one
+  line a recipient is guaranteed to see is the one the sender chose. An oversize subject is
+  rejected rather than truncated, because a silently halved subject leaves the sender
+  believing a shorter line arrived intact.
+
+  A brief is the tier in between: a couple of sentences saying whether the rest is worth
+  reading. It is what `inbox` shows by default, with `full` there when the detail matters and
+  `subject` when triaging. A message with no brief still shows its body under the default
+  tier, marked so the reader knows it is seeing everything rather than a summary, since
+  falling back to silence would make an unsummarised message invisible. Neither field touches
+  the notification budget: a message with a brief renders byte-identically to one without,
+  which is asserted rather than assumed. pigeon cannot write these itself, being a Go binary
+  with no model behind it, so the tool descriptions ask the sender to.
+- An `inbox` MCP tool and `pigeon inbox`, so a session can read its own mail instead of only
+  being told about it. Receiving was push-only: one notification line per message, with
+  anything longer spilling to a payload file the recipient had to Read by hand, and in the
+  run this came from 72% of messages were never read past that prefix -- the pointer was
+  offered a thousand times and followed under three hundred. A pull returns the full text for
+  a whole burst in one call. Both surfaces render through one function so they cannot drift.
+
+  It needs a second cursor family, because what a monitor has *notified* and what a session
+  has *consumed* are different facts. Neither family touches the other: a pull that moved the
+  monitor's cursors would silently suppress a notification, and a notification that moved the
+  consumption cursors would mark mail read that nobody had seen. Both are seeded together at
+  subscribe and at registration -- a monitor advances its ingest cursor within about 200ms of
+  a message landing, so an absent consumption cursor falling back on the monitor's position
+  finds everything already behind it, and every pull answered "no unread messages" while mail
+  sat in the log.
+
+  Compaction learns about them per subscriber: the consumption cursor where that key is
+  present, otherwise the monitor's. Taking the minimum over both would stop compaction
+  outright, since a missing key reads as offset zero. A consumption cursor also stops counting
+  once it is far enough behind, so one session that pulls once and then idles cannot pin a log
+  open forever, and `readat` is deliberately left unseeded -- its absence means "never
+  pulled", so a session that only ever takes notifications does not hold its topic logs open
+  for the whole staleness window. Pulling once opts a session into that protection.
+- `set_delivery`, letting a recipient choose how a topic reaches it: `push` (unchanged),
+  `digest`, or `quiet`. One session in the run this came from was interrupted 219 times in a
+  window where it made 22 commits, and 107 of those messages produced neither a reply nor an
+  edit, because there was only one way for a message to arrive. Digest collapses a minute's
+  traffic into one line naming the topic, the count and the senders, and the session reads
+  them with `inbox` when it chooses. Quiet notifies only that line.
+
+  An alert, or a message naming you in `for`, still interrupts a digest topic -- and never a
+  quiet one. That asymmetry is the point: digest says "batch the routine", quiet says "do not
+  interrupt me", and a mute a sufficiently insistent peer can override is not a mute.
+- An `alert` priority, and exactly two levels. Every notification arrived at the same weight,
+  so sessions marked urgency the only way left to them, which was shouting in capitals; because
+  everyone could do it, it cancelled out, and a routine commit report and a stop-work order
+  looked identical. A third level would recreate that one level down, where the scarce thing
+  stops being scarce. The rate limiter reserves ten of its thirty emissions a minute for
+  alerts, dropping routine throughput to twenty: a flood of chatter could otherwise suppress
+  an alert outright and the session would never learn it existed, which is precisely inverted
+  from what the cap is for.
+- A `for` list on a publish, saying who a broadcast is actually for. 124 of one session's 219
+  inbound messages never mentioned it anywhere in the body, and it eventually gave up and
+  started grepping payload files for its own name to decide what to read. The message still
+  lands in the topic log in full and still reaches everyone's inbox, so the record stays
+  complete and a catch-up read sees what was really said -- but it interrupts only the
+  sessions it names. The rest have it in the topic log and in their inbox: the monitor cursor
+  crosses it, the consumption cursor does not, so it is there to read and does not cost a turn
+  to ignore. Addressing beats alert, because a message urgent enough to escalate is urgent for
+  the sessions it names; a sender who means everybody, now, leaves `for` empty.
+
+  Names are stored as typed and matched at delivery, never resolved to session ids when sent.
+  A name is only unique among live sessions, so the same string read back later -- on a
+  catch-up, or a browse of history -- can mean a different session or nobody at all. Matching
+  covers the host label and the full session id as well as a declared name and the short id:
+  most sessions never declare a name, and once `for` decides who gets interrupted, "cannot be
+  named" quietly becomes "never notified". It fails open when an entry cannot be read, rather
+  than muting a session whose registry file was momentarily unavailable, and it is rejected on
+  a direct send, where the recipient is already decided and a second list that disagreed with
+  it would be a trap.
+- `ask` and `answer`, for a question that has to be answered before the asker carries on. A
+  coordinator published "is anyone running git right now? Speak up in the next moment,
+  otherwise I will remove it", implemented the wait as `sleep 25` in Bash, saw nothing, and
+  removed a lock that was live; the replies arrived after the irreversible act and
+  contradicted each other. Two things were wrong and only one was the waiting -- the asker was
+  told answers were coming and left free to act, and silence was read as consent, which is the
+  reading a broadcast can never justify, since a session that says nothing may be deaf, busy,
+  or gone.
+
+  So `ask` blocks. It publishes the question as an alert, then tails the answer log itself and
+  returns the tally as its own result, which means the asker cannot act before the window
+  closes because it is inside a tool call. The deadline lives in the calling process rather
+  than in the monitor, which is the component documented as dying on resume without always
+  being rearmed, and an ask whose close depended on it would hang exactly when it mattered.
+
+  The audience is snapshotted when the question is asked, so the tally has a fixed
+  denominator, and every non-answer is named with what that session's status was at close:
+  "no answer (deaf)" and "no answer (live)" mean different things and neither means yes. There
+  is deliberately no wording anywhere in the output that reads as "no objections". A session
+  that cannot be interrupted is not asked at all, rather than counted and reported as silent.
+  An answer from outside the snapshot is recorded and reported separately rather than counted,
+  and a session that answers twice replaces its own answer instead of voting twice.
+- A message can name one it supersedes. The alarm that prompted this said uncommitted work in
+  four files had been destroyed; seventy-seven seconds later its author retracted it, nothing
+  had been, and four sessions had stopped by then. The alarm stayed in every recipient's log
+  for good, because the only remedy available was a second broadcast -- which is why the
+  retraction cost as much as the alarm did. A recipient who has already seen the original is
+  now told this is a correction before reading a word of it. One who has not, because the
+  topic is on digest and the window has not closed, never sees the original at all: it is
+  dropped from the buffer and the alarm simply never happens, and dropping counts as handling
+  it so its offset is not lost. That second behaviour belongs to digest rather than to
+  supersede -- in push mode the channel drains in milliseconds and the original has almost
+  always gone out already, which is worth knowing before anyone expects a retraction to
+  overtake its own alarm.
+
+  Only the original sender may supersede, verified against a bounded map of ids this monitor
+  has seen. Without that check any peer could cancel someone else's alarm inside a digest
+  window, or stamp a false correction frame on a claim that was never withdrawn. An
+  unverifiable claim is ignored and the message delivered as an ordinary one, so the failure
+  is toward showing too much rather than too little.
+- Threads. `ReplyTo` has existed since the beginning and no caller ever set it. Now a reply
+  names its parent and the inbox groups a run of them under one header, because settling two
+  field names between two sessions took five separate publishes to four readers, and the two
+  who had no stake paid a wake for each. The field a sender sets is derived one hop, since a
+  sender holds a draft and not the log, so `pigeon thread` walks the reply edges properly
+  rather than trusting it. The notification line is untouched: the budget cannot afford a
+  thread tag and it would not help at doorbell time, when the reader has not chosen anything
+  yet.
+- Catch-up on subscribe. A session joining an in-flight topic saw nothing that came before,
+  and a coordinator hand-wrote catch-up summaries three times, spending its own context
+  reconstructing a log that was sitting on disk. Subscribing can now plant a starting point
+  behind the end. Which cursor gets planted is the whole feature: the monitor's stays at the
+  end, so joining a busy topic does not fire twenty notifications, and only the consumption
+  cursor moves back, so the messages sit in the inbox and the session reads them when it
+  chooses. `readat` stays unset, so a session that catches up and then never pulls still does
+  not hold compaction open.
+- Attachments. A session solved a problem all three of them had and could only offer to
+  describe it, there being no way to send the file. Bounded to five files and a quarter
+  megabyte each, stored under the message id so two senders attaching the same basename
+  cannot overwrite each other. An attachment is a file a peer chose: the tool description says
+  to read it rather than run it, and the inbox will only show a path inside a payload
+  directory this session already knows, which is the same rule the notification line has
+  always applied to a body pointer.
+- Every session now starts in the room for the checkout it is working in, alongside the two
+  that mean "everyone". A session came up in two rooms both meaning everyone, and the narrower
+  room it wanted had to be joined by hand; on the run that prompted this, a project topic
+  existed with exactly the right members, two of the three sessions in that checkout had
+  joined it, and the third had not -- so it broadcast to the whole machine instead and woke
+  nine sessions across six repositories. It was not being careless. Joining is a deliberate
+  act, and this codebase keeps finding that sessions do not perform those: nobody set a
+  delivery preference either, and nobody used the tool built for asking a question. Defaults
+  are the only instruction a session reliably follows, so the narrow room has to be one it is
+  already in.
+
+  The room is derived from the git repository root, so a session started in a subdirectory
+  lands with its peers rather than alone, and a checkout reached through a symlink resolves to
+  the same room. It is an ordinary namespaced topic whose name happens to be computed rather
+  than typed: no new tree, no new prefix, nothing that cuts across namespaces, and safe in a
+  private namespace for exactly that reason. Two worktrees of one repository get separate
+  rooms, which is right when they are separate lines of work and wrong when they are not; the
+  basename gets the common case and does not attempt the rest. A project can opt out, because
+  the room's name is the directory basename and a private checkout would otherwise put it in
+  every peer's copy of its entry and in `list_topics` the moment it used the room.
 - A `pigeon-usage` skill, bundled automatically by `pigeon install` alongside the
   monitor and MCP server. Unlike the example skill below, it is strictly
   informational -- the MCP tool list, what `live`/`deaf`/`dead` mean, and a known
@@ -72,6 +233,68 @@ All notable changes to this project are documented here. Format follows
   spool, so a message arriving relights the widget without waiting out the ttl.
 
 ### Changed
+- The two rooms that mean "everyone" are renamed. `all` read as "everyone" and meant
+  "everyone in this namespace", and since almost nobody runs a second namespace the two were
+  the same set in practice -- so the name taught the wrong lesson about which room was which,
+  and `@all` looked like a spelling variant of it rather than the different log it is. They
+  are now `namespace` and `@global`, and nothing is called "all", so nothing claims to be
+  everyone while being something narrower.
+
+  The checkout room gets `here`, the word it was missing. It is named after the repository,
+  which is what makes it legible to everybody else, but that left a session unable to name its
+  own room without looking it up first and left every document unable to name it at all -- so
+  the tier carrying most of the traffic was the only one with no word for it. `here` resolves
+  to the real name before anything is written, at the CLI and MCP edges rather than inside
+  topic parsing: a subscription list, a cursor key and a prune pass walking log files have no
+  session and no cwd behind them, and only a live caller has a "here" to mean. Outside a
+  checkout it is left alone rather than silently widening to a room nobody asked for.
+
+  Sessions already running keep the old names until they restart, and the old `all.ndjson`
+  stays where it is. Nothing migrates it: the log is readable, the topic is still a valid
+  name, and it simply stops being one anybody joins by default.
+- A topic name is accepted with the `#` it is printed with. `#` is decoration, not part of the
+  name, so every notification said `#chat` and typing `#chat` back failed validation. Output
+  that is not valid input only ever bites whoever copies what they were shown, which is what
+  an agent does. `@` is unchanged, since it selects a different tree, and `#@ops` stays invalid
+  so there is one spelling per tree.
+- `publish` reports its audience as a live/deaf split rather than one count. The subscriber
+  count walked both session listings and filtered only dead ones, so "3 other live session(s)
+  subscribe to it" could mean three sessions none of which would ever see the message -- the
+  word "live" was already in the sentence and already untrue. A deaf session is the case a
+  sender would otherwise act on, since it only ever reads its spool if it resumes under the
+  same session id, and a brand-new session gets a new id. The zero-subscriber note also stops
+  reading as reassuring when there are deaf subscribers behind it. `publish` additionally
+  warns when a named handle in `for` answers to no live session.
+- The host assumptions pigeon leans on are gathered behind a `Runtime` interface with one
+  implementation. Sending was never host-specific -- a spool append knows nothing about Claude
+  Code and the MCP server speaks an open protocol, so any MCP-capable agent can already
+  publish -- but receiving is welded to a background monitor whose stdout a host turns into
+  notifications, and those assumptions were spread across the monitor, the spool, the state
+  directory, the installer and the session index. An interface designed against a single
+  implementation is not an abstraction, so what this buys today is that the surface is visible
+  and stops spreading, and that the notification budget is a value the host supplies rather
+  than a constant compiled into the rate limiter. The seam is deliberately partial:
+  receiving-capability and identity checks go through it, the per-turn "who am I" lookups and
+  `Render`'s budget constants do not. No behaviour changes.
+- The README and the bundled coordination skill are rewritten around what a message can now be
+  and what it costs a reader. The skill matters more than the reference, because it is what a
+  session actually reads before deciding how to behave: it leads with the thing that outranks
+  every feature in it -- two sessions is the sweet spot, three or more wants a worktree each,
+  and do not appoint a coordinator, because at the scale where one seems necessary there are
+  already too many sessions and its grounding will be weaker than the specialists it is
+  directing. The rest is habits, each written down because its absence cost real hours: say
+  what class your evidence is, look for the benign explanation before broadcasting the
+  catastrophic one, never run a whole-tree git operation in a shared worktree, and do not act
+  on a relayed decision as though the user had said it.
+
+  `ask` is now routed from the situation rather than described as a capability. Across the
+  whole life of every session that has coordinated on this machine, `ask` and `answer` were
+  called zero times, `set_delivery` zero, and `inbox` once, while the session that had the
+  full vocabulary available wrote a direct, answerable question into the body of a publish and
+  went back to work -- getting lucky that one of the two peers it named replied unprompted,
+  with nothing anywhere recording that an answer was outstanding. The test is not how
+  important the message is, it is whether you need an answer before carrying on, and the
+  phrases that should trigger it are spelled out.
 - `skills/session-coordination` renamed to `skills/pigeon-session-coordination`, so its
   name pairs with the new bundled `pigeon-usage` skill above rather than reading as a
   generic term. Still an example, still not installed automatically; update the path if
@@ -84,6 +307,145 @@ All notable changes to this project are documented here. Format follows
   how. Nothing else changes: the widget reports the same states from the same registry.
 
 ### Fixed
+- The janitor could throw away a live session's mail. The sweep that clears orphaned spools
+  and cursors was guarded on age, reasoning that a day is far longer than any monitor gap --
+  but a cursor file's mtime records the last time messages flowed, not the last time the
+  session was alive, and nothing touches it on a heartbeat. On a quiet machine a running
+  session's cursors are days old, so the effective grace was zero: any other session
+  registering would sweep them, and cursors are re-seeded at the end of each log on the next
+  registration, so everything published during the gap was skipped rather than redelivered.
+  Worse, the sweep ran before the registering session wrote its own entry, with no exclusion
+  for it, so a monitor rearming after a gap qualified as an orphan and deleted the very spool
+  it was about to start following, three lines before recreating it empty.
+
+  The signal is exact now instead of heuristic. Deregistration leaves a tombstone naming the
+  process that owned the session, and the sweep asks whether that process is alive: a monitor
+  that exited an hour ago while claude runs on keeps its mail, and one whose process is gone
+  is collected immediately rather than after a day. Age survives only for orphans that predate
+  tombstones, which come from a build that never wrote one and are therefore genuinely old.
+  The registering session is excluded by name on top of that.
+- A clean exit leaked its spool and cursors. The sweep searches by leftover registry entry, so
+  a session killed before it could deregister was cleaned up, while one that exited properly
+  removed its own entry first and made everything it owned unreachable: 2796 cursors and 2791
+  spools against 9 live sessions, going back three weeks. The tidy path leaked and the messy
+  one did not. The sweep already existed and was wired only to `pigeon prune`, which nobody
+  types; it runs at registration too now. Deregistration still leaves the spool deliberately,
+  so mail queued while nothing was listening survives until a monitor comes back for it.
+- A `for` list that matched nobody interrupted nobody, silently. Matching took a declared name,
+  a host label and the short id, but not the full session id that `list_sessions` also prints,
+  so copying the long form and publishing "shout if you are mid-edit" woke no one while the
+  sender was told only how many sessions subscribe to the topic. Silence then reads as consent,
+  which is the failure the addressing work exists to prevent.
+- The checkout room could leak a private project's directory name. `WriteEntry` blanks a
+  private session's cwd, label and description precisely because a derived label is the cwd
+  basename -- but the room's name *is* that basename and subscriptions are not blanked, so a
+  private checkout would have put it in every peer's copy of its entry and in `list_topics`
+  the moment it used the room. A private namespace is unaffected, its topics being
+  namespace-local; the per-project flag now opts out.
+- A pull could wedge the inbox. Truncating an oversize batch kept the *newest* messages, and
+  since dropped and kept messages come from one source, every kept message sat behind a gap
+  the cursor could not pass: the cursor never moved, and eight unread with a limit of five
+  returned the same five forever while the other three became permanently unreachable.
+  Draining takes the oldest now, and a truncated pull says how many are left, because a
+  session that reads ten of sixty and stops has lost the other fifty just as surely. A browse
+  no longer consumes, since marking read on "show me recent history" made the flag mean
+  different things depending on how much history happened to exist. Two overlapping pulls can
+  no longer rewind each other's read position, and a pull naming an unsubscribed topic errors
+  rather than reading back "no unread messages", which is indistinguishable from the topic
+  being quiet.
+- The pull path printed sender names, subjects and bodies raw. `Render` sanitises every one of
+  those on the notification line precisely because a spool line can be hand-written and never
+  pass validation, and the pull path has the same exposure for longer: a newline in a name or
+  a body forged extra entries and fake headers inside output the reader treats as pigeon's own
+  structure.
+- Cursor abandonment is measured in time alone. Cutting once a cursor fell a megabyte behind
+  destroyed the case it exists for: pull at 11:58, a peer publishes a megabyte and a half at
+  12:00, prune runs at 12:01, and the burst is gone before a session that was reading on time
+  ever asked for it. Abandoned has to mean nobody is coming back -- a session that keeps
+  pulling closes the gap itself, and one that stops ages out. Peeking does not count as
+  reading.
+- The deferred digest flush marked messages nobody received. It wrote its line and advanced the
+  cursor, and the dominant shutdown here is Claude Code killing the monitor when a session
+  resumes -- so the reader on the other end of stdout was already gone, the line landed
+  nowhere, and the cursor moved past messages whose only announcement was that lost line. A
+  rearmed monitor then resumed past them and nothing ever mentioned them again: precisely the
+  silent loss that moving the cursor to handled-time was supposed to end, reintroduced by the
+  one path that runs when a session goes away. On the way out the line is now best-effort and
+  the cursor stays put. A duplicate digest line after a restart is the cheap side of that
+  trade.
+- Delivery routed on the message's own topic field, which a peer controls and a hand-written
+  line can omit or misname. A line in one topic's log omitting the field took the direct branch
+  and advanced that topic's cursor past its own unflushed buffer; a line claiming another
+  topic's name flushed that topic's cursor to an offset measured in a different log, and since
+  cursors only move forward it would skip its own unread messages permanently. Everything
+  routes on the source the follower actually read now, and the message's field is display only.
+  The pending-digest check in `advanceCursor` was keyed the same wrong way and was missed when
+  the rest moved.
+- Digest lines and suppression notices bypassed the emission cap they exist to respect. Claude
+  Code kills a monitor that emits too many events, so fifteen digest topics could add
+  forty-five uncounted lines a minute on top of thirty counted ones and cost the session its
+  monitor -- worse than any suppression. A digest line now spends from the alert reserve, since
+  one stands in for many messages and is the opposite of chatter. A suppressed alert's notice
+  could also wait indefinitely, being written only from inside the next emit when the shape
+  that suppresses an alert is a flood followed by silence; the digest tick now rolls the
+  window.
+- The cursor recorded ingestion rather than notification. `followSource` persisted right after
+  pushing a read pass into the channel, which was invisible while the gap was milliseconds and
+  fatal once a digest holds messages for a minute inside a process known to die on resume
+  without being rearmed -- a monitor killed mid-window would have resumed past its own
+  unflushed buffer and nothing would ever have mentioned those messages again. The channel
+  carries the offset with the message now, `followSource` writes no cursors at all, and the
+  delivery loop persists one only once the message at it has been handled: pushed, folded into
+  a digest that has since flushed, dropped as a self-broadcast, or suppressed by the rate
+  limiter. Suppression counts, since the design deliberately does not re-notify a suppressed
+  message and holding the cursor there would redeliver it forever. No cursor moves for a topic
+  while it has a pending digest, or an alert pushing past an older message still in that
+  topic's buffer would jump over it.
+- A pull racing compaction redelivered the whole log. Stat, base read and open are three
+  syscalls with nothing holding them together, and compaction renames the log before it writes
+  the new base, so a pull landing in that window measured one era's base against the other
+  era's file: the seek landed short by the size of the cut, every returned offset was
+  understated by the same amount, and `MarkRead` persisted it. The next pull then read its own
+  cursor as "compacted past us", reset to the base, and redelivered the entire surviving log.
+  One retry is enough, since compaction holds the topic lock for the rename and the base write
+  together.
+- A session's own broadcast left its consumption cursor behind. The monitor refuses to wake a
+  session with its own message and advances the monitor cursor to record that it handled it,
+  but nothing advanced the consumption cursor -- which is also the floor compaction will not
+  cut past, so a session that pulls regularly and then publishes held its topic log open on
+  account of its own broadcast, with the cursor's meaning false about the one message the
+  session can be surest is dealt with. Only a cursor sitting exactly where the message begins
+  may move: jumping it to the end unconditionally would carry it over anything unread in
+  front, so a single publish to a busy topic would silently stop every unpulled peer message
+  being unread.
+- `set_delivery` and `subscribe` wrote against the environment's session id, so after a
+  `/clear` they either failed as unregistered or wrote a setting no running monitor reads.
+  Both resolve through the same identity resolver as every other write path now, as does the
+  inbox itself -- reading the environment's id there would find no cursors, treat the whole
+  history as unread, and then write a read position under an id nothing else uses.
+- `subscribe` no longer re-seeds the monitor cursor of a topic already followed, which skipped
+  anything queued since. Catch-up also no longer confirms a window it did not plant: seeding
+  only ever seeds, so subscribing twice -- or unsubscribing and coming back, since that leaves
+  cursors behind -- reported twenty messages waiting into an inbox that would show none.
+- `ask` and `answer` resolved their namespace from the working directory rather than from the
+  entry the monitor is serving, so a divergence made quorum vacuously true and returned
+  "nobody was there to ask" while the topic had live subscribers.
+- Attachments leaked. Bodies spill as `<id>.txt` and the reclaim pass globbed only that, so an
+  attachment keeping its own extension was invisible to it forever -- up to five files and a
+  quarter megabyte per message, including orphans from a failed copy. The referenced-set check
+  was always the thing deciding safety and the glob only decides what gets considered, so it
+  considers everything now. Prune also walked only a message's body overflow when deciding
+  what was still referenced, so an attachment could be collected while messages still pointed
+  at it.
+- A thread came back in a different order run to run. Messages were ordered by timestamp, which
+  is one-second resolution, and a thread is precisely where several land inside one second; the
+  ties were then broken by Go's randomised map iteration. A conversation is ordered by its
+  reply chain now, parent before child, which is both deterministic and what the participants
+  meant.
+- A flag written after the topic was silently dropped. Go's flag package stops parsing at the
+  first positional argument, so `publish topic --subject x body` filed the subject away as
+  message text and reported success -- a silent drop, in a tool whose whole purpose is that
+  messages arrive.
 - A session that has been cleared now identifies itself correctly to the CLI. Same root cause as
   the `not armed` alarm below: after a clear, the monitor and the MCP server still hold the id
   they started with, while `pigeon` run from a shell in that session is handed the new one, and

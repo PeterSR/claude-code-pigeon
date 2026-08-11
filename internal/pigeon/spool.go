@@ -392,6 +392,90 @@ func newMessageID() string {
 // merely looks like one.
 var messageIDRe = regexp.MustCompile(`^m_[0-9a-f]{12}$`)
 
+// payloadBaseRe bounds the basename of a payload path to characters that
+// cannot carry structure into a line that quotes it.
+//
+// The containing directory was already checked at every site that shows one of
+// these paths, and that check is not enough on its own. The DIRECTORY is ours;
+// the BASENAME came from a peer -- either off a spool line, which this package
+// assumes throughout may have been hand-written and never validated, or from
+// the name of a file a sender chose to attach. A basename holding "]" forges
+// the end of the bracket hint it sits in, and one holding a newline -- legal in
+// a POSIX filename, so this needs no hand-written line at all -- ends the
+// notification line and starts a second, entirely attacker-authored one. Every
+// other peer-controlled field is bounded at render time for exactly this
+// reason; the payload path was the one reaching output raw.
+//
+// Checked rather than rewritten, the choice askHint makes for AskID just above:
+// a path that has been sanitised is no longer a path, and a pointer that does
+// not open is worse than no pointer at all.
+//
+// Deliberately a character class rather than the exact "<message id>.txt" shape
+// this package writes. Matching the id shape would read as tighter and would
+// strand real mail: newMessageID has a clock-based fallback for when crypto/rand
+// fails, which messageIDRe does not accept, and a payload file written by an
+// older build answers to no shape this build knows. The characters are what the
+// hazard is made of, so the characters are what this bounds -- losing a body
+// with no way to reach it is the failure the pointer exists to prevent.
+// Unbounded in length on purpose. What makes a basename dangerous here is the
+// characters in it, and length is already somebody else's job twice over: the
+// filesystem caps a path component, and the give-up ladder below is the thing
+// that decides what a long pointer costs the rest of the line. Capping it here
+// as well would drop the pointer for a path that is merely long -- stranding a
+// body that has no other route -- in the name of a hazard length is not.
+var payloadBaseRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// trustedPayloadPath reports whether p is one this session may show a reader or
+// read on their behalf: a safely-named file sitting directly in a payloads
+// directory n already knows -- its own, or the shared one a global topic spills
+// to. Everything else is a path a peer merely named, and naming a path is not
+// the same as it being ours.
+func (n Namespace) trustedPayloadPath(p string) bool {
+	base := filepath.Base(p)
+	if p == "" || !payloadBaseRe.MatchString(base) {
+		return false
+	}
+	// The character class admits a leading dot, since a payload name is only
+	// ever "<id>.txt" and an id has no business being rejected for its first
+	// character. That lets through the two names that are not files at all:
+	// "<payloads>/.." names the directory above the one whose contents we are
+	// vouching for, and neither it nor "." has a body to point at.
+	if base == "." || base == ".." {
+		return false
+	}
+	d := filepath.Dir(p)
+	return d == n.PayloadsDir() || d == SharedPayloadsDir()
+}
+
+// safeAttachName bounds the sender-chosen half of a stored attachment's name to
+// what attachNameRe will later accept, so the untrusted part cannot carry
+// structure into any output that lists it. Applied when the file is written
+// rather than only when it is shown, because the name becomes a real filename
+// on disk and a newline is legal in one.
+func safeAttachName(base string) string {
+	var b strings.Builder
+	for _, r := range base {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	name := b.String()
+	if len([]rune(name)) > 64 {
+		name = string([]rune(name)[:64])
+	}
+	// A basename that was entirely unsafe characters, or empty to begin with,
+	// still has to be nameable: two attachments reduced to nothing would also
+	// collide with each other, which the caller reports as a duplicate.
+	if name == "" {
+		name = "file"
+	}
+	return name
+}
+
 // validateSupersedes checks that a draft's Supersedes value, if given, is
 // shaped like a real message id and does not name the message it is on. This
 // is everything Send and Publish can check: neither holds the history needed
@@ -468,7 +552,7 @@ func attachFiles(dir, msgID string, paths []string) ([]string, error) {
 			return nil, fmt.Errorf("attach %q is %d bytes; the limit is %d (%d KiB)",
 				p, fi.Size(), maxAttachmentBytes, maxAttachmentBytes/1024)
 		}
-		name := msgID + "-" + filepath.Base(p)
+		name := msgID + "-" + safeAttachName(filepath.Base(p))
 		if used[name] {
 			return nil, fmt.Errorf("attach %q: another attachment already uses the basename %q", p, filepath.Base(p))
 		}
@@ -854,10 +938,8 @@ func (n Namespace) Render(m *Message, self *Entry) string {
 	// Only ever point at a payload directory this session already knows: its
 	// own, or the shared one a global topic spills to. A hand-written spool line
 	// could otherwise name any path and have it read back as trustworthy.
-	if p := m.Payload; p != "" && filepath.Base(p) != "" {
-		if d := filepath.Dir(p); d == n.PayloadsDir() || d == SharedPayloadsDir() {
-			payload = " [full text: " + p + "]"
-		}
+	if p := m.Payload; n.trustedPayloadPath(p) {
+		payload = " [full text: " + p + "]"
 	}
 
 	// The subject sits in the never-dropped class alongside the payload

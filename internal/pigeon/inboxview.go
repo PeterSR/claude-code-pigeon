@@ -2,7 +2,6 @@ package pigeon
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -316,10 +315,7 @@ func writeInboxItem(b *strings.Builder, it InboxItem, detail string, self *Entry
 func writeAttachments(b *strings.Builder, attach []string, ns Namespace) {
 	var shown []string
 	for _, p := range attach {
-		if filepath.Base(p) == "" {
-			continue
-		}
-		if d := filepath.Dir(p); d != ns.PayloadsDir() && d != SharedPayloadsDir() {
+		if !ns.trustedPayloadPath(p) {
 			continue
 		}
 		shown = append(shown, p)

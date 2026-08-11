@@ -443,6 +443,17 @@ func readAnswers(dir, id string) ([]Answer, error) {
 		if err := json.Unmarshal([]byte(s), &a); err != nil {
 			continue
 		}
+		// Answer validates the verdict on the way in, so a line carrying
+		// anything else was not written by the tool that owns this file.
+		// Dropped rather than rendered, because the render files an
+		// unrecognised verdict with the agreements while the summary counts
+		// only the three real ones: keeping it would put a row that reads as
+		// consent above a tally that never counted it. A dropped line leaves
+		// its session reported as "no answer", which is the safe direction and
+		// the true one -- nothing valid was said on its behalf.
+		if validateVerdict(a.Verdict) != nil {
+			continue
+		}
 		all = append(all, a)
 	}
 	if err := sc.Err(); err != nil {
@@ -569,6 +580,20 @@ func RenderAskResult(res *AskResult) string {
 // "no answer") left-padded so the names that follow line up, then who and --
 // when given -- why.
 func askRow(label, who, note string) string {
+	// Both halves are peer-controlled, and this is the output with the most to
+	// gain from forging: a coordinator reads this tally and then does the
+	// irreversible thing. `who` comes off another session's registry entry,
+	// whose name that session chose. `note` is sanitised by Answer on the way
+	// in, but an answer log is a file any local process can append to, so the
+	// value read back was not necessarily the value written. A newline in
+	// either would open a second row -- an "ok" from a session that never
+	// answered, indented to look exactly like the rest.
+	//
+	// This is the same re-sanitise-at-render discipline Render applies to a
+	// name it has already validated once, for the same reason: the check that
+	// matters is the one nearest the output.
+	who = truncate(Sanitize(who), 72)
+	note = truncate(Sanitize(note), askNoteLimit)
 	line := fmt.Sprintf("  %-6s  %s", label, who)
 	if note != "" {
 		line += " -- " + note

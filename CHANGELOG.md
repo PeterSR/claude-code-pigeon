@@ -307,6 +307,48 @@ All notable changes to this project are documented here. Format follows
   how. Nothing else changes: the widget reports the same states from the same registry.
 
 ### Fixed
+- A monitor rearm erased every delivery mode the session had set. `register` carried a
+  session's name, description and subscriptions across a restart and left `Delivery` out of
+  that list, and since `WriteEntry` replaces the whole entry, a field left out is not stale
+  but gone. A rearm is not an edge case here: Claude Code kills the monitor on every resume.
+  So a session that set a topic to digest or quiet went back to being interrupted by it after
+  its next resume, silently, which is the one outcome `set_delivery` exists to prevent. It
+  also moved the denominator under `ask`, which excludes quiet sessions from a question's
+  audience.
+- A payload path reached the notification line and the inbox with its basename unchecked.
+  Both surfaces gated on the containing directory, which is pigeon's, and the basename is a
+  peer's: it arrives either off a spool line, which this package assumes throughout may have
+  been hand-written, or from the name of a file a sender chose to attach. A `]` in it closes
+  the bracket hint it sits inside, and a newline -- legal in a POSIX filename, so this needed
+  no hand-written line at all -- ends the notification line and starts a second one written
+  entirely by the peer. The basename is now bounded to characters that cannot carry
+  structure, checked rather than rewritten, since a sanitised path is no longer a path and a
+  pointer that does not open is worse than no pointer. An attachment's stored name is bounded
+  when it is written as well as when it is shown, because it becomes a real filename on disk.
+- `pigeon listen --json` read any file a message named. It inlines a payload's bytes into its
+  NDJSON so a consumer never has to open the file, with no check that the path was one pigeon
+  wrote -- while `Render` and the inbox both refuse to so much as print a path from outside a
+  known payload directory. A hand-written line naming any file the user can read had its
+  contents pumped into whatever automation was downstream. It now takes the same containment
+  decision the other two take, applied to the read rather than the print.
+- An ask tally could be forged. The verdict rows echoed the answering session's name and note
+  raw, and an answer log is a file any local process can append to, so the value read back is
+  not necessarily the one `answer` sanitised on the way in: a newline in either opened a
+  second row, indented to look exactly like the rest -- an agreement from a session that never
+  answered, in the one output a coordinator reads before doing something irreversible. Both
+  halves are re-sanitised at render time now, the discipline `Render` already applies to a
+  name it has validated once. An unrecognised verdict is also no longer accepted at all: it
+  was filed with the agreements by the render while the summary counted only the three real
+  verdicts, so a forged line could add a row that read as consent and appeared in no tally.
+- `here` named a private checkout's own directory. `defaultSubscriptions` refuses to join
+  that room for a private project, in a comment naming the hazard exactly -- the room's name
+  is the directory basename, which is what `private` keeps off the bus -- but the alias
+  resolved without the same check, and the publish tool description steers a session toward
+  `here` first. One `publish here` created the topic, hanging the hidden directory's name in
+  `list_topics` for the whole namespace, and subscribing wrote it into an entry every peer
+  reads, where `WriteEntry` does not blank it. The alias now refuses out loud rather than
+  quietly widening to the everyone room, which would send a message meant for one checkout to
+  the whole machine. A private namespace is unaffected, its topics being namespace-local.
 - The janitor could throw away a live session's mail. The sweep that clears orphaned spools
   and cursors was guarded on age, reasoning that a day is far longer than any monitor gap --
   but a cursor file's mtime records the last time messages flowed, not the last time the

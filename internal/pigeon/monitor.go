@@ -764,12 +764,26 @@ func register(ns Namespace, sid string, rt Runtime, logf func(string, ...any)) e
 		logf("project config: %v", cerr)
 	}
 
-	// Preserve identity and subscriptions declared earlier in this session.
+	// Preserve identity, subscriptions and delivery modes declared earlier in
+	// this session.
+	//
+	// Delivery belongs in that list for a sharper reason than the rest. A
+	// monitor being killed and rearmed is not an edge case here, it is the
+	// documented dominant lifecycle event -- Claude Code does it on every
+	// resume -- and WriteEntry replaces the whole entry, so a field left out
+	// here is not merely stale, it is erased. Dropping it turned every digest
+	// and quiet topic back into push on resume, silently, which is the one
+	// outcome set_delivery exists to prevent: a session that asked not to be
+	// interrupted goes back to being interrupted and is never told. It also
+	// moves under askAudience, which excludes quiet sessions from a question's
+	// denominator.
 	var name, desc string
 	var subs []string
+	var delivery map[string]string
 	prev, err := ns.ReadEntry(sid)
 	if err == nil {
 		name, desc, subs = prev.Name, prev.Description, prev.Subscriptions
+		delivery = prev.Delivery
 	} else {
 		// Only a session's *first* registration takes identity from the
 		// config. After that the session's own declarations are authoritative,
@@ -800,6 +814,7 @@ func register(ns Namespace, sid string, rt Runtime, logf func(string, ...any)) e
 		StartedAt:      now,
 		HeartbeatAt:    now,
 		Subscriptions:  subs,
+		Delivery:       delivery,
 		Runtime:        rt.Name(),
 		RuntimeVersion: rt.Version(),
 		Label:          labelName,

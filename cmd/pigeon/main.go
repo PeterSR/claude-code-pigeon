@@ -492,7 +492,11 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	if err := misplacedFlag(rest[1:]); err != nil {
 		return err
 	}
-	topic, text := pigeon.ResolveTopicAlias(rest[0], pigeon.CurrentCwd()), strings.Join(rest[1:], " ")
+	topic, err := pigeon.ResolveTopicAlias(rest[0], pigeon.CurrentCwd())
+	if err != nil {
+		return err
+	}
+	text := strings.Join(rest[1:], " ")
 
 	priority := ""
 	if alert {
@@ -563,7 +567,11 @@ func cmdAsk(args []string, w, stderr io.Writer) error {
 	if err := misplacedFlag(rest[1:]); err != nil {
 		return err
 	}
-	topic, text := pigeon.ResolveTopicAlias(rest[0], pigeon.CurrentCwd()), strings.Join(rest[1:], " ")
+	topic, err := pigeon.ResolveTopicAlias(rest[0], pigeon.CurrentCwd())
+	if err != nil {
+		return err
+	}
+	text := strings.Join(rest[1:], " ")
 
 	ns, err := namespaceOf(nsName)
 	if err != nil {
@@ -616,7 +624,11 @@ func cmdSubscribe(args []string, w, stderr io.Writer) error {
 	if len(rest) != 1 {
 		return fmt.Errorf("usage: pigeon subscribe [--catchup <20|30m>] <topic>")
 	}
-	rest[0] = pigeon.ResolveTopicAlias(rest[0], pigeon.CurrentCwd())
+	resolved, err := pigeon.ResolveTopicAlias(rest[0], pigeon.CurrentCwd())
+	if err != nil {
+		return err
+	}
+	rest[0] = resolved
 	e, err := ownEntry()
 	if err != nil {
 		return err
@@ -637,7 +649,11 @@ func cmdUnsubscribe(args []string, w io.Writer) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: pigeon unsubscribe <topic>")
 	}
-	args[0] = pigeon.ResolveTopicAlias(args[0], pigeon.CurrentCwd())
+	resolved, err := pigeon.ResolveTopicAlias(args[0], pigeon.CurrentCwd())
+	if err != nil {
+		return err
+	}
+	args[0] = resolved
 	e, err := ownEntry()
 	if err != nil {
 		return err
@@ -678,7 +694,11 @@ func cmdDelivery(args []string, w, stderr io.Writer) error {
 	if len(args) != 2 {
 		return fmt.Errorf("usage: pigeon delivery [<topic> <push|digest|quiet>]")
 	}
-	args[0] = pigeon.ResolveTopicAlias(args[0], pigeon.CurrentCwd())
+	resolved, err := pigeon.ResolveTopicAlias(args[0], pigeon.CurrentCwd())
+	if err != nil {
+		return err
+	}
+	args[0] = resolved
 	if err := pigeon.SetDelivery(e.SessionID, args[0], args[1]); err != nil {
 		return err
 	}

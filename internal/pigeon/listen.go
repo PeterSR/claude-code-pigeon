@@ -230,7 +230,15 @@ func Listen(opts ListenOptions, stdout, stderr io.Writer) error {
 			}
 			if emitJSON {
 				ev := listenEvent{Message: m, Namespace: ns.String()}
-				if m.Payload != "" {
+				// Only ever read back a payload this session wrote itself.
+				// Render and the inbox both gate on the containing directory
+				// before so much as printing one of these paths; this read is
+				// the same trust decision taken further, since it puts the
+				// bytes themselves into output some other program consumes.
+				// Ungated, a hand-written line naming any file this user can
+				// read -- a key, a token, a history file -- would have had its
+				// contents pumped through the listener.
+				if ns.trustedPayloadPath(m.Payload) {
 					if b, err := os.ReadFile(m.Payload); err == nil {
 						ev.Body = string(b)
 					}

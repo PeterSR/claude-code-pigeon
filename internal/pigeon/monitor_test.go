@@ -608,24 +608,61 @@ func TestHereResolvesToTheCheckoutsOwnRoom(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := ResolveTopicAlias("here", repo); got != "caterflow-inventory" {
+	mustResolve := func(topic, cwd string) string {
+		t.Helper()
+		got, err := ResolveTopicAlias(topic, cwd)
+		if err != nil {
+			t.Fatalf("ResolveTopicAlias(%q): %v", topic, err)
+		}
+		return got
+	}
+
+	if got := mustResolve("here", repo); got != "caterflow-inventory" {
 		t.Errorf(`ResolveTopicAlias("here") = %q, want the checkout's room`, got)
 	}
-	if got := ResolveTopicAlias("HERE", repo); got != "caterflow-inventory" {
+	if got := mustResolve("HERE", repo); got != "caterflow-inventory" {
 		t.Errorf("the alias should be case-insensitive, got %q", got)
 	}
 	// It resolves to the real name before anything is written, so what lands
 	// in the log and in a peer's notification says which checkout it was.
-	if got := ResolveTopicAlias("deploys", repo); got != "deploys" {
+	if got := mustResolve("deploys", repo); got != "deploys" {
 		t.Errorf("an ordinary topic was rewritten: %q", got)
 	}
-	if got := ResolveTopicAlias("@global", repo); got != "@global" {
+	if got := mustResolve("@global", repo); got != "@global" {
 		t.Errorf("a global topic was rewritten: %q", got)
 	}
 	// Nowhere to mean: left alone rather than silently widened to a room the
 	// caller did not ask for.
-	if got := ResolveTopicAlias("here", ""); got != "here" {
+	if got := mustResolve("here", ""); got != "here" {
 		t.Errorf("outside a checkout the alias should stay put, got %q", got)
+	}
+}
+
+// A private checkout's room is named after the directory private exists to
+// keep off the bus. defaultSubscriptions already refuses to join it; the alias
+// is the other door into the same room, and the publish tool description sends
+// a session through it first.
+func TestHereRefusesToNameAPrivateCheckoutsRoom(t *testing.T) {
+	repo := writeProjectConfig(t, `{"private": true}`)
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ResolveTopicAlias("here", repo)
+	if err == nil {
+		t.Fatalf("`here` resolved to %q in a private checkout, putting the directory name on the bus", got)
+	}
+	if got != "" {
+		t.Errorf("a refused alias must not also hand back a topic, got %q", got)
+	}
+	// Refused, not quietly widened: resolving to the everyone room would send
+	// the message the session meant for its checkout to the whole machine.
+	if got == PublicTopic || got == GlobalPublicTopic {
+		t.Errorf("the alias widened to %q instead of refusing", got)
+	}
+	// Only the alias is affected. A private checkout can still name a topic.
+	if to, err := ResolveTopicAlias("deploys", repo); err != nil || to != "deploys" {
+		t.Errorf("an explicitly named topic was refused: %q, %v", to, err)
 	}
 }
 

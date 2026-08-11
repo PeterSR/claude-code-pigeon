@@ -497,13 +497,16 @@ func TestRenderKeepsTheSubjectWhenSpaceIsTight(t *testing.T) {
 			if len(base)+1 >= total {
 				t.Skipf("temp root is already %d bytes, past the %d-byte home this case tests", len(base), total)
 			}
-			ran++
 			home := filepath.Join(base, strings.Repeat("d", total-len(base)-1))
 			t.Setenv(EnvHome, home)
 			ns := mustNS(t, strings.Repeat("n", 60))
 			if err := ns.EnsureDirs(); err != nil {
 				t.Skipf("path too long for this filesystem: %v", err)
 			}
+			// Counted here rather than above the skips: a case that bailed on
+			// EnsureDirs asserted nothing either, and counting it would let the
+			// all-skipped guard below report coverage this sweep never had.
+			ran++
 
 			payload := filepath.Join(ns.PayloadsDir(), "m_deadbeefcafe.txt")
 			subject := strings.Repeat("j", 80)

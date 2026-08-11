@@ -62,17 +62,38 @@ const CheckoutTopicAlias = "here"
 // ParseTopicRef, because a topic name is also read back from places with no
 // session and no cwd behind them: a subscription list, a cursor key, a prune
 // pass walking log files. Only a live caller has a "here" to mean.
-func ResolveTopicAlias(topic, cwd string) string {
+func ResolveTopicAlias(topic, cwd string) (string, error) {
 	if !strings.EqualFold(strings.TrimSpace(topic), CheckoutTopicAlias) {
-		return topic
+		return topic, nil
+	}
+	// A private checkout has no room to name. The room's name IS the directory
+	// basename, which is the one thing `private` exists to keep off the bus --
+	// defaultSubscriptions already refuses to join it for that reason, in a
+	// comment that spells the hazard out. Resolving the alias walks straight
+	// back in through the other door: publishing creates the topic, hanging the
+	// hidden directory's name in `list_topics` for the whole namespace, and
+	// subscribing writes it into an entry every peer reads, where WriteEntry
+	// does not blank it. The publish tool description now steers a session
+	// toward `here` first, so this is the likely route into the room rather
+	// than an exotic one.
+	//
+	// Refused out loud rather than quietly resolved to the wider room: a
+	// session that typed `here` wants the narrow one, and silently broadcasting
+	// to everybody instead is the exact failure the checkout room was added to
+	// end. A private NAMESPACE is untouched -- its topics are namespace-local,
+	// so the room is safe there, and it is the per-project flag that opts out.
+	if cfg, _, err := LoadProjectConfig(cwd); err == nil && cfg != nil && cfg.Private {
+		return "", fmt.Errorf("this checkout is private, so `here` has no room to name: " +
+			"the room is named after the directory, which is what private keeps off the bus -- " +
+			"name a topic explicitly instead")
 	}
 	if t := CheckoutTopic(cwd); t != "" {
-		return t
+		return t, nil
 	}
 	// Outside a checkout there is no room to mean, so leave it alone and let
 	// the caller fail on a topic literally named "here" rather than silently
 	// widening to something else.
-	return topic
+	return topic, nil
 }
 
 var topicRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)

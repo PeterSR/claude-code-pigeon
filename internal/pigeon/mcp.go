@@ -630,7 +630,11 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return mcpPublish(ns, ResolveTopicAlias(a.Topic, CurrentCwd()), a.Text, a.Subject, a.Brief, priority, a.For, a.Supersedes, a.ReplyTo, a.Attach)
+		topic, err := ResolveTopicAlias(a.Topic, CurrentCwd())
+		if err != nil {
+			return "", err
+		}
+		return mcpPublish(ns, topic, a.Text, a.Subject, a.Brief, priority, a.For, a.Supersedes, a.ReplyTo, a.Attach)
 	case "subscribe", "unsubscribe":
 		var a struct {
 			Topic     string `json:"topic"`
@@ -642,14 +646,22 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return mcpSubscription(ns, name, ResolveTopicAlias(a.Topic, CurrentCwd()), a.Catchup)
+		topic, err := ResolveTopicAlias(a.Topic, CurrentCwd())
+		if err != nil {
+			return "", err
+		}
+		return mcpSubscription(ns, name, topic, a.Catchup)
 	case "set_delivery":
 		var a struct {
 			Topic string `json:"topic"`
 			Mode  string `json:"mode"`
 		}
 		_ = json.Unmarshal(raw, &a)
-		return mcpSetDelivery(ResolveTopicAlias(a.Topic, CurrentCwd()), a.Mode)
+		topic, err := ResolveTopicAlias(a.Topic, CurrentCwd())
+		if err != nil {
+			return "", err
+		}
+		return mcpSetDelivery(topic, a.Mode)
 	case "inbox":
 		return mcpInbox(raw)
 	case "list_topics":
@@ -675,7 +687,11 @@ func callTool(name string, raw json.RawMessage) (string, error) {
 			DeadlineSec int    `json:"deadline_sec"`
 		}
 		_ = json.Unmarshal(raw, &a)
-		return mcpAsk(ResolveTopicAlias(a.Topic, CurrentCwd()), a.Text, a.Subject, a.DeadlineSec)
+		topic, err := ResolveTopicAlias(a.Topic, CurrentCwd())
+		if err != nil {
+			return "", err
+		}
+		return mcpAsk(topic, a.Text, a.Subject, a.DeadlineSec)
 	case "answer":
 		var a struct {
 			Ask     string `json:"ask"`

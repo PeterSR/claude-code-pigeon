@@ -471,15 +471,34 @@ func TestRenderKeepsThePayloadPointerWhenSpaceIsTight(t *testing.T) {
 // so it has to survive the same tight-budget sweep TestRenderKeepsThe
 // PayloadPointerWhenSpaceIsTight already runs the pointer through.
 func TestRenderKeepsTheSubjectWhenSpaceIsTight(t *testing.T) {
-	// Only swept up to a pad that stays inside the give-up ladder itself
-	// (unlike the payload-only sweep this mirrors): the subject's own
-	// never-dropped reservation eats into the same budget the pointer does,
-	// so at large enough pads even the fully-collapsed last rung of the
-	// ladder no longer fits and the pathological fallback below it takes
-	// over -- a separate code path this test is not about.
-	for _, pad := range []int{0, 30, 60, 90} {
-		t.Run(fmt.Sprintf("pad%d", pad), func(t *testing.T) {
-			home := filepath.Join(t.TempDir(), strings.Repeat("d", pad))
+	// Swept by total home length rather than by a pad added to t.TempDir(),
+	// because a pad only means anything relative to a temp root whose length
+	// is the platform's business: the same pad that lands mid-ladder on Linux
+	// lands past the end of it on macOS and Windows, whose temp paths are far
+	// longer. The sibling sweep above learned this once already, and fixing it
+	// there by adding more pads left the assumption itself in place for this
+	// one to inherit.
+	//
+	// The ceiling is the ladder's own last rung, and it is a real boundary
+	// rather than an arbitrary one: past a home of roughly 180 bytes the
+	// payload pointer alone is close enough to the budget that the subject
+	// cannot fit beside it, and the ladder gives the subject up deliberately,
+	// because the pointer is the only part of the line with no substitute.
+	// That trade is the documented behaviour, so the sweep stops below it.
+	// A platform whose temp root is longer than a case's home cannot host that
+	// case at all, so the short end of the sweep skips on macOS and Windows.
+	// Counted rather than left to skip quietly: a sweep that skipped every case
+	// would report the invariant as holding while testing nothing, which is the
+	// reading this whole branch exists to remove.
+	ran := 0
+	for _, total := range []int{60, 90, 120, 150, 170} {
+		t.Run(fmt.Sprintf("home%d", total), func(t *testing.T) {
+			base := t.TempDir()
+			if len(base)+1 >= total {
+				t.Skipf("temp root is already %d bytes, past the %d-byte home this case tests", len(base), total)
+			}
+			ran++
+			home := filepath.Join(base, strings.Repeat("d", total-len(base)-1))
 			t.Setenv(EnvHome, home)
 			ns := mustNS(t, strings.Repeat("n", 60))
 			if err := ns.EnsureDirs(); err != nil {
@@ -514,6 +533,11 @@ func TestRenderKeepsTheSubjectWhenSpaceIsTight(t *testing.T) {
 				t.Errorf("the subject was dropped by the give-up ladder:\n%s", got)
 			}
 		})
+	}
+	if ran == 0 {
+		t.Fatalf("every case skipped: this platform's temp root is longer than the "+
+			"widest home the ladder can hold a subject in (%d bytes), so the invariant "+
+			"went untested rather than untrue", 170)
 	}
 }
 

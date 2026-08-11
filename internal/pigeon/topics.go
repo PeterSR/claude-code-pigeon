@@ -10,11 +10,18 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// PublicTopic is the mailbox every session joins by default, so a broadcast
-// reaches the whole namespace without anyone configuring anything.
-const PublicTopic = "all"
+// PublicTopic is the mailbox every session in a namespace joins by default, so
+// a broadcast reaches the whole namespace without anyone configuring anything.
+//
+// Named for its scope rather than its size. It was "all", which reads as
+// "everyone" and means "everyone in this namespace" -- and since almost nobody
+// runs more than one namespace, the two were the same set in practice and the
+// name taught the wrong lesson about which room was which. Nothing is called
+// "all" now, so nothing claims to be everyone while being something narrower.
+const PublicTopic = "namespace"
 
 // GlobalPrefix marks a topic that lives outside every namespace, so `@ops` is
 // one log the whole machine shares while `ops` is one log per namespace.
@@ -26,17 +33,217 @@ const PublicTopic = "all"
 const GlobalPrefix = "@"
 
 // GlobalPublicTopic is the machine-wide mailbox. Every session subscribes to it
-// as well as to its own namespace's `all`: this is the one place isolation is
+// as well as to its own namespace's, and this is the one place isolation is
 // deliberately not absolute, because a broadcast meant for everyone on the
-// machine has to reach everyone on the machine. `pigeon unsubscribe @all`
+// machine has to reach everyone on the machine. `pigeon unsubscribe @global`
 // opts out.
-const GlobalPublicTopic = GlobalPrefix + PublicTopic
+//
+// Deliberately not GlobalPrefix + PublicTopic. They were one string with a
+// prefix, which made the pair look like two spellings of one room rather than
+// the two different logs they are.
+const GlobalPublicTopic = GlobalPrefix + "global"
+
+// CheckoutTopicAlias is what a session calls its own checkout's room without
+// having to know its name.
+//
+// The room itself is named after the repository, which is what makes it useful
+// to everyone else: a peer reading the log later can see which checkout it
+// belonged to. But that leaves a session unable to name its own room without
+// looking it up first, and leaves every document unable to name it at all --
+// so the tier that carries most of the traffic was the only one with no word
+// for it. This is that word. It resolves to the real name before anything is
+// written, so nothing downstream ever sees the alias.
+const CheckoutTopicAlias = "here"
+
+// ResolveTopicAlias expands CheckoutTopicAlias against a working directory,
+// and passes everything else through untouched.
+//
+// Resolved at the edges -- the CLI and the MCP server -- rather than inside
+// ParseTopicRef, because a topic name is also read back from places with no
+// session and no cwd behind them: a subscription list, a cursor key, a prune
+// pass walking log files. Only a live caller has a "here" to mean.
+func ResolveTopicAlias(topic, cwd string) (string, error) {
+	if !strings.EqualFold(strings.TrimSpace(topic), CheckoutTopicAlias) {
+		return topic, nil
+	}
+	// A private checkout has no room to name. The room's name IS the directory
+	// basename, which is the one thing `private` exists to keep off the bus --
+	// defaultSubscriptions already refuses to join it for that reason, in a
+	// comment that spells the hazard out. Resolving the alias walks straight
+	// back in through the other door: publishing creates the topic, hanging the
+	// hidden directory's name in `list_topics` for the whole namespace, and
+	// subscribing writes it into an entry every peer reads, where WriteEntry
+	// does not blank it. The publish tool description now steers a session
+	// toward `here` first, so this is the likely route into the room rather
+	// than an exotic one.
+	//
+	// Refused out loud rather than quietly resolved to the wider room: a
+	// session that typed `here` wants the narrow one, and silently broadcasting
+	// to everybody instead is the exact failure the checkout room was added to
+	// end. A private NAMESPACE is untouched -- its topics are namespace-local,
+	// so the room is safe there, and it is the per-project flag that opts out.
+	if cfg, _, err := LoadProjectConfig(cwd); err == nil && cfg != nil && cfg.Private {
+		return "", fmt.Errorf("this checkout is private, so `here` has no room to name: " +
+			"the room is named after the directory, which is what private keeps off the bus -- " +
+			"name a topic explicitly instead")
+	}
+	if t := CheckoutTopic(cwd); t != "" {
+		return t, nil
+	}
+	// Outside a checkout there is no room to mean, so leave it alone and let
+	// the caller fail on a topic literally named "here" rather than silently
+	// widening to something else.
+	return topic, nil
+}
 
 var topicRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+
+// forMaxEntries caps how many names a topic message's For may list. Eight is
+// generous for "the people who should act on this" and stingy for "the
+// people I am cc-ing", which is the distinction For exists to force.
+const forMaxEntries = 8
+
+// forNameLimit caps each For entry, in runes. Names are addresses (see
+// ValidName), which top out at 32; 64 leaves room for a name typed slightly
+// wrong without inviting a paragraph in what is meant to be a short list.
+const forNameLimit = 64
+
+// validateFor sanitises and bounds a topic message's For list the same way
+// validateBounded does for subject/brief: rejected outright rather than
+// silently trimmed or dropped, so a sender can trust that what was typed is
+// what was stored. Empties are dropped rather than rejected -- a stray blank
+// in a list is noise, not a claim about a recipient -- and the result is
+// deduplicated case-insensitively so "alice" and "Alice" cost one slot, not
+// two.
+func validateFor(names []string) ([]string, error) {
+	seen := map[string]bool{}
+	var out []string
+	for _, raw := range names {
+		v := strings.TrimSpace(Sanitize(raw))
+		if v == "" {
+			continue
+		}
+		if n := len([]rune(v)); n > forNameLimit {
+			return nil, fmt.Errorf("for entry %q is %d runes; the limit is %d", v, n, forNameLimit)
+		}
+		key := strings.ToLower(v)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, v)
+	}
+	if len(out) > forMaxEntries {
+		return nil, fmt.Errorf("for names %d sessions; the limit is %d", len(out), forMaxEntries)
+	}
+	return out, nil
+}
 
 // inboxCursorKey tracks how far the direct spool has been read. It is not a
 // valid topic name, so it can never collide with one.
 const inboxCursorKey = ":inbox"
+
+// --- consumption cursors -----------------------------------------------------
+//
+// cursors/<session>.json holds two families under one map. The bare key
+// (inboxCursorKey or a topic's TopicRef.String()) is the MONITOR's ingest
+// cursor: how far followSource has read as it decides what to notify. The
+// "read:" / "readat:" keys below are the SESSION's consumption cursor: how far
+// ReadInbox has actually handed back to a pull. They are advanced by different
+// code paths and must never be conflated -- a pull silently marking a message
+// as notified, or a notification silently marking it as pulled, both defeat
+// the other path's bookkeeping.
+//
+// A topic name can never contain ":" (ValidTopic), and inboxCursorKey already
+// leans on that same fact, so "read:" + any valid monitor-cursor key can never
+// collide with a bare monitor-cursor key, nor with another source's "read:"
+// key.
+
+const readCursorPrefix = "read:"
+const readAtCursorPrefix = "readat:"
+
+// readCursorKey and readAtCursorKey name a source's consumption cursor and the
+// unix-seconds timestamp it last advanced. source is the same key the
+// monitor's own cursor is filed under: inboxCursorKey for the direct spool
+// (giving "read::inbox" / "readat::inbox"), or a TopicRef's String() for a
+// topic.
+func readCursorKey(source string) string   { return readCursorPrefix + source }
+func readAtCursorKey(source string) string { return readAtCursorPrefix + source }
+
+// maxUnreadAge bounds how long a consumption cursor can hold a topic log's
+// compaction back. Without a bound, a session that pulls once and then idles --
+// or never comes back -- would pin the log open forever, which is worse than
+// the message loss the cursor exists to prevent. It is refreshed only by a real
+// consuming pull, never by a peek, so it measures reading rather than looking.
+const maxUnreadAge = 6 * time.Hour
+
+// effectiveOffset is the position pruneTopicDir treats one subscriber as
+// having reached, for the purpose of a compaction cut.
+//
+// It prefers the session's *consumption* cursor (what ReadInbox has actually
+// handed back) over its *monitor* cursor (what followSource has merely
+// ingested), because compaction must never cut past a message the session was
+// notified of but has not yet pulled. It falls back to the monitor cursor,
+// and reports abandoned=true, in exactly two cases:
+//
+//   - the consumption cursor does not exist at all. readCursors returns a
+//     plain map, so a missing key would otherwise read back as 0 -- and on
+//     the day this shipped, no session anywhere has a consumption cursor.
+//     Using that 0 as a real position would collapse `slowest` to 0 for every
+//     topic and stop compaction fleet-wide, forever. This is the "naive fix"
+//     the design explicitly forbids, so the zero-value read is guarded by the
+//     presence check below rather than trusted.
+//   - the consumption cursor is present but abandoned: too far behind the
+//     monitor cursor, or too old, or has a missing/zero readat alongside a
+//     present read cursor (which reads the same as "too old").
+//
+// abandoned is false when the fallback is simply "no consumption cursor
+// exists yet" -- that is the expected, unremarkable state for the entire
+// fleet on day one, not something worth counting as a problem.
+func effectiveOffset(cursors map[string]int64, topic string, now time.Time) (off int64, state cursorState) {
+	monitorOff := cursors[topic]
+	roff, ok := cursors[readCursorKey(topic)]
+	if !ok {
+		return monitorOff, cursorAbsent
+	}
+	rat, hasAt := cursors[readAtCursorKey(topic)]
+	if !hasAt || rat <= 0 {
+		// Seeded by Subscribe but never advanced by a pull. This session takes
+		// notifications and does not use the pull path, so protecting its
+		// position would hold the log open for nothing.
+		return monitorOff, cursorNeverPulled
+	}
+	if now.Sub(time.Unix(rat, 0)) > maxUnreadAge {
+		return monitorOff, cursorStale
+	}
+	// Deliberately NOT bounded by how far behind the monitor this is.
+	//
+	// An earlier version cut once the gap passed a byte threshold, checked
+	// before the timestamp, and that destroyed exactly the case the cursor
+	// exists for: a session pulls at 11:58, a peer publishes a megabyte and a
+	// half at 12:00, prune runs at 12:01 and cuts the whole burst away before
+	// the session -- which is awake and reading on time -- ever asks for it.
+	// "Abandoned" has to mean "nobody is coming back", not "the burst was big".
+	// A session that keeps pulling keeps its cursor moving, so the gap closes
+	// on its own; one that stops pulling stops refreshing readat and ages out
+	// within maxUnreadAge. Peeking does not refresh it, so only real
+	// consumption counts as being alive.
+	return roff, cursorFresh
+}
+
+// cursorState says why pruneTopicDir used the offset it did, so the prune
+// result can report the one case worth reporting: a session that pulled, then
+// stopped, and is now holding a log open. A cursor that was never seeded, or
+// seeded and never used, is the unremarkable state of most of the fleet and is
+// not worth counting as a problem.
+type cursorState int
+
+const (
+	cursorFresh cursorState = iota
+	cursorAbsent
+	cursorNeverPulled
+	cursorStale
+)
 
 // ValidTopic keeps topic names safe as filenames and readable in a
 // notification line. It validates the bare name; the global prefix is stripped
@@ -56,13 +263,31 @@ type TopicRef struct {
 	Global bool
 }
 
+// DisplayPrefix is what TopicLabel prints in front of a namespaced topic. It is
+// decoration, not part of the name: the stored name, the subscription entry,
+// the cursor key and the log filename are all bare.
+//
+// It is accepted on input all the same, because the asymmetry with GlobalPrefix
+// was a trap. Every notification says "#chat", `pigeon topics` says "#chat",
+// and typing "#chat" back failed validation, since "#" is not in the charset a
+// name may use. Output that is not valid input only ever bites whoever copies
+// what they were shown, which is exactly what an agent does.
+const DisplayPrefix = "#"
+
 // ParseTopicRef validates a topic as typed.
 func ParseTopicRef(s string) (TopicRef, error) {
 	s = strings.TrimSpace(s)
-	ref := TopicRef{Name: s}
 	if rest, ok := strings.CutPrefix(s, GlobalPrefix); ok {
-		ref = TopicRef{Name: rest, Global: true}
+		ref := TopicRef{Name: rest, Global: true}
+		if err := ValidTopic(ref.Name); err != nil {
+			return TopicRef{}, err
+		}
+		return ref, nil
 	}
+	// Stripped only here, in the namespaced branch, so "#@ops" stays invalid
+	// rather than quietly resolving to the global log: one canonical way to
+	// name each tree, plus the decoration this one is printed with.
+	ref := TopicRef{Name: strings.TrimPrefix(s, DisplayPrefix)}
 	if err := ValidTopic(ref.Name); err != nil {
 		return TopicRef{}, err
 	}
@@ -87,7 +312,7 @@ func TopicLabel(topic string) string {
 	if strings.HasPrefix(topic, GlobalPrefix) {
 		return topic
 	}
-	return "#" + topic
+	return DisplayPrefix + topic
 }
 
 func (r TopicRef) path(n Namespace) string {
@@ -136,11 +361,11 @@ func (n Namespace) cursorPath(sessionID string) string {
 // Publish appends a message to a topic log. Every subscriber's monitor picks
 // it up independently; there is no fan-out at write time, which keeps
 // publishing O(1) regardless of how many sessions are listening.
-func Publish(topic, text string, from Sender) (*Message, error) {
-	return CurrentNamespace().Publish(topic, text, from)
+func Publish(topic string, d Draft, from Sender) (*Message, error) {
+	return CurrentNamespace().Publish(topic, d, from)
 }
 
-func (n Namespace) Publish(topic, text string, from Sender) (*Message, error) {
+func (n Namespace) Publish(topic string, d Draft, from Sender) (*Message, error) {
 	ref, err := ParseTopicRef(topic)
 	if err != nil {
 		return nil, err
@@ -155,23 +380,80 @@ func (n Namespace) Publish(topic, text string, from Sender) (*Message, error) {
 	if err := n.EnsureDirs(); err != nil {
 		return nil, err
 	}
-	body := Sanitize(text)
+	body := Sanitize(d.Text)
 	if body == "" {
 		return nil, fmt.Errorf("refusing to publish an empty message")
 	}
+	subject, err := validateSubject(d.Subject)
+	if err != nil {
+		return nil, err
+	}
+	brief, err := validateBrief(d.Brief)
+	if err != nil {
+		return nil, err
+	}
+	if err := validatePriority(d.Priority); err != nil {
+		return nil, err
+	}
+	for_, err := validateFor(d.For)
+	if err != nil {
+		return nil, err
+	}
+	id := newMessageID()
+	supersedes, err := validateSupersedes(d.Supersedes, id)
+	if err != nil {
+		return nil, err
+	}
+	askID, err := validateAskID(d.AskID)
+	if err != nil {
+		return nil, err
+	}
+	replyTo, err := validateReplyTo(d.ReplyTo, id)
+	if err != nil {
+		return nil, err
+	}
 
 	msg := &Message{
-		ID:    newMessageID(),
-		TS:    nowRFC3339(),
-		From:  from,
-		Topic: ref.String(),
-		Text:  body,
+		ID:       id,
+		TS:       nowRFC3339(),
+		From:     from,
+		Topic:    ref.String(),
+		Text:     body,
+		Subject:  subject,
+		Brief:    brief,
+		Priority: d.Priority,
+		AskID:    askID,
+		// Stored as the sender typed it, not resolved to a session id here.
+		// A name is only unique among sessions live *right now*; the same
+		// name read back later -- a catch-up pull, a --all browse, another
+		// subscriber's monitor a minute from now -- can by then belong to a
+		// different session, or to nobody at all. Resolving early would bake
+		// in whichever session happened to answer to the name at publish
+		// time and silently misattribute the marker forever after. Matching
+		// the typed name against each reader at the moment they look (see
+		// Message.IsFor) is the only version of this that stays honest as
+		// the set of live sessions changes underneath the log.
+		For:        for_,
+		Supersedes: supersedes,
+		ReplyTo:    replyTo,
+	}
+	// See Send's comment on Thread: Publish has the same draft-only view, so
+	// this is the same one-hop-short approximation, not a resolved root id.
+	if replyTo != "" {
+		msg.Thread = replyTo
 	}
 	if len([]rune(body)) > BodyBudget {
 		p := filepath.Join(ref.payloadsDir(n), msg.ID+".txt")
-		if err := os.WriteFile(p, []byte(text), 0o600); err == nil {
+		if err := os.WriteFile(p, []byte(d.Text), 0o600); err == nil {
 			msg.Payload = p
 		}
+	}
+	if len(d.Attach) > 0 {
+		stored, err := attachFiles(ref.payloadsDir(n), msg.ID, d.Attach)
+		if err != nil {
+			return nil, err
+		}
+		msg.Attach = stored
 	}
 
 	line, err := json.Marshal(msg)
@@ -199,20 +481,37 @@ func (n Namespace) Publish(topic, text string, from Sender) (*Message, error) {
 // Subscribe adds a topic to a session's subscription list. The running monitor
 // notices within about a second and starts following it -- no restart.
 func Subscribe(sessionID, topic string) error {
-	return CurrentNamespace().Subscribe(sessionID, topic)
+	_, err := SubscribeCatchup(sessionID, topic, "")
+	return err
 }
 
 func (n Namespace) Subscribe(sessionID, topic string) error {
+	_, err := n.SubscribeCatchup(sessionID, topic, "")
+	return err
+}
+
+// SubscribeCatchup is Subscribe with an optional catch-up window. catchup is
+// "" for none, a count ("20", the last N messages) or a Go duration ("30m",
+// everything published within that long); see seedCursor for exactly what it
+// plants. It returns how many messages the window currently holds, so a
+// caller can report it in the same breath as the subscribe confirmation.
+func SubscribeCatchup(sessionID, topic, catchup string) (int, error) {
+	return CurrentNamespace().SubscribeCatchup(sessionID, topic, catchup)
+}
+
+func (n Namespace) SubscribeCatchup(sessionID, topic, catchup string) (int, error) {
 	ref, err := ParseTopicRef(topic)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	// Start at the end so subscribing does not replay the topic's history
-	// into the session as a burst of notifications.
-	if err := n.seedCursor(sessionID, ref); err != nil {
-		return err
+	// Start at the end so subscribing does not replay the topic's history as a
+	// burst of notifications; catchup, if given, only ever moves the separate
+	// consumption cursor further back (see seedCursor).
+	waiting, err := n.seedCursor(sessionID, ref, catchup)
+	if err != nil {
+		return 0, err
 	}
-	return n.MutateEntry(sessionID, func(e *Entry) error {
+	err = n.MutateEntry(sessionID, func(e *Entry) error {
 		for _, t := range e.Subscriptions {
 			if t == ref.String() {
 				return nil
@@ -222,6 +521,22 @@ func (n Namespace) Subscribe(sessionID, topic string) error {
 		sort.Strings(e.Subscriptions)
 		return nil
 	})
+	return waiting, err
+}
+
+// CatchupNote renders how many messages a catch-up window found, in the one
+// phrasing `pigeon subscribe --catchup` and the subscribe MCP tool both use,
+// so the confirmation itself says something is waiting rather than leaving
+// that to be discovered on the next inbox pull.
+func CatchupNote(waiting int, spec string) string {
+	noun, verb := "messages", "are"
+	if waiting == 1 {
+		noun, verb = "message", "is"
+	}
+	if n, err := strconv.Atoi(spec); err == nil {
+		return fmt.Sprintf(" %d of the last %d %s %s waiting in your inbox.", waiting, n, noun, verb)
+	}
+	return fmt.Sprintf(" %d %s from the last %s %s waiting in your inbox.", waiting, noun, spec, verb)
 }
 
 func Unsubscribe(sessionID, topic string) error {
@@ -241,6 +556,60 @@ func (n Namespace) Unsubscribe(sessionID, topic string) error {
 			}
 		}
 		e.Subscriptions = out
+		return nil
+	})
+}
+
+// Delivery modes a topic may be set to (see Entry.Delivery). There is no mode
+// for the direct spool: see the comment on Entry.Delivery for why.
+const (
+	DeliveryPush   = "push"   // notify immediately, one line per message
+	DeliveryDigest = "digest" // collapse routine messages into one line a minute
+	DeliveryQuiet  = "quiet"  // never notify a message directly, only the digest line
+)
+
+// validDeliveryMode rejects anything but the three values Entry.Delivery may
+// hold for a topic, the same defence-in-depth as validatePriority: an entry is
+// a file on disk and can be hand-edited, so a stored value is never trusted
+// without being checked again wherever it is read.
+func validDeliveryMode(mode string) error {
+	switch mode {
+	case DeliveryPush, DeliveryDigest, DeliveryQuiet:
+		return nil
+	}
+	return fmt.Errorf("delivery mode %q is not valid; use %q, %q or %q", mode, DeliveryPush, DeliveryDigest, DeliveryQuiet)
+}
+
+// SetDelivery changes how topic reaches sessionID. RunMonitor reads the
+// entry fresh for every message it delivers (see its deliver closure), so
+// this takes effect at least as fast as a subscribe or unsubscribe does --
+// well within subCheckInterval -- without a restart.
+func SetDelivery(sessionID, topic, mode string) error {
+	return CurrentNamespace().SetDelivery(sessionID, topic, mode)
+}
+
+func (n Namespace) SetDelivery(sessionID, topic, mode string) error {
+	ref, err := ParseTopicRef(topic)
+	if err != nil {
+		return err
+	}
+	if err := validDeliveryMode(mode); err != nil {
+		return err
+	}
+	return n.MutateEntry(sessionID, func(e *Entry) error {
+		// Push is the default and the absent case reads the same way, so
+		// setting it back to push removes the key rather than storing it
+		// explicitly. Otherwise a session that has never touched delivery
+		// modes at all and one that dialled every topic back to push would
+		// look different on disk for no behavioural reason.
+		if mode == DeliveryPush {
+			delete(e.Delivery, ref.String())
+			return nil
+		}
+		if e.Delivery == nil {
+			e.Delivery = map[string]string{}
+		}
+		e.Delivery[ref.String()] = mode
 		return nil
 	})
 }
@@ -373,16 +742,137 @@ func (n Namespace) mutateCursors(sessionID string, fn func(map[string]int64)) er
 // seedCursor starts a new subscription at the end of the log, so joining a
 // topic does not replay its history as a burst of notifications. The offset is
 // logical, so it stays correct across every later compaction.
-func (n Namespace) seedCursor(sessionID string, ref TopicRef) error {
+//
+// catchup optionally plants the CONSUMPTION cursor further back than the log's
+// end -- see catchupWindow for what a count or a duration spec resolves to.
+// The MONITOR cursor above is seeded at the end regardless, catchup or not:
+// this is the one place the two cursor families this file's comment block
+// describes could be conflated by mistake, and doing so would turn "let me
+// see what I missed" into a burst of notifications for history nobody asked
+// to be pushed. Catch-up fills the inbox; it never touches what the monitor
+// pushes.
+//
+// It returns how many messages the requested window currently holds (0 when
+// catchup is ""), so a caller can report it alongside the subscribe
+// confirmation.
+func (n Namespace) seedCursor(sessionID string, ref TopicRef, catchup string) (int, error) {
 	path := ref.path(n)
 	var size int64
 	if fi, err := os.Stat(path); err == nil {
 		size = fi.Size()
 	}
-	end := readBase(path) + size
-	return n.mutateCursors(sessionID, func(m map[string]int64) {
-		m[ref.String()] = end
+	base := readBase(path)
+	end := base + size
+
+	readStart, waiting := end, 0
+	if catchup != "" {
+		start, count, err := catchupWindow(path, base, end, catchup)
+		if err != nil {
+			return 0, err
+		}
+		readStart, waiting = start, count
+	}
+
+	// Catch-up only applies to a topic this session has never read. seedCursor
+	// deliberately never moves an existing cursor, so counting a window that
+	// was not planted would report "20 messages are waiting" to a session whose
+	// inbox will show none -- reachable simply by subscribing twice, or by
+	// unsubscribing and coming back, since Unsubscribe leaves cursors behind.
+	if catchup != "" {
+		if _, seen := n.readCursors(sessionID)[readCursorKey(ref.String())]; seen {
+			readStart, waiting = end, 0
+			catchup = ""
+		}
+	}
+
+	err := n.mutateCursors(sessionID, func(m map[string]int64) {
+		// Only ever seed. Subscribe is not guarded against being called for a
+		// topic this session already follows, and re-seeding to the end there
+		// would skip whatever arrived since -- silently, and for a deaf session
+		// that means dropping mail already queued on the log.
+		if _, seen := m[ref.String()]; !seen {
+			m[ref.String()] = end
+		}
+		// Seed the consumption cursor, and only here. Absent a catch-up
+		// request this lands at the same place as the monitor cursor above;
+		// with one, it lands wherever catchupWindow says the window starts.
+		//
+		// It cannot be left absent to fall back on the monitor's cursor at read
+		// time, because the monitor advances its own within about 200ms of a
+		// message landing -- long before any session gets round to asking for
+		// it. A consumption cursor that chased it would find everything already
+		// behind it and ReadInbox would answer "nothing unread" forever, which
+		// is the whole feature rendered inert.
+		//
+		// Seeded together and then left alone, the two say different true
+		// things: the monitor's is how far notifications have got, and this one
+		// is how far the session has actually read (or, for a catch-up window,
+		// how far back it has asked to see).
+		if _, seen := m[readCursorKey(ref.String())]; !seen {
+			m[readCursorKey(ref.String())] = readStart
+		}
+		// readat is deliberately NOT set here, catch-up or not. It is written
+		// only when ReadInbox actually advances this cursor, so its absence
+		// means "this session has never pulled" -- and compaction treats a
+		// never-pulled cursor as abandoned rather than letting every session
+		// that only ever takes notifications hold its topic logs open for the
+		// staleness window. A catch-up window plants where a pull would start;
+		// it is not itself a pull, so it must not look like one to prune.
 	})
+	return waiting, err
+}
+
+// catchupWindow works out where a subscribe's consumption cursor should be
+// planted for a requested catch-up window, and how many messages currently sit
+// in it. spec is either a plain positive integer ("20", the last N messages)
+// or a Go duration ("30m", everything published within that long). Anything
+// else is rejected outright, the same as every other bounded field in this
+// package: silently falling back to no catch-up would leave a caller believing
+// history was replayed when it was not.
+func catchupWindow(path string, base, end int64, spec string) (start int64, waiting int, err error) {
+	msgs, err := readSourceFrom(path, base)
+	if err != nil {
+		return end, 0, err
+	}
+	if count, cerr := strconv.Atoi(spec); cerr == nil {
+		if count <= 0 {
+			return end, 0, fmt.Errorf("catchup count must be positive, got %d", count)
+		}
+		if count >= len(msgs) {
+			return base, len(msgs), nil
+		}
+		// The offset just past the (len-count)'th message -- i.e. just before
+		// the last `count` messages start.
+		return msgs[len(msgs)-count-1].end, count, nil
+	}
+	d, derr := time.ParseDuration(spec)
+	if derr != nil {
+		return end, 0, fmt.Errorf("catchup %q is neither a count (e.g. \"20\") nor a duration (e.g. \"30m\")", spec)
+	}
+	if d <= 0 {
+		return end, 0, fmt.Errorf("catchup duration must be positive, got %s", d)
+	}
+	cutoff := time.Now().Add(-d)
+	idx := len(msgs) // first message inside the window; len(msgs) means none is
+	for i, pm := range msgs {
+		ts, terr := time.Parse(time.RFC3339, pm.msg.TS)
+		if terr != nil {
+			// A hand-written or corrupt timestamp: skip it rather than let it
+			// decide the window boundary on nothing.
+			continue
+		}
+		if !ts.Before(cutoff) {
+			idx = i
+			break
+		}
+	}
+	if idx == len(msgs) {
+		return end, 0, nil
+	}
+	if idx == 0 {
+		return base, len(msgs), nil
+	}
+	return msgs[idx-1].end, len(msgs) - idx, nil
 }
 
 // ListTopics reports every topic reachable from this namespace -- its own logs
@@ -470,32 +960,73 @@ func allSessions() []*Entry {
 	return kept
 }
 
-// SubscriberCount reports how many live sessions besides exceptSessionID would
-// receive a publish to this topic.
-func (n Namespace) SubscriberCount(topic, exceptSessionID string) int {
-	ref, err := ParseTopicRef(topic)
-	if err != nil {
-		return 0
-	}
+// matchingSubscribers returns every entry, besides exceptSessionID, that
+// subscribes to ref. It is the one place that walks the subscriber list, so
+// SubscriberCount and SubscriberBreakdown cannot drift on what counts as
+// "subscribed" -- only on what they do with the entries once found.
+func (n Namespace) matchingSubscribers(ref TopicRef, exceptSessionID string) []*Entry {
 	entries := []*Entry{}
 	if ref.Global {
 		entries = allSessions()
 	} else if got, err := n.ListSessions(false, false); err == nil {
 		entries = got
 	}
-	count := 0
+	var matched []*Entry
 	for _, e := range entries {
 		if e.SessionID == exceptSessionID {
 			continue
 		}
 		for _, t := range e.Subscriptions {
 			if t == ref.String() {
-				count++
+				matched = append(matched, e)
 				break
 			}
 		}
 	}
+	return matched
+}
+
+// SubscriberCount reports how many live sessions besides exceptSessionID would
+// receive a publish to this topic. A deaf one does not count here: its spool
+// still gets the message, but nothing is reading that spool, so it is not part
+// of the number a publisher checks to decide whether a topic is worth writing
+// to right now.
+func (n Namespace) SubscriberCount(topic, exceptSessionID string) int {
+	ref, err := ParseTopicRef(topic)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, e := range n.matchingSubscribers(ref, exceptSessionID) {
+		if e.Status == StatusLive {
+			count++
+		}
+	}
 	return count
+}
+
+// SubscriberBreakdown counts a topic's subscribers by whether they can
+// actually receive. A deaf session is not gone: its spool keeps every message
+// published while it stayed deaf, complete and in order. But nothing reads
+// that spool until the same session id comes back under `claude --resume`,
+// which might be in a minute or might be never -- so folding deaf in with live
+// tells a publisher "reached" about a session that has not actually seen
+// anything yet. Separating the two lets a claim or a question be judged by who
+// is really listening, not by who merely subscribed at some point.
+func (n Namespace) SubscriberBreakdown(topic, exceptSessionID string) (live, deaf int) {
+	ref, err := ParseTopicRef(topic)
+	if err != nil {
+		return 0, 0
+	}
+	for _, e := range n.matchingSubscribers(ref, exceptSessionID) {
+		switch e.Status {
+		case StatusLive:
+			live++
+		case StatusDeaf:
+			deaf++
+		}
+	}
+	return live, deaf
 }
 
 // TopicInfo is one row of `pigeon topics`.
@@ -520,6 +1051,17 @@ type PruneResult struct {
 	TopicsCompacted int
 	PayloadsRemoved int
 	BytesReclaimed  int64
+	// AbandonedCursors counts subscribers whose consumption cursor
+	// (read:<topic>, advanced by ReadInbox) was present but stale enough --
+	// by byte distance or by age -- that a compaction pass fell back to their
+	// monitor cursor instead of waiting on it forever. pruneTopicDir has no
+	// logger to report through, so this count is that report: a caller that
+	// wants to know who was abandoned can compare a session's own cursors
+	// before and after.
+	AbandonedCursors int
+	// AsksRemoved counts ask records (and their answer logs) whose deadline
+	// passed more than askRetention ago -- see PruneAsks.
+	AsksRemoved int
 }
 
 // Add folds one pass into another, so a caller sweeping several namespaces
@@ -529,6 +1071,8 @@ func (r *PruneResult) Add(o PruneResult) {
 	r.TopicsCompacted += o.TopicsCompacted
 	r.PayloadsRemoved += o.PayloadsRemoved
 	r.BytesReclaimed += o.BytesReclaimed
+	r.AbandonedCursors += o.AbandonedCursors
+	r.AsksRemoved += o.AsksRemoved
 }
 
 // PruneTopics reclaims space in this namespace's topic logs.
@@ -656,8 +1200,14 @@ func pruneTopicDir(dir string, global bool, subscribers func(TopicRef) []*Entry,
 		base := readBase(p)
 		logicalEnd := base + fi.Size()
 		slowest := logicalEnd
+		now := time.Now()
 		for _, e := range subs {
-			if off := cursorNS(e).readCursors(e.SessionID)[ref.String()]; off < slowest {
+			cursors := cursorNS(e).readCursors(e.SessionID)
+			off, state := effectiveOffset(cursors, ref.String(), now)
+			if state == cursorStale {
+				res.AbandonedCursors++
+			}
+			if off < slowest {
 				slowest = off
 			}
 		}

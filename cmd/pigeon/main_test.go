@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -279,6 +280,89 @@ func TestSendSpillsLongBodyToAPayloadFile(t *testing.T) {
 	wantContains(t, r, "stdout", "full text at")
 }
 
+// --reply-to threads a reply, and `pigeon thread` walks it back.
+func TestSendReplyToAndThreadCommand(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+	register(t, "bbbb2222-0000-0000-0000-000000000000", "beta")
+
+	r := invoke(t, "send", "beta", "kicking off the release")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	spool, err := os.ReadFile(pigeon.SpoolPath("bbbb2222-0000-0000-0000-000000000000"))
+	if err != nil {
+		t.Fatalf("read spool: %v", err)
+	}
+	var rootID string
+	if i := strings.Index(string(spool), `"id":"`); i >= 0 {
+		rest := string(spool)[i+len(`"id":"`):]
+		rootID = rest[:strings.IndexByte(rest, '"')]
+	}
+	if rootID == "" {
+		t.Fatalf("could not find the root message id in the spool: %s", spool)
+	}
+
+	r = invoke(t, "send", "--reply-to", rootID, "beta", "sounds good")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+
+	// Both messages landed on beta's spool, not alpha's -- `pigeon thread`
+	// reads from the caller's own logs, so read it back as beta.
+	t.Setenv(pigeon.EnvSessionID, "bbbb2222-0000-0000-0000-000000000000")
+	r = invoke(t, "thread", rootID)
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", "kicking off the release")
+	wantContains(t, r, "stdout", "sounds good")
+}
+
+// --attach copies the file and reports the count; the CLI must not silently
+// drop an attachment that exceeds the limits.
+func TestSendAttachCopiesFileAndRejectsTooMany(t *testing.T) {
+	withHome(t)
+	register(t, "bbbb2222-0000-0000-0000-000000000000", "beta")
+	dir := t.TempDir()
+	f := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(f, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	r := invoke(t, "send", "--attach", f, "beta", "see attached")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", "attached 1 file(s)")
+
+	args := []string{"send"}
+	for i := 0; i < 6; i++ {
+		args = append(args, "--attach", f)
+	}
+	args = append(args, "beta", "too many")
+	if r := invoke(t, args...); r.code == 0 {
+		t.Errorf("send with 6 attachments should have been rejected: %s", r)
+	}
+}
+
+// --catchup plants a window into the inbox and the confirmation says so.
+func TestSubscribeCatchupReportsWhatIsWaiting(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+	for i := 0; i < 3; i++ {
+		if _, err := pigeon.Publish("deploys", pigeon.Draft{Text: strings.Repeat("x", 1)}, pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+	}
+	r := invoke(t, "subscribe", "--catchup", "2", "deploys")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", "subscribed to #deploys")
+	wantContains(t, r, "stdout", "2 of the last 2 messages")
+}
+
 func TestPublishReportsSubscriberCountExcludingSelf(t *testing.T) {
 	withHome(t)
 	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
@@ -291,7 +375,11 @@ func TestPublishReportsSubscriberCountExcludingSelf(t *testing.T) {
 	}
 
 	r := invoke(t, "publish", "deploys", "shipping in 5")
-	wantContains(t, r, "stdout", "published to #deploys (1 subscriber(s) besides you)")
+	// beta is deaf (register holds no monitor lock), so it is not counted as
+	// live -- but it must still show up as one deaf subscriber, not two: self
+	// (also deaf, also subscribed) has to stay excluded from that count too.
+	wantContains(t, r, "stdout", "published to #deploys (0 subscriber(s) besides you)")
+	wantContains(t, r, "stdout", "NOTE: 1 subscriber(s) are deaf")
 }
 
 func TestPublishRequiresTopicAndText(t *testing.T) {
@@ -346,6 +434,49 @@ func TestSubscribeTakesExactlyOneTopic(t *testing.T) {
 			t.Errorf("%v: %s", args, r)
 		}
 	}
+}
+
+// --- delivery ----------------------------------------------------------------
+
+func TestDeliverySetsAndListsNonDefaultModes(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+
+	r := invoke(t, "delivery")
+	wantContains(t, r, "stdout", "every topic is push")
+
+	if r := invoke(t, "delivery", "deploys", "digest"); r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	e, err := pigeon.ReadEntry("aaaa1111-0000-0000-0000-000000000000")
+	if err != nil {
+		t.Fatalf("ReadEntry: %v", err)
+	}
+	if e.Delivery["deploys"] != pigeon.DeliveryDigest {
+		t.Errorf("Delivery[deploys] = %q, want %q", e.Delivery["deploys"], pigeon.DeliveryDigest)
+	}
+
+	r = invoke(t, "delivery")
+	wantContains(t, r, "stdout", "#deploys")
+	wantContains(t, r, "stdout", "digest")
+
+	// Setting it back to push removes the entry rather than storing the
+	// default explicitly (see Namespace.SetDelivery).
+	if r := invoke(t, "delivery", "deploys", "push"); r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	r = invoke(t, "delivery")
+	wantContains(t, r, "stdout", "every topic is push")
+}
+
+func TestDeliveryRejectsAnInvalidMode(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+	r := invoke(t, "delivery", "deploys", "bogus")
+	if r.code != 1 {
+		t.Errorf("exit = %d, want 1\n%s", r.code, r)
+	}
+	wantContains(t, r, "stderr", "not valid")
 }
 
 // --- identity --------------------------------------------------------------
@@ -704,12 +835,14 @@ func TestPublishToAGlobalTopic(t *testing.T) {
 	}
 
 	// The subscriber is in another namespace, which is the whole point of "@".
+	// registerIn leaves it deaf, so it is reported as deaf rather than live.
 	r := invoke(t, "publish", "@ops", "all hands")
-	wantContains(t, r, "stdout", "published to @ops (1 subscriber(s) besides you)")
+	wantContains(t, r, "stdout", "published to @ops (0 subscriber(s) besides you)")
+	wantContains(t, r, "stdout", "NOTE: 1 subscriber(s) are deaf")
 
 	r = invoke(t, "topics")
 	wantContains(t, r, "stdout", "@ops")
-	wantContains(t, r, "stdout", "@all")
+	wantContains(t, r, "stdout", pigeon.GlobalPublicTopic)
 }
 
 func TestTopicsAcrossNamespaces(t *testing.T) {
@@ -723,7 +856,7 @@ func TestTopicsAcrossNamespaces(t *testing.T) {
 	if err := other.Subscribe(beta.SessionID, "secrets"); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
-	if _, err := other.Publish("@ops", "all hands", pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := other.Publish("@ops", pigeon.Draft{Text: "all hands"}, pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 
@@ -981,4 +1114,258 @@ func TestSendPublishRejectBadAs(t *testing.T) {
 	if r := invoke(t, "publish", "--as", "bad name", "all", "hi"); r.code == 0 {
 		t.Errorf("publish with a bad --as should fail: %s", r)
 	}
+}
+
+// A flag written after the topic is swallowed by Go's flag package as message
+// text. Silently dropping a subject the caller clearly meant to set is the
+// failure mode this guard exists to convert into an error.
+func TestPublishRejectsAFlagWrittenAfterThePositionalArgs(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := cmdPublish([]string{"testtopic", "--subject", "SHORT", "body"}, &out, &errOut)
+	if err == nil {
+		t.Fatal("expected an error for a misplaced --subject, got none")
+	}
+	if !strings.Contains(err.Error(), "came after a positional argument") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSendRejectsAFlagWrittenAfterThePositionalArgs(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := cmdSend([]string{"sometarget", "--as", "someone", "body"}, &out, &errOut)
+	if err == nil {
+		t.Fatal("expected an error for a misplaced --as, got none")
+	}
+	if !strings.Contains(err.Error(), "came after a positional argument") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// A body may legitimately begin with a dash; only names pigeon actually
+// defines are rejected.
+func TestPublishAllowsABodyThatLooksLikeAnUnknownFlag(t *testing.T) {
+	if err := misplacedFlag([]string{"--not-a-pigeon-flag", "text"}); err != nil {
+		t.Fatalf("unexpected rejection: %v", err)
+	}
+}
+
+// --for is subject to the same misplaced-flag trap as every other named flag:
+// written after the topic, Go's flag package files it away as message text.
+func TestPublishRejectsAForFlagWrittenAfterThePositionalArgs(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := cmdPublish([]string{"testtopic", "--for", "beta", "body"}, &out, &errOut)
+	if err == nil {
+		t.Fatal("expected an error for a misplaced --for, got none")
+	}
+	if !strings.Contains(err.Error(), "came after a positional argument") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// --for is repeatable, and every name given reaches the published message: a
+// recipient the message names sees the "-> you" marker when it pulls its
+// inbox.
+func TestPublishForFlagIsRepeatableAndReachesTheMessage(t *testing.T) {
+	withHome(t)
+	asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+	beta := register(t, "bbbb2222-0000-0000-0000-000000000000", "beta")
+	if err := pigeon.Subscribe(beta.SessionID, "deploys"); err != nil {
+		t.Fatal(err)
+	}
+
+	r := invoke(t, "publish", "--for", "beta", "--for", "gamma", "deploys", "ship it")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+
+	t.Setenv(pigeon.EnvSessionID, beta.SessionID)
+	ir := invoke(t, "inbox")
+	if ir.code != 0 {
+		t.Fatalf("%s", ir)
+	}
+	wantContains(t, ir, "stdout", "-> you")
+}
+
+// --supersedes is subject to the same misplaced-flag trap as every other
+// named flag: written after the target/topic, Go's flag package files it
+// away as message text.
+func TestSendRejectsASupersedesFlagWrittenAfterThePositionalArgs(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := cmdSend([]string{"sometarget", "--supersedes", "m_deadbeef1234", "body"}, &out, &errOut)
+	if err == nil {
+		t.Fatal("expected an error for a misplaced --supersedes, got none")
+	}
+	if !strings.Contains(err.Error(), "came after a positional argument") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestPublishRejectsASupersedesFlagWrittenAfterThePositionalArgs(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := cmdPublish([]string{"testtopic", "--supersedes", "m_deadbeef1234", "body"}, &out, &errOut)
+	if err == nil {
+		t.Fatal("expected an error for a misplaced --supersedes, got none")
+	}
+	if !strings.Contains(err.Error(), "came after a positional argument") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// --supersedes reaches the message the same way --subject or --for does:
+// given correctly placed, before the target, it lands on the sent message.
+func TestSendSupersedesFlagReachesTheMessage(t *testing.T) {
+	withHome(t)
+	const alphaID = "aaaa1111-0000-0000-0000-000000000000"
+	asSession(t, alphaID, "alpha")
+	beta := register(t, "bbbb2222-0000-0000-0000-000000000000", "beta")
+
+	original, err := pigeon.Send(beta, pigeon.Draft{Text: "the deploy is stuck"},
+		pigeon.Sender{Kind: "session", SessionID: alphaID, Name: "alpha"})
+	if err != nil {
+		t.Fatalf("Send (original): %v", err)
+	}
+
+	r := invoke(t, "send", "--supersedes", original.ID, "beta", "false alarm, it recovered")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+
+	items, _, err := pigeon.CurrentNamespace().ReadInbox(beta.SessionID, pigeon.InboxQuery{UnreadOnly: false, Limit: 10})
+	if err != nil {
+		t.Fatalf("ReadInbox: %v", err)
+	}
+	var got string
+	found := false
+	for _, it := range items {
+		if it.Message.Text == "false alarm, it recovered" {
+			got, found = it.Message.Supersedes, true
+		}
+	}
+	if !found {
+		t.Fatalf("the sent message was not found in the recipient's inbox: %v", items)
+	}
+	if got != original.ID {
+		t.Errorf("Supersedes = %q, want %q", got, original.ID)
+	}
+}
+
+// --- inbox -------------------------------------------------------------
+
+// The CLI twin of the MCP inbox tool renders the same full body text a
+// notification would have clipped, using the same shared RenderInbox path.
+func TestInboxRendersFullBodyAndSubject(t *testing.T) {
+	withHome(t)
+	me := asSession(t, "aaaa1111-0000-0000-0000-000000000000", "alpha")
+
+	long := strings.Repeat("x", pigeon.BodyBudget+50)
+	if _, err := pigeon.DefaultNamespace().Send(me, pigeon.Draft{Text: long, Subject: "big one"}, pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	r := invoke(t, "inbox")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", long)
+	wantContains(t, r, "stdout", "SUBJECT: big one")
+}
+
+// A topic message naming other sessions, but not this one, must render
+// exactly as it always has -- no marker for a session it does not name.
+func TestInboxOmitsTheYouMarkerWhenNotAddressed(t *testing.T) {
+	withHome(t)
+	me := asSession(t, "cccc3333-0000-0000-0000-000000000000", "gamma")
+	if err := pigeon.Subscribe(me.SessionID, "deploys"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pigeon.DefaultNamespace().Publish("deploys",
+		pigeon.Draft{Text: "roll it back", For: []string{"beta"}}, pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	r := invoke(t, "inbox")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	if strings.Contains(r.stdout, "-> you") {
+		t.Errorf("inbox showed the marker for a session the message does not name:\n%s", r.stdout)
+	}
+}
+
+// --peek must not advance the read cursor: a second, default call sees the
+// same message again.
+func TestInboxPeekLeavesMessagesUnread(t *testing.T) {
+	withHome(t)
+	me := asSession(t, "bbbb2222-0000-0000-0000-000000000000", "beta")
+	if _, err := pigeon.DefaultNamespace().Send(me, pigeon.Draft{Text: "hello"}, pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	r := invoke(t, "inbox", "--peek")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", "hello")
+
+	r2 := invoke(t, "inbox")
+	if r2.code != 0 {
+		t.Fatalf("%s", r2)
+	}
+	wantContains(t, r2, "stdout", "hello")
+}
+
+// --subjects prints the header and subject only, never the body.
+func TestInboxSubjectsFlagOmitsBody(t *testing.T) {
+	withHome(t)
+	me := asSession(t, "cccc3333-0000-0000-0000-000000000000", "gamma")
+	if _, err := pigeon.DefaultNamespace().Send(me, pigeon.Draft{Text: "the body text", Subject: "the subject"}, pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	r := invoke(t, "inbox", "--subjects")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", "SUBJECT: the subject")
+	if strings.Contains(r.stdout, "the body text") {
+		t.Errorf("--subjects leaked the body:\n%s", r)
+	}
+}
+
+// --all surfaces history already marked read, not only unread mail.
+func TestInboxAllShowsAlreadyReadHistory(t *testing.T) {
+	withHome(t)
+	me := asSession(t, "dddd4444-0000-0000-0000-000000000000", "delta")
+	if _, err := pigeon.DefaultNamespace().Send(me, pigeon.Draft{Text: "already seen"}, pigeon.Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+	if r := invoke(t, "inbox"); r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+
+	// Default (unread only) now finds nothing left.
+	r := invoke(t, "inbox")
+	if r.code != 0 {
+		t.Fatalf("%s", r)
+	}
+	wantContains(t, r, "stdout", "No unread messages")
+	wantContains(t, r, "stdout", "--all")
+
+	r2 := invoke(t, "inbox", "--all")
+	if r2.code != 0 {
+		t.Fatalf("%s", r2)
+	}
+	wantContains(t, r2, "stdout", "already seen")
+}
+
+// A plain shell has no session's mail to read, so inbox has to say that
+// plainly rather than surface Self's generic "not inside a session" error.
+func TestInboxOutsideASessionSaysSo(t *testing.T) {
+	withHome(t)
+	r := invoke(t, "inbox")
+	if r.code == 0 {
+		t.Fatalf("inbox outside a session should fail: %s", r)
+	}
+	wantContains(t, r, "stderr", "inbox")
+	wantContains(t, r, "stderr", "session")
 }

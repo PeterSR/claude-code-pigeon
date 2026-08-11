@@ -66,7 +66,7 @@ func TestWeaverbirdCommand_ValueReportsWaitingCount(t *testing.T) {
 	t.Setenv(pigeon.EnvSessionID, "")
 
 	for i := 0; i < 2; i++ {
-		if _, err := pigeon.Send(beta, "queued", pigeon.Sender{Kind: "shell", Name: "test"}, ""); err != nil {
+		if _, err := pigeon.Send(beta, pigeon.Draft{Text: "queued"}, pigeon.Sender{Kind: "shell", Name: "test"}); err != nil {
 			t.Fatalf("Send: %v", err)
 		}
 	}

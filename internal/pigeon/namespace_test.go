@@ -246,7 +246,7 @@ func TestParseTopicRef(t *testing.T) {
 		{"deploys", "deploys", false},
 		{"@deploys", "deploys", true},
 		{PublicTopic, PublicTopic, false},
-		{GlobalPublicTopic, PublicTopic, true},
+		{GlobalPublicTopic, strings.TrimPrefix(GlobalPublicTopic, GlobalPrefix), true},
 	}
 	for _, c := range cases {
 		ref, err := ParseTopicRef(c.in)
@@ -276,7 +276,7 @@ func TestNamespacedTopicsDoNotLeak(t *testing.T) {
 	withHome(t)
 	acme, other := mustNS(t, "acme"), mustNS(t, "other")
 
-	if _, err := acme.Publish("deploys", "acme shipped", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := acme.Publish("deploys", Draft{Text: "acme shipped"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	if acme.TopicPath("deploys") == other.TopicPath("deploys") {
@@ -308,11 +308,11 @@ func TestGlobalTopicsReachEveryNamespace(t *testing.T) {
 		t.Errorf("@ops lives at %q, not in the shared tree", acme.TopicPath("@ops"))
 	}
 
-	liveEntryIn(t, other, "bbbb2222", "beta", "/home/p/web")
+	armedIn(t, other, "bbbb2222", "beta")
 	if err := other.Subscribe("bbbb2222", "@ops"); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
-	if _, err := acme.Publish("@ops", "everyone please stand by", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := acme.Publish("@ops", Draft{Text: "everyone please stand by"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	body, err := os.ReadFile(other.TopicPath("@ops"))
@@ -341,7 +341,7 @@ func TestEveryNamespaceJoinsBothPublicMailboxes(t *testing.T) {
 	t.Setenv(EnvClaudePID, "")
 	t.Setenv(EnvProjectDir, t.TempDir())
 
-	if err := register(acme, "aaaa1111", func(string, ...any) {}); err != nil {
+	if err := register(acme, "aaaa1111", CurrentRuntime(), func(string, ...any) {}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	e, err := acme.ReadEntry("aaaa1111")
@@ -372,7 +372,7 @@ func TestGlobalAndLocalTopicsKeepSeparateCursors(t *testing.T) {
 	liveEntryIn(t, ns, "aaaa1111", "alpha", "/tmp/a")
 
 	from := Sender{Kind: "shell", Name: "sh"}
-	if _, err := ns.Publish("deploys", "local history", from); err != nil {
+	if _, err := ns.Publish("deploys", Draft{Text: "local history"}, from); err != nil {
 		t.Fatal(err)
 	}
 	if err := ns.Subscribe("aaaa1111", "deploys"); err != nil {
@@ -395,10 +395,10 @@ func TestListTopicsCoversLocalAndSharedLogs(t *testing.T) {
 	withHome(t)
 	ns := mustNS(t, "acme")
 	from := Sender{Kind: "shell", Name: "sh"}
-	if _, err := ns.Publish("deploys", "x", from); err != nil {
+	if _, err := ns.Publish("deploys", Draft{Text: "x"}, from); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ns.Publish("@ops", "y", from); err != nil {
+	if _, err := ns.Publish("@ops", Draft{Text: "y"}, from); err != nil {
 		t.Fatal(err)
 	}
 
@@ -420,7 +420,7 @@ func TestListTopicsCoversLocalAndSharedLogs(t *testing.T) {
 	}
 	// A topic published in another namespace is not reachable from here and
 	// must not be listed as though it were.
-	if _, err := mustNS(t, "other").Publish("secrets", "z", from); err != nil {
+	if _, err := mustNS(t, "other").Publish("secrets", Draft{Text: "z"}, from); err != nil {
 		t.Fatal(err)
 	}
 	if again, _ := ns.ListTopics(); len(again) != len(topics) {
@@ -441,7 +441,7 @@ func TestRenderAcceptsOwnAndSharedPayloadsOnly(t *testing.T) {
 	shared := filepath.Join(SharedPayloadsDir(), "m_def.txt")
 	for _, good := range []string{ours, shared} {
 		m := &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "hi", Payload: good}
-		if got := acme.Render(m); !strings.Contains(got, good) {
+		if got := acme.Render(m, nil); !strings.Contains(got, good) {
 			t.Errorf("Render dropped a pointer it should follow (%s): %s", good, got)
 		}
 	}
@@ -453,7 +453,7 @@ func TestRenderAcceptsOwnAndSharedPayloadsOnly(t *testing.T) {
 		"relative.txt",
 	} {
 		m := &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "hi", Payload: bad}
-		if got := acme.Render(m); strings.Contains(got, bad) {
+		if got := acme.Render(m, nil); strings.Contains(got, bad) {
 			t.Errorf("Render surfaced a foreign payload path %q: %s", bad, got)
 		}
 	}
@@ -466,20 +466,20 @@ func TestGlobalTopicPayloadsGoToTheSharedDirectory(t *testing.T) {
 	acme, other := mustNS(t, "acme"), mustNS(t, "other")
 	long := strings.Repeat("g", BodyBudget*2)
 
-	msg, err := acme.Publish("@ops", long, Sender{Kind: "shell", Name: "sh"})
+	msg, err := acme.Publish("@ops", Draft{Text: long}, Sender{Kind: "shell", Name: "sh"})
 	if err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	if filepath.Dir(msg.Payload) != SharedPayloadsDir() {
 		t.Fatalf("payload went to %q, want the shared directory", filepath.Dir(msg.Payload))
 	}
-	if got := other.Render(msg); !strings.Contains(got, msg.Payload) {
+	if got := other.Render(msg, nil); !strings.Contains(got, msg.Payload) {
 		t.Errorf("a subscriber in another namespace cannot follow the pointer:\n%s", got)
 	}
 
 	// A namespaced topic keeps its payload local, where only its own
 	// subscribers can be pointed at it.
-	local, err := acme.Publish("deploys", long, Sender{Kind: "shell", Name: "sh"})
+	local, err := acme.Publish("deploys", Draft{Text: long}, Sender{Kind: "shell", Name: "sh"})
 	if err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
@@ -536,7 +536,7 @@ func TestRenderNamesTheSenderNamespaceOnlyWhenItMatters(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := acme.Render(c.msg)
+			got := acme.Render(c.msg, nil)
 			if has := strings.Contains(got, "[ns: "); has != c.wantNS {
 				t.Errorf("namespace shown = %v, want %v: %s", has, c.wantNS, got)
 			}
@@ -553,8 +553,8 @@ func TestRenderNamesTheSenderNamespaceOnlyWhenItMatters(t *testing.T) {
 func TestRenderMarksAGlobalTopicDifferently(t *testing.T) {
 	withHome(t)
 	ns := mustNS(t, "acme")
-	global := ns.Render(&Message{From: Sender{Kind: "shell", Name: "sh"}, Topic: "@ops", Text: "x"})
-	local := ns.Render(&Message{From: Sender{Kind: "shell", Name: "sh"}, Topic: "ops", Text: "x"})
+	global := ns.Render(&Message{From: Sender{Kind: "shell", Name: "sh"}, Topic: "@ops", Text: "x"}, nil)
+	local := ns.Render(&Message{From: Sender{Kind: "shell", Name: "sh"}, Topic: "ops", Text: "x"}, nil)
 	if !strings.Contains(global, "[pigeon @ops]") {
 		t.Errorf("global topic rendered as %q", global)
 	}
@@ -580,7 +580,7 @@ func TestRenderBoundsAHostileSenderNamespace(t *testing.T) {
 		},
 		Text: strings.Repeat("z", 4000),
 	}
-	got := ns.Render(m)
+	got := ns.Render(m, nil)
 	if strings.ContainsAny(got, "<>") {
 		t.Fatalf("Render leaked structural characters from the namespace: %q", got)
 	}
@@ -603,7 +603,7 @@ func TestCrossNamespaceSendLandsInTheRecipientsTree(t *testing.T) {
 	liveEntryIn(t, acme, "aaaa1111", "alpha", "/home/p/api")
 	to := liveEntryIn(t, other, "bbbb2222", "beta", "/home/p/web")
 
-	msg, err := other.Send(to, strings.Repeat("x", BodyBudget*2), CurrentSender(), "")
+	msg, err := other.Send(to, Draft{Text: strings.Repeat("x", BodyBudget*2)}, CurrentSender())
 	if err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -618,11 +618,11 @@ func TestCrossNamespaceSendLandsInTheRecipientsTree(t *testing.T) {
 	if filepath.Dir(msg.Payload) != other.PayloadsDir() {
 		t.Errorf("payload went to %q, want the recipient's directory", filepath.Dir(msg.Payload))
 	}
-	if got := other.Render(msg); !strings.Contains(got, msg.Payload) {
+	if got := other.Render(msg, nil); !strings.Contains(got, msg.Payload) {
 		t.Errorf("the recipient cannot follow its own payload pointer:\n%s", got)
 	}
 	// And the reply has to say where to send it, or it goes nowhere.
-	if got := other.Render(msg); !strings.Contains(got, "pigeon send -n acme alpha") {
+	if got := other.Render(msg, nil); !strings.Contains(got, "pigeon send -n acme alpha") {
 		t.Errorf("the reply hint does not name the sender's namespace:\n%s", got)
 	}
 }
@@ -782,7 +782,7 @@ func TestSharedTopicsAreNotPrunedWhileAnotherNamespaceSubscribes(t *testing.T) {
 	if err := other.Subscribe("bbbb2222", "@ops"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := acme.Publish("@ops", "still wanted", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := acme.Publish("@ops", Draft{Text: "still wanted"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -885,7 +885,10 @@ func TestFlatLayoutIsMigratedIntoTheDefaultNamespace(t *testing.T) {
 	if got := ns.Pending("aaaa1111"); got != 1 {
 		t.Errorf("Pending = %d, want the queued message to have survived", got)
 	}
-	if _, err := os.Stat(ns.TopicPath(PublicTopic)); err != nil {
+	// "all" by name, not PublicTopic: the fixture is a layout from an older
+	// build, and migration moves the files it finds rather than renaming the
+	// topics inside them.
+	if _, err := os.Stat(ns.TopicPath("all")); err != nil {
 		t.Errorf("the topic log did not move: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(ns.PayloadsDir(), "m_1.txt")); err != nil {

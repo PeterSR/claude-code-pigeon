@@ -199,7 +199,7 @@ func TestUninstallLeavesStateAloneUnlessPurged(t *testing.T) {
 	}
 	// Something worth losing: a registered session with queued mail.
 	to := liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
-	if _, err := Send(to, "still queued", Sender{Kind: "shell", Name: "sh"}, ""); err != nil {
+	if _, err := Send(to, Draft{Text: "still queued"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 

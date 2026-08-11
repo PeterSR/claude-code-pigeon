@@ -9,6 +9,7 @@ package pigeon
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -153,6 +154,20 @@ func (m *monitor) stop(t *testing.T) {
 	}
 }
 
+// withDigestInterval shrinks the package's digest flush interval for one
+// test. digestInterval is a full minute in production; RunMonitor reads it
+// exactly once, early, to build its ticker (see RunMonitor), so setting it
+// before startMonitor launches the monitor goroutine -- and restoring it only
+// once that goroutine has actually stopped -- never races the read. t.Cleanup
+// runs LIFO, and startMonitor registers its own stop cleanup after this
+// function returns, so the restore below always runs after the monitor exits.
+func withDigestInterval(t *testing.T, d time.Duration) {
+	t.Helper()
+	orig := digestInterval
+	digestInterval = d
+	t.Cleanup(func() { digestInterval = orig })
+}
+
 // peer is a plausible sender that is not the session under test.
 func peer() Sender {
 	return Sender{Kind: "session", SessionID: "bbbb2222-3333", Name: "beta", Cwd: "/home/p/web"}
@@ -222,9 +237,10 @@ func TestMonitorRegistersEntryAndHoldsTheLock(t *testing.T) {
 	}
 }
 
-// register() reflects Claude Code's own session name into the entry, so peers
-// see the /status label without reading Claude Code's internals themselves.
-func TestMonitorPopulatesClaudeName(t *testing.T) {
+// register() reflects Claude Code's own session name into the entry's Label,
+// so peers see the /status label without reading Claude Code's internals
+// themselves.
+func TestMonitorPopulatesLabel(t *testing.T) {
 	withHome(t)
 	const sid = "mon-claude-name-1"
 	// Plant the index register() will read, and point EnvConfigDir at it so the
@@ -233,13 +249,16 @@ func TestMonitorPopulatesClaudeName(t *testing.T) {
 	startMonitor(t, sid)
 
 	var e *Entry
-	eventually(t, 5*time.Second, "the entry to carry the claude name", func() bool {
+	eventually(t, 5*time.Second, "the entry to carry the label", func() bool {
 		var err error
 		e, err = ReadEntry(sid)
-		return err == nil && e.ClaudeName != ""
+		return err == nil && e.Label != ""
 	})
-	if e.ClaudeName != "chosen-here" || e.ClaudeNameSource != "user" {
-		t.Fatalf("claude name = %q (%q), want chosen-here (user)", e.ClaudeName, e.ClaudeNameSource)
+	if e.Label != "chosen-here" || e.LabelSource != "user" {
+		t.Fatalf("label = %q (%q), want chosen-here (user)", e.Label, e.LabelSource)
+	}
+	if e.Runtime != RuntimeClaudeCode {
+		t.Fatalf("runtime = %q, want %q", e.Runtime, RuntimeClaudeCode)
 	}
 }
 
@@ -314,7 +333,7 @@ func TestRegisterSkipsPruningADeadLookingSessionWhoseLockIsHeld(t *testing.T) {
 	}
 
 	t.Setenv(EnvClaudePID, strconv.Itoa(os.Getpid()))
-	if err := register(ns, newSID, func(string, ...any) {}); err != nil {
+	if err := register(ns, newSID, CurrentRuntime(), func(string, ...any) {}); err != nil {
 		t.Fatalf("register(%s): %v", newSID, err)
 	}
 
@@ -338,11 +357,10 @@ func TestMonitorEmitsDirectMessagesButNeverItsOwn(t *testing.T) {
 
 	// A message stamped with this session's own id must never be emitted:
 	// waking a session with its own broadcast is a loop with a model in it.
-	if _, err := Send(mailbox(sid), "echo of my own voice",
-		Sender{Kind: "session", SessionID: sid, Name: "me"}, ""); err != nil {
+	if _, err := Send(mailbox(sid), Draft{Text: "echo of my own voice"}, Sender{Kind: "session", SessionID: sid, Name: "me"}); err != nil {
 		t.Fatalf("Send (self): %v", err)
 	}
-	if _, err := Send(mailbox(sid), "the build is green", peer(), ""); err != nil {
+	if _, err := Send(mailbox(sid), Draft{Text: "the build is green"}, peer()); err != nil {
 		t.Fatalf("Send (peer): %v", err)
 	}
 
@@ -360,13 +378,350 @@ func TestMonitorEmitsDirectMessagesButNeverItsOwn(t *testing.T) {
 	}
 }
 
+// TestOwnBroadcastCarriesTheConsumptionCursorWithIt covers the second cursor.
+//
+// The monitor already refuses to wake a session with its own broadcast and
+// advances the monitor cursor to say so. Nothing advanced the consumption
+// cursor, so a session that published to a topic it was up to date on was left
+// sitting behind its own message forever: a compaction floor pinned by a line
+// the session wrote itself, and a cursor whose meaning ("everything before
+// here is dealt with") was false about the one message it could be surest of.
+func TestOwnBroadcastCarriesTheConsumptionCursorWithIt(t *testing.T) {
+	withHome(t)
+	const sid = "mon-selfread-1"
+	startMonitor(t, sid)
+	if err := Subscribe(sid, "chat"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 5*time.Second, "the monitor to pick up the subscription", func() bool {
+		_, ok := readCursors(sid)["chat"]
+		return ok
+	})
+
+	if _, err := Publish("chat", Draft{Text: "my own claim"}, Sender{Kind: "session", SessionID: sid}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	eventually(t, 5*time.Second, "the monitor cursor to cross the session's own message", func() bool {
+		return readCursors(sid)["chat"] > 0
+	})
+	eventually(t, 5*time.Second, "the consumption cursor to follow it", func() bool {
+		c := readCursors(sid)
+		return c[readCursorKey("chat")] == c["chat"]
+	})
+}
+
+// TestOwnBroadcastDoesNotSkipAPeersUnreadMessage is the guard on the above.
+//
+// Advancing the consumption cursor to the end of the session's own message
+// unconditionally would carry it over anything unread sitting in front: publish
+// once to a busy topic and every peer message not yet pulled silently stops
+// being unread. Only a cursor already sitting exactly where the session's own
+// message begins has read everything before it.
+func TestOwnBroadcastDoesNotSkipAPeersUnreadMessage(t *testing.T) {
+	withHome(t)
+	const sid = "mon-selfread-2"
+	m := startMonitor(t, sid)
+	if err := Subscribe(sid, "chat"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 5*time.Second, "the monitor to pick up the subscription", func() bool {
+		_, ok := readCursors(sid)["chat"]
+		return ok
+	})
+
+	if _, err := Publish("chat", Draft{Text: "a peer said something first"}, peer()); err != nil {
+		t.Fatalf("Publish (peer): %v", err)
+	}
+	eventually(t, 5*time.Second, "the peer's message to be notified", func() bool {
+		return m.stdout.has("a peer said something first")
+	})
+	// Notified, but never pulled -- so it is still unread, and publishing must
+	// not change that.
+	if _, err := Publish("chat", Draft{Text: "and then I claimed a file"}, Sender{Kind: "session", SessionID: sid}); err != nil {
+		t.Fatalf("Publish (self): %v", err)
+	}
+	eventually(t, 5*time.Second, "the monitor to handle the session's own message", func() bool {
+		return readCursors(sid)["chat"] > 0
+	})
+
+	items, _, err := DefaultNamespace().ReadInbox(sid, InboxQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Message.Text != "a peer said something first" {
+		t.Fatalf("got %d items (%v), want the peer's message still unread: publishing swallowed it",
+			len(items), itemTexts(items))
+	}
+}
+
+func itemTexts(items []InboxItem) []string {
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.Message.Text)
+	}
+	return out
+}
+
+// TestABroadcastNamingOthersDoesNotInterruptYou is the addressing gate.
+//
+// A For list said who a message was for and then changed nothing about who it
+// woke. One broadcast naming two sessions was pushed into nine, and the seven
+// bystanders each spent a turn deciding it was none of their business.
+func TestABroadcastNamingOthersDoesNotInterruptYou(t *testing.T) {
+	withHome(t)
+	const sid = "mon-forgate-1"
+	m := startMonitor(t, sid)
+	if err := Subscribe(sid, "chat"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 5*time.Second, "the monitor to pick up the subscription", func() bool {
+		_, ok := readCursors(sid)["chat"]
+		return ok
+	})
+
+	if _, err := Publish("chat", Draft{
+		Text: "the seeders are mine, shout if mid-edit",
+		For:  []string{"inv-engine", "inv-screens"},
+	}, peer()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	// Handled, so the monitor cursor crosses it. That is also what makes the
+	// absence below real rather than merely early.
+	eventually(t, 5*time.Second, "the monitor to handle the message", func() bool {
+		return readCursors(sid)["chat"] > 0
+	})
+	if m.stdout.has("the seeders are mine") {
+		t.Errorf("a broadcast naming other sessions interrupted this one:\n%s", m.stdout.String())
+	}
+
+	// Held for the inbox, not dropped: not being interrupted is not the same
+	// as not being able to find it.
+	items, _, err := DefaultNamespace().ReadInbox(sid, InboxQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("got %d inbox items, want the message held for reading", len(items))
+	}
+}
+
+func TestABroadcastNamingYouStillInterrupts(t *testing.T) {
+	withHome(t)
+	const sid = "mon-forgate-2"
+	m := startMonitor(t, sid)
+	if err := Subscribe(sid, "chat"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 5*time.Second, "the monitor to pick up the subscription", func() bool {
+		_, ok := readCursors(sid)["chat"]
+		return ok
+	})
+
+	// By short session id, which is the handle every session has: most never
+	// declare a name.
+	if _, err := Publish("chat", Draft{
+		Text: "this one is yours",
+		For:  []string{Short(sid)},
+	}, peer()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	eventually(t, 5*time.Second, "the addressed session to be woken", func() bool {
+		return m.stdout.has("this one is yours")
+	})
+	if !m.stdout.has("-> you") {
+		t.Errorf("an addressed message lost its marker:\n%s", m.stdout.String())
+	}
+}
+
+// TestCheckoutTopicIsTheRepositoryNotTheDirectory: a session started in a
+// subdirectory has to land with its peers, not in a room of its own.
+func TestCheckoutTopicIsTheRepositoryNotTheDirectory(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "caterflow-inventory")
+	sub := filepath.Join(repo, "backend", "app")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := CheckoutTopic(repo); got != "caterflow-inventory" {
+		t.Errorf("CheckoutTopic(repo) = %q", got)
+	}
+	if got := CheckoutTopic(sub); got != "caterflow-inventory" {
+		t.Errorf("CheckoutTopic(subdir) = %q, want the repository's room", got)
+	}
+	// A linked worktree has a .git FILE, not a directory.
+	wt := filepath.Join(root, "inventory-wt")
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: /elsewhere\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := CheckoutTopic(wt); got != "inventory-wt" {
+		t.Errorf("CheckoutTopic(worktree) = %q", got)
+	}
+	// Outside a repository, the directory itself.
+	if got := CheckoutTopic(root); got != topicNameFrom(filepath.Base(root)) {
+		t.Errorf("CheckoutTopic(non-repo) = %q", got)
+	}
+
+	// Reached by a symlink, it is still the same working tree and so must be
+	// the same room: two sessions in a room they disagree about would each
+	// believe they had announced themselves to the other.
+	link := filepath.Join(root, "link-to-inventory")
+	if err := os.Symlink(repo, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if got := CheckoutTopic(link); got != "caterflow-inventory" {
+		t.Errorf("CheckoutTopic(symlink) = %q, want the room of the tree it points at", got)
+	}
+}
+
+func TestCheckoutTopicFoldsNamesIntoTheCharset(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"Caterflow Inventory", "caterflow-inventory"},
+		{"my.project_v2", "my.project_v2"},
+		{"---weird---", "weird"},
+		{"Ærø", "r"},
+		{"", ""},
+		{"...", ""},
+	} {
+		if got := topicNameFrom(tc.in); got != tc.want {
+			t.Errorf("topicNameFrom(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestHereResolvesToTheCheckoutsOwnRoom: the room carrying most of the traffic
+// was the only tier with no word for it. It is named after the repository,
+// which is what makes it legible to everyone else, and that left a session
+// unable to name its own room without looking it up first.
+func TestHereResolvesToTheCheckoutsOwnRoom(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "caterflow-inventory")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mustResolve := func(topic, cwd string) string {
+		t.Helper()
+		got, err := ResolveTopicAlias(topic, cwd)
+		if err != nil {
+			t.Fatalf("ResolveTopicAlias(%q): %v", topic, err)
+		}
+		return got
+	}
+
+	if got := mustResolve("here", repo); got != "caterflow-inventory" {
+		t.Errorf(`ResolveTopicAlias("here") = %q, want the checkout's room`, got)
+	}
+	if got := mustResolve("HERE", repo); got != "caterflow-inventory" {
+		t.Errorf("the alias should be case-insensitive, got %q", got)
+	}
+	// It resolves to the real name before anything is written, so what lands
+	// in the log and in a peer's notification says which checkout it was.
+	if got := mustResolve("deploys", repo); got != "deploys" {
+		t.Errorf("an ordinary topic was rewritten: %q", got)
+	}
+	if got := mustResolve("@global", repo); got != "@global" {
+		t.Errorf("a global topic was rewritten: %q", got)
+	}
+	// Nowhere to mean: left alone rather than silently widened to a room the
+	// caller did not ask for.
+	if got := mustResolve("here", ""); got != "here" {
+		t.Errorf("outside a checkout the alias should stay put, got %q", got)
+	}
+}
+
+// A private checkout's room is named after the directory private exists to
+// keep off the bus. defaultSubscriptions already refuses to join it; the alias
+// is the other door into the same room, and the publish tool description sends
+// a session through it first.
+func TestHereRefusesToNameAPrivateCheckoutsRoom(t *testing.T) {
+	repo := writeProjectConfig(t, `{"private": true}`)
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ResolveTopicAlias("here", repo)
+	if err == nil {
+		t.Fatalf("`here` resolved to %q in a private checkout, putting the directory name on the bus", got)
+	}
+	if got != "" {
+		t.Errorf("a refused alias must not also hand back a topic, got %q", got)
+	}
+	// Refused, not quietly widened: resolving to the everyone room would send
+	// the message the session meant for its checkout to the whole machine.
+	if got == PublicTopic || got == GlobalPublicTopic {
+		t.Errorf("the alias widened to %q instead of refusing", got)
+	}
+	// Only the alias is affected. A private checkout can still name a topic.
+	if to, err := ResolveTopicAlias("deploys", repo); err != nil || to != "deploys" {
+		t.Errorf("an explicitly named topic was refused: %q, %v", to, err)
+	}
+}
+
+// The three default rooms are three different logs, and the two well-known
+// ones are no longer one string with a prefix.
+func TestTheThreeDefaultRoomsAreDistinct(t *testing.T) {
+	if PublicTopic != "namespace" {
+		t.Errorf("PublicTopic = %q", PublicTopic)
+	}
+	if GlobalPublicTopic != "@global" {
+		t.Errorf("GlobalPublicTopic = %q", GlobalPublicTopic)
+	}
+	if strings.TrimPrefix(GlobalPublicTopic, GlobalPrefix) == PublicTopic {
+		t.Error("the machine room is still the namespace room with a prefix, so they share a name")
+	}
+	// Nothing is called "all" any more: the name read as "everyone" while
+	// meaning "everyone in this namespace".
+	for _, n := range []string{PublicTopic, GlobalPublicTopic} {
+		if strings.Contains(n, "all") {
+			t.Errorf("%q still claims to be everyone", n)
+		}
+	}
+}
+
+// TestPrintedTopicNameCanBeTypedBackIn: every notification says "#chat" and
+// typing "#chat" used to fail validation, because "#" is decoration and not
+// part of the name. Output that is not valid input only bites whoever copies
+// what they were shown.
+func TestPrintedTopicNameCanBeTypedBackIn(t *testing.T) {
+	printed := TopicLabel("chat")
+	if printed != "#chat" {
+		t.Fatalf("TopicLabel(chat) = %q", printed)
+	}
+	ref, err := ParseTopicRef(printed)
+	if err != nil {
+		t.Fatalf("ParseTopicRef(%q): %v", printed, err)
+	}
+	if ref.Name != "chat" || ref.Global {
+		t.Errorf("ParseTopicRef(%q) = %+v, want the bare namespaced topic", printed, ref)
+	}
+	// The global form is unchanged: "@" is part of the name and selects a
+	// different tree.
+	if g, err := ParseTopicRef(TopicLabel("@ops")); err != nil || g.Name != "ops" || !g.Global {
+		t.Errorf("ParseTopicRef(@ops) = %+v, %v", g, err)
+	}
+	// One canonical spelling per tree: "#@ops" is not a way to reach the
+	// global log.
+	if _, err := ParseTopicRef("#@ops"); err == nil {
+		t.Error(`"#@ops" was accepted; it must not resolve to the global tree`)
+	}
+}
+
 func TestMonitorDeliversMailQueuedBeforeItStarted(t *testing.T) {
 	withHome(t)
 	const sid = "mon-queued-1"
 	// Mail written while nothing was listening: the inbox cursor must resume
 	// from where it was rather than skipping to the end of the spool, or a
 	// `claude --resume` silently loses everything sent while it was away.
-	if _, err := Send(mailbox(sid), "queued while nobody listened", peer(), ""); err != nil {
+	if _, err := Send(mailbox(sid), Draft{Text: "queued while nobody listened"}, peer()); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -390,10 +745,10 @@ func TestMonitorDeliversSubscribedTopicsOnly(t *testing.T) {
 	// Nothing subscribes this session to #secrets, so it must stay silent even
 	// though the log sits in the same state directory and is trivially
 	// readable. Publishing it first means the barrier below is meaningful.
-	if _, err := Publish("secrets", "not for you", peer()); err != nil {
+	if _, err := Publish("secrets", Draft{Text: "not for you"}, peer()); err != nil {
 		t.Fatalf("Publish (#secrets): %v", err)
 	}
-	if _, err := Publish(PublicTopic, "deploying to staging in 5", peer()); err != nil {
+	if _, err := Publish(PublicTopic, Draft{Text: "deploying to staging in 5"}, peer()); err != nil {
 		t.Fatalf("Publish (#%s): %v", PublicTopic, err)
 	}
 
@@ -424,7 +779,7 @@ func TestSubscribingWhileTheMonitorRunsTakesEffect(t *testing.T) {
 		return m.stderr.has(`following topic "deploys"`)
 	})
 
-	if _, err := Publish("deploys", "v2.1 rolled out", peer()); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "v2.1 rolled out"}, peer()); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	eventually(t, 6*time.Second, "the #deploys message", func() bool {
@@ -443,7 +798,7 @@ func TestUnsubscribingWhileTheMonitorRunsStopsDelivery(t *testing.T) {
 	eventually(t, 6*time.Second, "the monitor to start following #deploys", func() bool {
 		return m.stderr.has(`following topic "deploys"`)
 	})
-	if _, err := Publish("deploys", "first while subscribed", peer()); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "first while subscribed"}, peer()); err != nil {
 		t.Fatalf("Publish (before): %v", err)
 	}
 	eventually(t, 6*time.Second, "the first #deploys message", func() bool {
@@ -457,12 +812,12 @@ func TestUnsubscribingWhileTheMonitorRunsStopsDelivery(t *testing.T) {
 		return m.stderr.has(`unfollowing topic "deploys"`)
 	})
 
-	if _, err := Publish("deploys", "second after unsubscribing", peer()); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "second after unsubscribing"}, peer()); err != nil {
 		t.Fatalf("Publish (after): %v", err)
 	}
 	// Barrier: a direct message sent afterwards proves the monitor is still
 	// emitting, so the missing topic line is a real absence.
-	if _, err := Send(mailbox(sid), "still listening", peer(), ""); err != nil {
+	if _, err := Send(mailbox(sid), Draft{Text: "still listening"}, peer()); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	eventually(t, 6*time.Second, "the barrier direct message", func() bool {
@@ -470,6 +825,443 @@ func TestUnsubscribingWhileTheMonitorRunsStopsDelivery(t *testing.T) {
 	})
 	if m.stdout.has("second after unsubscribing") {
 		t.Errorf("monitor kept delivering a topic it had left:\n%s", m.stdout.String())
+	}
+}
+
+// --- delivery modes ----------------------------------------------------------
+
+// A digest topic must collapse a burst into ONE line per interval, not one
+// notification per message -- that collapsing is the entire point.
+func TestDigestTopicCollapsesMultipleMessagesIntoOneLine(t *testing.T) {
+	withDigestInterval(t, 300*time.Millisecond)
+	withHome(t)
+	const sid = "mon-digest-collapse-1"
+	m := startMonitor(t, sid)
+
+	if err := Subscribe(sid, "deploys"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	eventually(t, 6*time.Second, "the monitor to start following #deploys", func() bool {
+		return m.stderr.has(`following topic "deploys"`)
+	})
+	if err := SetDelivery(sid, "deploys", DeliveryDigest); err != nil {
+		t.Fatalf("SetDelivery: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := Publish("deploys", Draft{Text: fmt.Sprintf("build %d", i)}, peer()); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+	}
+
+	eventually(t, 3*time.Second, "the digest line", func() bool {
+		return m.stdout.has("3 waiting on #deploys")
+	})
+	for i := 0; i < 3; i++ {
+		if m.stdout.has(fmt.Sprintf("build %d", i)) {
+			t.Errorf("a digest topic pushed an individual message instead of collapsing them:\n%s", m.stdout.String())
+		}
+	}
+	if got := strings.Count(m.stdout.String(), "waiting on #deploys"); got != 1 {
+		t.Errorf("the digest line appeared %d time(s), want exactly 1 (one per interval, not one per message)", got)
+	}
+}
+
+// An alert bypasses a digest topic's buffering entirely: it is scarce by
+// construction (see PriorityAlert), and holding it for a minute defeats the
+// one thing it exists to do.
+func TestAlertOnADigestTopicPushesImmediately(t *testing.T) {
+	withHome(t)
+	const sid = "mon-digest-alert-1"
+	m := startMonitor(t, sid)
+
+	if err := Subscribe(sid, "deploys"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	eventually(t, 6*time.Second, "the monitor to start following #deploys", func() bool {
+		return m.stderr.has(`following topic "deploys"`)
+	})
+	if err := SetDelivery(sid, "deploys", DeliveryDigest); err != nil {
+		t.Fatalf("SetDelivery: %v", err)
+	}
+
+	if _, err := Publish("deploys", Draft{Text: "prod is down", Priority: PriorityAlert}, peer()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	eventually(t, 3*time.Second, "the alert to push immediately, without waiting for a digest tick", func() bool {
+		return m.stdout.has("prod is down")
+	})
+}
+
+// quiet is absolute: unlike digest, not even an alert earns an immediate
+// push there. A peer's self-assessed urgency cannot override a session that
+// asked not to be interrupted at all.
+func TestAlertOnAQuietTopicDoesNotPushImmediately(t *testing.T) {
+	withHome(t)
+	const sid = "mon-quiet-alert-1"
+	m := startMonitor(t, sid)
+
+	if err := Subscribe(sid, "deploys"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	eventually(t, 6*time.Second, "the monitor to start following #deploys", func() bool {
+		return m.stderr.has(`following topic "deploys"`)
+	})
+	if err := SetDelivery(sid, "deploys", DeliveryQuiet); err != nil {
+		t.Fatalf("SetDelivery: %v", err)
+	}
+
+	if _, err := Publish("deploys", Draft{Text: "prod is down", Priority: PriorityAlert}, peer()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	// Barrier: a direct message sent afterwards proves the monitor is alive
+	// and processing, so the missing alert text below is a real absence
+	// rather than a slow test.
+	if _, err := Send(mailbox(sid), Draft{Text: "still listening"}, peer()); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	eventually(t, 6*time.Second, "the barrier direct message", func() bool {
+		return m.stdout.has("still listening")
+	})
+	if m.stdout.has("prod is down") {
+		t.Errorf("an alert on a quiet topic was pushed immediately; quiet must be absolute:\n%s", m.stdout.String())
+	}
+}
+
+// A message naming this session in For pushes immediately on a digest topic,
+// the same as an alert -- it is not chatter, it is something this session was
+// specifically asked to act on.
+func TestForNamedMessagePushesOnADigestTopic(t *testing.T) {
+	withHome(t)
+	const sid = "mon-digest-for-1"
+	m := startMonitor(t, sid)
+
+	if err := Subscribe(sid, "deploys"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	eventually(t, 6*time.Second, "the monitor to start following #deploys", func() bool {
+		return m.stderr.has(`following topic "deploys"`)
+	})
+	if err := SetDelivery(sid, "deploys", DeliveryDigest); err != nil {
+		t.Fatalf("SetDelivery: %v", err)
+	}
+
+	// Short(sid), not a declared name: this session was never given one, and
+	// For matches either handle (see Message.IsFor).
+	if _, err := Publish("deploys", Draft{Text: "please review this", For: []string{Short(sid)}}, peer()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	eventually(t, 3*time.Second, "the for-named message to push immediately", func() bool {
+		return m.stdout.has("please review this")
+	})
+}
+
+// The one property Part 1 exists for: a message held in an unflushed digest
+// buffer must not have its cursor crossed by something else on the same
+// topic, or a monitor that dies before the next flush loses it for good.
+//
+// The synchronization here is structural, not timing-based: "routine change"
+// and the alert that follows it are both on #deploys, read by the one
+// goroutine following that log, in that order. So once the alert -- which
+// pushes immediately -- is actually on stdout, "routine change" has
+// necessarily already been read and folded into the digest buffer by the
+// single-threaded delivery loop, whether or not the buffer has flushed yet.
+func TestMonitorCursorHoldsAtAnUnflushedDigestMessageThenAdvancesOnFlush(t *testing.T) {
+	withDigestInterval(t, 300*time.Millisecond)
+	withHome(t)
+	const sid = "mon-digest-cursor-1"
+	m := startMonitor(t, sid)
+
+	if err := Subscribe(sid, "deploys"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	eventually(t, 6*time.Second, "the monitor to start following #deploys", func() bool {
+		return m.stderr.has(`following topic "deploys"`)
+	})
+	if err := SetDelivery(sid, "deploys", DeliveryDigest); err != nil {
+		t.Fatalf("SetDelivery: %v", err)
+	}
+
+	if _, err := Publish("deploys", Draft{Text: "routine change"}, peer()); err != nil {
+		t.Fatalf("Publish (routine): %v", err)
+	}
+	if _, err := Publish("deploys", Draft{Text: "urgent followup", Priority: PriorityAlert}, peer()); err != nil {
+		t.Fatalf("Publish (alert): %v", err)
+	}
+	eventually(t, 3*time.Second, "the alert to push past the still-buffered routine message", func() bool {
+		return m.stdout.has("urgent followup")
+	})
+
+	// "routine change" is confirmed read and buffered by now (see the doc
+	// comment above), but the digest has not flushed, so the topic's cursor
+	// must still be exactly where it started: untouched.
+	if got := readCursors(sid)["deploys"]; got != 0 {
+		t.Errorf("cursor for #deploys = %d before any digest flush, want 0 (must not advance past the buffered message)", got)
+	}
+
+	eventually(t, 3*time.Second, "the digest to flush", func() bool {
+		return m.stdout.has("1 waiting on #deploys")
+	})
+	eventually(t, 3*time.Second, "the cursor to advance once the digest flushes", func() bool {
+		return readCursors(sid)["deploys"] > 0
+	})
+}
+
+// --- supersedes --------------------------------------------------------------
+
+// impostor is a plausible sender that is neither the session under test nor
+// peer() -- used to prove a supersede claim is checked against the exact
+// original sender, not merely "some session".
+func impostor() Sender {
+	return Sender{Kind: "session", SessionID: "cccc4444-5555", Name: "gamma", Cwd: "/home/g/web"}
+}
+
+// The one security rule this feature exists to enforce: a peer that did not
+// send the original may not supersede it. An impostor's claim must be
+// ignored entirely -- the message delivered as ordinary, no correction
+// marker anywhere in the line.
+func TestMonitorIgnoresASupersedeClaimFromADifferentSender(t *testing.T) {
+	withHome(t)
+	const sid = "mon-supersede-forge-1"
+	m := startMonitor(t, sid)
+
+	original, err := Send(mailbox(sid), Draft{Text: "STOP AND READ, something was destroyed", Priority: PriorityAlert}, peer())
+	if err != nil {
+		t.Fatalf("Send (original): %v", err)
+	}
+	eventually(t, 5*time.Second, "the original alert", func() bool {
+		return m.stdout.has("STOP AND READ")
+	})
+
+	if _, err := Send(mailbox(sid), Draft{Text: "false alarm, ignore that", Supersedes: original.ID}, impostor()); err != nil {
+		t.Fatalf("Send (forged supersede): %v", err)
+	}
+	eventually(t, 5*time.Second, "the forged supersede to be delivered", func() bool {
+		return m.stdout.has("false alarm, ignore that")
+	})
+	if m.stdout.has("correction") {
+		t.Errorf("a supersede claim from a different sender than the original was honoured:\n%s", m.stdout.String())
+	}
+}
+
+// A legitimate correction of a message this monitor already pushed carries
+// the marker wherever it is rendered: nothing was buffered to drop, so
+// "already emitted" applies.
+func TestMonitorRendersTheCorrectionMarkerForAnAlreadyEmittedMessage(t *testing.T) {
+	withHome(t)
+	const sid = "mon-supersede-correct-1"
+	m := startMonitor(t, sid)
+
+	original, err := Send(mailbox(sid), Draft{Text: "STOP AND READ, something was destroyed", Priority: PriorityAlert}, peer())
+	if err != nil {
+		t.Fatalf("Send (original): %v", err)
+	}
+	eventually(t, 5*time.Second, "the original alert", func() bool {
+		return m.stdout.has("STOP AND READ")
+	})
+
+	if _, err := Send(mailbox(sid), Draft{Text: "false alarm, nothing was destroyed", Supersedes: original.ID}, peer()); err != nil {
+		t.Fatalf("Send (correction): %v", err)
+	}
+	eventually(t, 5*time.Second, "the correction to be delivered", func() bool {
+		return m.stdout.has("false alarm, nothing was destroyed")
+	})
+	if !m.stdout.has("↺ correction") {
+		t.Errorf("a legitimate correction of an already-emitted message did not carry the marker:\n%s", m.stdout.String())
+	}
+}
+
+// The scenario this whole feature exists for: an alert lands in a digest
+// buffer, and a retraction from the same sender arrives before the buffer
+// flushes. The alarm itself must never be shown -- dropped from the buffer
+// entirely -- while the retraction goes on to be handled as an ordinary
+// message on the same topic. The cursor must still cross both once the
+// buffer flushes, or a monitor restart would replay the alarm forever.
+func TestSupersedeDropsAStillBufferedMessageAndTheCursorAdvancesPastBoth(t *testing.T) {
+	withDigestInterval(t, 300*time.Millisecond)
+	withHome(t)
+	const sid = "mon-supersede-drop-1"
+	m := startMonitor(t, sid)
+
+	if err := Subscribe(sid, "alerts"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	eventually(t, 6*time.Second, "the monitor to start following #alerts", func() bool {
+		return m.stderr.has(`following topic "alerts"`)
+	})
+	if err := SetDelivery(sid, "alerts", DeliveryDigest); err != nil {
+		t.Fatalf("SetDelivery: %v", err)
+	}
+
+	original, err := Publish("alerts", Draft{Text: "SOMEBODY RAN git reset --hard"}, peer())
+	if err != nil {
+		t.Fatalf("Publish (original): %v", err)
+	}
+	// Barrier: a direct message proves the original has already been read
+	// and folded into the digest buffer before the retraction is sent.
+	if _, err := Send(mailbox(sid), Draft{Text: "still listening 1"}, peer()); err != nil {
+		t.Fatalf("Send (barrier 1): %v", err)
+	}
+	eventually(t, 6*time.Second, "the first barrier", func() bool {
+		return m.stdout.has("still listening 1")
+	})
+
+	if _, err := Publish("alerts", Draft{Text: "false alarm, nothing was destroyed", Supersedes: original.ID}, peer()); err != nil {
+		t.Fatalf("Publish (retraction): %v", err)
+	}
+	// Barrier 2: proves the retraction itself has been read and processed --
+	// dropping the original from the buffer -- before the digest is checked.
+	if _, err := Send(mailbox(sid), Draft{Text: "still listening 2"}, peer()); err != nil {
+		t.Fatalf("Send (barrier 2): %v", err)
+	}
+	eventually(t, 6*time.Second, "the second barrier", func() bool {
+		return m.stdout.has("still listening 2")
+	})
+
+	eventually(t, 3*time.Second, "the digest to flush", func() bool {
+		return m.stdout.has("waiting on #alerts")
+	})
+	// The alarm was dropped; the retraction was not (it is an ordinary
+	// message on the topic once its own Supersedes is cleared -- see
+	// resolveSupersede). One buffered message survives to be counted, not
+	// two and not zero.
+	if !m.stdout.has("1 waiting on #alerts") {
+		t.Errorf("digest line did not report exactly 1 survivor (the alarm dropped, the retraction kept):\n%s", m.stdout.String())
+	}
+	if got := strings.Count(m.stdout.String(), "waiting on #alerts"); got != 1 {
+		t.Errorf("the digest line appeared %d time(s), want exactly 1", got)
+	}
+
+	want := endOffset(CurrentNamespace().TopicPath("alerts"))
+	eventually(t, 3*time.Second, "the cursor to advance past both the dropped and the surviving message", func() bool {
+		return readCursors(sid)["alerts"] == want
+	})
+}
+
+// A message the rate limiter suppresses is still HANDLED -- it is deliberately
+// not re-notified (see newRateLimiter) -- so the cursor has to cross it same
+// as a pushed one, or the same flood is reconsidered forever.
+func TestRateLimitSuppressedMessageStillAdvancesTheCursor(t *testing.T) {
+	withHome(t)
+	const sid = "mon-ratelimit-cursor-1"
+	m := startMonitor(t, sid)
+
+	// Enough direct messages to spill past the normal-traffic cap and into
+	// suppression (see newRateLimiter's alertReserve), well inside the
+	// one-minute window so none of this relies on it rolling over.
+	const total = maxPerMinute - alertReserve + 5
+	for i := 0; i < total; i++ {
+		if _, err := Send(mailbox(sid), Draft{Text: fmt.Sprintf("msg %d", i)}, peer()); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+	}
+
+	want := endOffset(SpoolPath(sid))
+	eventually(t, 6*time.Second, "the inbox cursor to cross every message, suppressed included", func() bool {
+		return readCursors(sid)[inboxCursorKey] == want
+	})
+
+	// If this test's flood never actually triggered suppression it would not
+	// be testing anything: confirm the tail really was held back rather than
+	// printed, now that the cursor above proves it was still handled.
+	last := fmt.Sprintf("msg %d", total-1)
+	if m.stdout.has(last) {
+		t.Fatalf("%q was printed rather than suppressed; this test needs a real suppression to prove anything", last)
+	}
+}
+
+// Shutdown must flush whatever digest is still buffered, the same way it
+// already flushes rate-limit suppression notices: a session that stops its
+// monitor with an unflushed digest tick pending must still learn what was
+// waiting, not lose it silently to a ticker that never got to fire.
+func TestMonitorFlushesPendingDigestOnShutdown(t *testing.T) {
+	// A long interval: the flush this test checks for must come from
+	// shutdown, not from the ticker winning a race against it.
+	withDigestInterval(t, time.Hour)
+	withHome(t)
+	const sid = "mon-digest-shutdown-1"
+	m := startMonitor(t, sid)
+
+	if err := Subscribe(sid, "deploys"); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	eventually(t, 6*time.Second, "the monitor to start following #deploys", func() bool {
+		return m.stderr.has(`following topic "deploys"`)
+	})
+	if err := SetDelivery(sid, "deploys", DeliveryDigest); err != nil {
+		t.Fatalf("SetDelivery: %v", err)
+	}
+	if _, err := Publish("deploys", Draft{Text: "routine change"}, peer()); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	// Barrier: wait for the monitor to say it has actually buffered the
+	// message. A direct message used to stand in for this and could not: the
+	// spool and the topic have separate followers, so the direct one being
+	// emitted proves nothing about whether the topic one has been read yet.
+	eventually(t, 6*time.Second, "the message to be held for the digest", func() bool {
+		return m.stderr.has(`holding a message on "deploys"`)
+	})
+
+	m.stop(t) // triggers RunMonitor's deferred flushDigests via the SIGTERM path
+
+	if !m.stdout.has("1 waiting on #deploys") {
+		t.Errorf("shutdown did not flush the pending digest:\n%s", m.stdout.String())
+	}
+}
+
+// Push mode is the default and must behave exactly as it did before delivery
+// modes existed: the notification line the monitor prints is Render's output,
+// verbatim, with nothing else on stdout around it.
+func TestPushModeNotificationIsByteIdenticalToRender(t *testing.T) {
+	withHome(t)
+	const sid = "mon-push-identical-1"
+	m := startMonitor(t, sid)
+
+	msg, err := Send(mailbox(sid), Draft{Text: "the build is green", Subject: "ci"}, peer())
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	eventually(t, 5*time.Second, "the notification line", func() bool {
+		return m.stdout.has("the build is green")
+	})
+
+	self, err := ReadEntry(sid)
+	if err != nil {
+		t.Fatalf("ReadEntry: %v", err)
+	}
+	want := DefaultNamespace().Render(msg, self) + "\n"
+	if got := m.stdout.String(); got != want {
+		t.Errorf("push-mode notification differs from Render's own output:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
+// renderDigestLine is peer-controlled input rendered into a notification, the
+// same threat model as Render itself: a sender name may carry the structural
+// characters Sanitize exists to neutralise, and a burst of senders may not fit
+// the notification budget at all.
+func TestRenderDigestLineSanitisesSenderNames(t *testing.T) {
+	line := renderDigestLine("deploys", 2, []string{"al<pha>", "be]ta["})
+	if !strings.HasPrefix(line, "[pigeon] 2 waiting on #deploys from ") {
+		t.Errorf("unexpected line shape: %q", line)
+	}
+	if !strings.HasSuffix(line, "-- read with the inbox tool") {
+		t.Errorf("missing trailer: %q", line)
+	}
+	body := strings.TrimSuffix(strings.TrimPrefix(line, "[pigeon] 2 waiting on #deploys from "), " -- read with the inbox tool")
+	if strings.ContainsAny(body, "<>[]") {
+		t.Errorf("an unsanitised structural character reached the line: %q", line)
+	}
+}
+
+func TestRenderDigestLineIsBoundedByRenderBudget(t *testing.T) {
+	senders := make([]string, 50)
+	for i := range senders {
+		senders[i] = strings.Repeat("x", 40)
+	}
+	line := renderDigestLine("deploys", len(senders), senders)
+	if n := len([]rune(line)); n > RenderBudget {
+		t.Errorf("digest line is %d runes, want at most RenderBudget (%d)", n, RenderBudget)
 	}
 }
 
@@ -493,8 +1285,7 @@ func TestMonitorReceivesGlobalBroadcastsFromAnotherNamespace(t *testing.T) {
 	const sid = "mon-global-1"
 	m := startMonitor(t, sid)
 
-	if _, err := DefaultNamespace().Publish(GlobalPublicTopic, "everyone please stand by",
-		peerFrom(DefaultNamespaceName)); err != nil {
+	if _, err := DefaultNamespace().Publish(GlobalPublicTopic, Draft{Text: "everyone please stand by"}, peerFrom(DefaultNamespaceName)); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	eventually(t, 6*time.Second, "the machine-wide broadcast", func() bool {
@@ -523,13 +1314,12 @@ func TestMonitorIgnoresANamespacedTopicFromAnotherNamespace(t *testing.T) {
 		return m.stderr.has(`following topic "deploys"`)
 	})
 
-	if _, err := DefaultNamespace().Publish("deploys", "not for you",
-		peerFrom(DefaultNamespaceName)); err != nil {
+	if _, err := DefaultNamespace().Publish("deploys", Draft{Text: "not for you"}, peerFrom(DefaultNamespaceName)); err != nil {
 		t.Fatalf("Publish (other namespace): %v", err)
 	}
 	// Barrier: a publish into this namespace's own #deploys proves the follower
 	// is running, so the missing line above is a real absence.
-	if _, err := acme.Publish("deploys", "this one is ours", peerFrom("acme")); err != nil {
+	if _, err := acme.Publish("deploys", Draft{Text: "this one is ours"}, peerFrom("acme")); err != nil {
 		t.Fatalf("Publish (own namespace): %v", err)
 	}
 	eventually(t, 6*time.Second, "the barrier message", func() bool {
@@ -549,8 +1339,7 @@ func TestMonitorDeliversACrossNamespaceDirectMessage(t *testing.T) {
 	const sid = "mon-crossns-1"
 	m := startMonitor(t, sid)
 
-	if _, err := mustNS(t, "acme").Send(mailbox(sid), "from next door",
-		peerFrom(DefaultNamespaceName), ""); err != nil {
+	if _, err := mustNS(t, "acme").Send(mailbox(sid), Draft{Text: "from next door"}, peerFrom(DefaultNamespaceName)); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	eventually(t, 6*time.Second, "the cross-namespace message", func() bool {
@@ -682,57 +1471,53 @@ func TestMonitorRefusesToGuessTheSession(t *testing.T) {
 
 // --- followers -------------------------------------------------------------
 
-func TestFollowSourcePersistsOffsetSoARestartDoesNotReplay(t *testing.T) {
+// followSource no longer persists a cursor itself -- see its doc comment --
+// so this test now checks the replacement contract: every message carries the
+// logical offset immediately after it, and resuming a fresh follower from
+// that offset (as the delivery side does once it has actually handled the
+// message) picks up only what is new.
+func TestFollowSourceStampsOffsetsSoARestartDoesNotReplay(t *testing.T) {
 	dir := withHome(t)
 	path := filepath.Join(dir, "topic.ndjson")
 	appendMessage(t, path, "one")
 	appendMessage(t, path, "two")
 
-	var mu sync.Mutex
-	var saved int64
-	persist := func(n int64) {
-		mu.Lock()
-		defer mu.Unlock()
-		saved = n
-	}
-	readSaved := func() int64 {
-		mu.Lock()
-		defer mu.Unlock()
-		return saved
-	}
-
-	out := make(chan *Message, 8)
+	out := make(chan followedMessage, 8)
 	stop := make(chan struct{})
-	go followSource(path, 0, out, stop, persist, func(string, ...any) {})
+	go followSource(path, 0, "topic", out, stop, func(string, ...any) {})
 
+	var lastOffset int64
 	for _, want := range []string{"one", "two"} {
 		select {
-		case m := <-out:
-			if m.Text != want {
-				t.Fatalf("got %q, want %q -- the log must be read in order", m.Text, want)
+		case fm := <-out:
+			if fm.msg.Text != want {
+				t.Fatalf("got %q, want %q -- the log must be read in order", fm.msg.Text, want)
 			}
+			if fm.source != "topic" {
+				t.Fatalf("source = %q, want %q", fm.source, "topic")
+			}
+			lastOffset = fm.offset
 		case <-time.After(5 * time.Second):
 			t.Fatalf("timed out waiting for %q", want)
 		}
 	}
-	eventually(t, 5*time.Second, "the offset to be persisted", func() bool {
-		return readSaved() == endOffset(path)
-	})
+	if lastOffset != endOffset(path) {
+		t.Errorf("offset on the last message = %d, want %d (the end of the log)", lastOffset, endOffset(path))
+	}
 	close(stop)
 
-	// Restarting from the persisted offset must pick up only what is new. A
-	// replay here would re-notify the session with everything it has already
-	// seen every time its monitor restarts.
-	out2 := make(chan *Message, 8)
+	// A replay here would re-notify the session with everything it has
+	// already seen every time its monitor restarts.
+	out2 := make(chan followedMessage, 8)
 	stop2 := make(chan struct{})
 	defer close(stop2)
-	go followSource(path, readSaved(), out2, stop2, nil, func(string, ...any) {})
+	go followSource(path, lastOffset, "topic", out2, stop2, func(string, ...any) {})
 	appendMessage(t, path, "three")
 
 	select {
-	case m := <-out2:
-		if m.Text != "three" {
-			t.Fatalf("got %q after restart, want only the new line", m.Text)
+	case fm := <-out2:
+		if fm.msg.Text != "three" {
+			t.Fatalf("got %q after restart, want only the new line", fm.msg.Text)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for the line appended after the restart")
@@ -748,16 +1533,16 @@ func TestFollowSourceSkipsUnparseableLines(t *testing.T) {
 		t.Fatalf("write log: %v", err)
 	}
 
-	out := make(chan *Message, 4)
+	out := make(chan followedMessage, 4)
 	stop := make(chan struct{})
 	defer close(stop)
-	go followSource(path, 0, out, stop, nil, func(string, ...any) {})
+	go followSource(path, 0, "topic", out, stop, func(string, ...any) {})
 	appendMessage(t, path, "after the junk")
 
 	select {
-	case m := <-out:
-		if m.Text != "after the junk" {
-			t.Fatalf("got %q, want the message after the junk line", m.Text)
+	case fm := <-out:
+		if fm.msg.Text != "after the junk" {
+			t.Fatalf("got %q, want the message after the junk line", fm.msg.Text)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("follower stalled on an unparseable line")

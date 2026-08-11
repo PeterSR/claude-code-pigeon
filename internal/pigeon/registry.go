@@ -54,29 +54,88 @@ type Entry struct {
 	StartedAt     string   `json:"startedAt,omitempty"`
 	HeartbeatAt   string   `json:"heartbeatAt,omitempty"`
 	Subscriptions []string `json:"subscriptions,omitempty"`
-	CCVersion     string   `json:"ccVersion,omitempty"`
-	// ClaudeName is Claude Code's own session name, the one /status shows, and
-	// ClaudeNameSource is how Claude Code arrived at it ("derived" from the cwd,
-	// or user-set). Both are a host label pigeon merely reflects, never an
-	// address -- Name is what routing uses. They are filled in best-effort from
-	// Claude Code's session index and refreshed by the heartbeat, so a mid-session
-	// rename shows up within about 15s; empty when the index cannot be read.
-	// Withheld for private sessions, because a derived name echoes the cwd.
-	ClaudeName       string `json:"claudeName,omitempty"`
-	ClaudeNameSource string `json:"claudeNameSource,omitempty"`
-	Driven           bool   `json:"driven,omitempty"`
+
+	// Runtime names the agent host that wrote this entry; RuntimeVersion is
+	// that host's own version string. RuntimeClaudeCode is the only value
+	// pigeon writes today, but the field exists so a host is recorded as a
+	// fact rather than assumed -- see doctor.go's minCCVersion/testedCCVersion
+	// for the Claude-Code-specific version floor this is not.
+	Runtime        string `json:"runtime,omitempty"`
+	RuntimeVersion string `json:"runtimeVersion,omitempty"`
+	// Deprecated: written by pigeon before the runtime/label rename. Read,
+	// never written -- folded into RuntimeVersion when that key is absent (see
+	// Entry.migrateLegacy).
+	LegacyCCVersion string `json:"ccVersion,omitempty"`
+
+	// Label is a display name the host assigns -- the one /status shows, for
+	// Claude Code -- and LabelSource is how the host arrived at it ("derived"
+	// from the cwd, or a value marking it user-set). Both are a label pigeon
+	// merely reflects, never an address -- Name is what routing uses. They are
+	// filled in best-effort from the host's own session state (see
+	// claudesession.go for how Claude Code's is read) and refreshed by the
+	// heartbeat, so a mid-session rename shows up within about 15s; empty when
+	// that state cannot be read. Withheld for private sessions, because a
+	// derived label echoes the cwd.
+	Label       string `json:"label,omitempty"`
+	LabelSource string `json:"labelSource,omitempty"`
+	// Deprecated: written by pigeon before the rename. Read, never written --
+	// folded into Label/LabelSource when the new keys are absent (see
+	// Entry.migrateLegacy). The exposure of keeping the old reader around is
+	// small: a heartbeat rewrites a live entry every 15s, so a session whose
+	// monitor is from this build self-heals onto the new keys within one tick;
+	// one still running an older monitor keeps writing these for its own
+	// lifetime, and the worst consequence is a blank column in a listing,
+	// because the label is never an address and nothing routes on it.
+	LegacyClaudeName       string `json:"claudeName,omitempty"`
+	LegacyClaudeNameSource string `json:"claudeNameSource,omitempty"`
+	Driven                 bool   `json:"driven,omitempty"`
+	// Delivery maps a subscribed topic to how it reaches this session: absent
+	// (or "push") notifies per message, "digest" collapses routine traffic
+	// into one line a minute (an alert or a message naming this session in
+	// `for` still pushes immediately), "quiet" notifies nothing but that one
+	// line, ever -- see RunMonitor's delivery switch for the exact rules.
+	//
+	// The direct spool has no key here and cannot be configured: a message
+	// addressed to this session personally is not chatter to be batched, it
+	// is mail for exactly one reader, so RunMonitor never even looks this map
+	// up for it.
+	Delivery map[string]string `json:"delivery,omitempty"`
 	// Private sessions publish no cwd and no description. The flag itself is
 	// published so this session can be told why its own entry looks bare.
 	Private bool `json:"private,omitempty"`
-	// Ephemeral marks a session that is not a Claude Code session at all: a plain
+	// Ephemeral marks a session that is not an agent session at all: a plain
 	// shell holding an inbox open with `pigeon listen`. Its pid is that shell, it
-	// has no ClaudeName to reflect, and it vanishes the moment the shell exits, so
-	// listings mark it as a shell rather than reporting a blank Claude name as
+	// has no Label to reflect, and it vanishes the moment the shell exits, so
+	// listings mark it as a shell rather than reporting a blank label as
 	// something to fix.
 	Ephemeral bool `json:"ephemeral,omitempty"`
 
 	// Derived at read time, never persisted.
 	Status Status `json:"-"`
+}
+
+// RuntimeClaudeCode is the only Runtime value pigeon writes today.
+const RuntimeClaudeCode = "claude-code"
+
+// migrateLegacy folds an entry's pre-rename keys into their replacements
+// whenever the new key is absent, so an entry an older pigeon wrote reads the
+// same as one this build wrote. It never overwrites a new key that is already
+// set: that value is what wrote the entry most recently, and a legacy key
+// sitting next to it must not win back over a change made under this key.
+//
+// Called once, right after every raw JSON entry is unmarshalled -- see
+// ReadEntry, ListSessions and pruneDeadEntries -- so every reader downstream
+// of those sees the new shape regardless of which shape is actually on disk.
+func (e *Entry) migrateLegacy() {
+	if e.Label == "" {
+		e.Label = e.LegacyClaudeName
+	}
+	if e.LabelSource == "" {
+		e.LabelSource = e.LegacyClaudeNameSource
+	}
+	if e.RuntimeVersion == "" {
+		e.RuntimeVersion = e.LegacyCCVersion
+	}
 }
 
 // Display is the best short human handle for this session.
@@ -141,6 +200,7 @@ func (n Namespace) ReadEntry(sessionID string) (*Entry, error) {
 	if err := json.Unmarshal(b, &e); err != nil {
 		return nil, err
 	}
+	e.migrateLegacy()
 	// The directory is the truth about which namespace this session is in; the
 	// field is a convenience for whoever reads the JSON afterwards.
 	e.Namespace = n.String()
@@ -168,12 +228,16 @@ func (n Namespace) WriteEntry(e *Entry) error {
 	// cannot receive mail.
 	rec.Namespace = n.String()
 	if rec.Private {
-		// The Claude name goes too: a derived one is the cwd basename with a
+		// The label goes too: a derived one is the cwd basename with a
 		// suffix, so publishing it would leak exactly the directory Private is
 		// meant to keep off the bus.
 		rec.Cwd, rec.Description = "", ""
-		rec.ClaudeName, rec.ClaudeNameSource = "", ""
+		rec.Label, rec.LabelSource = "", ""
 	}
+	// Legacy keys are read, never written: whatever put them on rec -- a
+	// migrateLegacy fold-in from ReadEntry, or a hand-edited file -- must not
+	// be carried forward by a write this build makes.
+	rec.LegacyClaudeName, rec.LegacyClaudeNameSource, rec.LegacyCCVersion = "", "", ""
 	b, err := json.MarshalIndent(&rec, "", "  ")
 	if err != nil {
 		return err
@@ -209,7 +273,61 @@ func (n Namespace) RemoveEntry(sessionID string) {
 	if ValidSessionID(sessionID) != nil {
 		return
 	}
+	// Leave a tombstone naming the process that owned this session, so the
+	// unattended sweep can tell "the monitor exited" from "the session is
+	// gone". Those are not the same thing and the difference is a mailbox:
+	// a monitor can die and rearm while its claude process runs on, and the
+	// spool it deliberately leaves behind is that session's unread mail.
+	//
+	// Written before the entry is removed, from the entry itself, because the
+	// entry is the only place the pid lives. Best effort: a failure here costs
+	// the sweep its exact signal and falls back to the age guard, which is the
+	// behaviour orphans from older builds get anyway.
+	if e, err := n.ReadEntry(sessionID); err == nil && e.PID > 0 {
+		if b, err := json.Marshal(tombstone{PID: e.PID, ProcStart: e.ProcStart}); err == nil {
+			_ = os.WriteFile(n.tombstonePath(sessionID), b, 0o600)
+		}
+	}
 	_ = os.Remove(n.entryPath(sessionID))
+}
+
+// tombstone records who owned a session whose entry has been removed. It exists
+// so the sweep has the one fact an orphan otherwise cannot supply: whether the
+// process that owned this state is still running.
+type tombstone struct {
+	PID       int    `json:"pid"`
+	ProcStart string `json:"procStart,omitempty"`
+}
+
+// tombstoneSuffix is deliberately not ".json": the sessions directory is
+// globbed for "*.json" by both pruneDeadEntries and reconcileOrphans, and a
+// tombstone must never be mistaken for an entry.
+const tombstoneSuffix = ".gone"
+
+func (n Namespace) tombstonePath(sessionID string) string {
+	return filepath.Join(n.SessionsDir(), sessionID+tombstoneSuffix)
+}
+
+// clearTombstone drops the record left by a previous exit of this session.
+func (n Namespace) clearTombstone(sessionID string) {
+	if ValidSessionID(sessionID) != nil {
+		return
+	}
+	_ = os.Remove(n.tombstonePath(sessionID))
+}
+
+// ownerAlive reports whether the process that owned sessionID is still running,
+// and whether a tombstone was found to ask at all.
+func (n Namespace) ownerAlive(sessionID string) (alive, known bool) {
+	b, err := os.ReadFile(n.tombstonePath(sessionID))
+	if err != nil {
+		return false, false
+	}
+	var t tombstone
+	if err := json.Unmarshal(b, &t); err != nil || t.PID <= 0 {
+		return false, false
+	}
+	return ProcessAlive(t.PID, t.ProcStart), true
 }
 
 // monitorListening reports whether a monitor currently holds the session lock.
@@ -282,6 +400,7 @@ func (n Namespace) ListSessions(includeDead, prune bool) ([]*Entry, error) {
 		if err := json.Unmarshal(b, &e); err != nil {
 			continue
 		}
+		e.migrateLegacy()
 		// A planted entry file must not be able to steer prune at a path
 		// outside the state tree.
 		if ValidSessionID(e.SessionID) != nil ||
@@ -328,6 +447,7 @@ func (n Namespace) pruneDeadEntries(exceptSID string) int {
 		if err := json.Unmarshal(b, &e); err != nil {
 			continue
 		}
+		e.migrateLegacy()
 		// A planted entry file must not be able to steer this at a path
 		// outside the state tree, same guard as ListSessions.
 		if ValidSessionID(e.SessionID) != nil || filepath.Base(p) != e.SessionID+".json" {
@@ -442,6 +562,7 @@ func (n Namespace) removeSessionFiles(sessionID, entryFile string) {
 	_ = os.Remove(entryFile)
 	_ = os.Remove(n.SpoolPath(sessionID))
 	_ = os.Remove(n.cursorPath(sessionID))
+	_ = os.Remove(n.tombstonePath(sessionID))
 }
 
 // reclaimPayloads removes payload files no surviving log still points at.
@@ -476,6 +597,11 @@ func (n Namespace) referencedPayloads() map[string]bool {
 	return refs
 }
 
+// collectPayloadRefs records every payload path a log's messages still point
+// at -- the body-overflow file named by Payload, and every file named by
+// Attach. Both spill to the same payload directory (see attachFiles), so both
+// have to be counted here or the second one is exactly what a live message
+// still points at that this scan would otherwise call garbage.
 func collectPayloadRefs(logPath string, into map[string]bool) {
 	f, err := os.Open(logPath)
 	if err != nil {
@@ -486,15 +612,27 @@ func collectPayloadRefs(logPath string, into map[string]bool) {
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {
 		m, err := ParseMessage(strings.TrimSpace(sc.Text()))
-		if err != nil || m.Payload == "" {
+		if err != nil {
 			continue
 		}
-		into[m.Payload] = true
+		if m.Payload != "" {
+			into[m.Payload] = true
+		}
+		for _, p := range m.Attach {
+			if p != "" {
+				into[p] = true
+			}
+		}
 	}
 }
 
 func reclaimPayloadsIn(dir string, referenced map[string]bool) (removed int, bytes int64) {
-	paths, err := filepath.Glob(filepath.Join(dir, "*.txt"))
+	// Every file in the directory, not just *.txt. Bodies spill as
+	// "<id>.txt", but an attachment keeps its own extension, so a .patch or a
+	// .go copied in here was invisible to reclamation and leaked forever. The
+	// referenced-set check below is what decides safety; the glob only decides
+	// what gets considered.
+	paths, err := filepath.Glob(filepath.Join(dir, "*"))
 	if err != nil {
 		return 0, 0
 	}
@@ -522,11 +660,38 @@ func reclaimPayloadsIn(dir string, referenced map[string]bool) (removed int, byt
 // ReconcileOrphans is the exported entry point for the sweep. It covers one
 // namespace; a session whose project config changed namespace leaves its old
 // entry behind, and only sweeping every namespace clears that.
+//
+// This form sweeps every orphan regardless of age, which is what `pigeon prune`
+// asks for: the person typing it is present and has decided. The automatic
+// sweep uses reconcileOrphans(orphanGrace) instead -- see the hazard there.
 func ReconcileOrphans() int { return CurrentNamespace().ReconcileOrphans() }
 
-func (n Namespace) ReconcileOrphans() int { return n.reconcileOrphans() }
+func (n Namespace) ReconcileOrphans() int { return n.reconcileOrphans(0, "") }
 
-func (n Namespace) reconcileOrphans() int {
+// orphanGrace bounds how long leftover state survives when nothing can say who
+// owned it. It is the FALLBACK, not the rule: see ownerAlive.
+//
+// "No entry" does not mean "gone". A monitor removes the entry on its way out
+// but deliberately leaves the spool, so mail queued while nothing was listening
+// survives until a monitor comes back for it, and monitors do die and rearm
+// without the claude process ever exiting. Deleting such a session's state
+// costs it every message published while it was away: its cursors are re-seeded
+// at the END of each log on the next registration, so the gap is not
+// redelivered, it is skipped.
+//
+// Which is why an mtime is not good enough on its own, and this originally
+// shipped believing it was. A cursor file is written when messages flow, not
+// while a session merely lives, so a quiet session's cursors can be older than
+// any grace period while the session is running perfectly well. The tombstone
+// RemoveEntry leaves is the exact signal; age only decides orphans that predate
+// it, which by definition come from a build that never wrote one and are
+// therefore genuinely old.
+const orphanGrace = 24 * time.Hour
+
+// reconcileOrphans clears state whose session has no registry entry. exceptSID
+// is never touched: its caller may be registering that session right now, and
+// its entry does not exist yet.
+func (n Namespace) reconcileOrphans(minAge time.Duration, exceptSID string) int {
 	known := map[string]bool{}
 	entries, err := filepath.Glob(filepath.Join(n.SessionsDir(), "*.json"))
 	if err == nil {
@@ -546,9 +711,30 @@ func (n Namespace) reconcileOrphans() int {
 			if id == "" || known[id] || ValidSessionID(id) != nil {
 				continue
 			}
+			if id == exceptSID {
+				continue
+			}
+			if minAge > 0 {
+				// The tombstone answers exactly, so age is never consulted when
+				// there is one: a session whose monitor exited an hour ago but
+				// whose claude process is still running keeps its mail, and one
+				// whose process is gone is collected immediately rather than
+				// after a day.
+				if alive, known := n.ownerAlive(id); known {
+					if alive {
+						continue
+					}
+				} else {
+					fi, err := os.Stat(p)
+					if err != nil || time.Since(fi.ModTime()) < minAge {
+						continue
+					}
+				}
+			}
 			if os.Remove(p) == nil {
 				removed++
 			}
+			_ = os.Remove(n.tombstonePath(id))
 		}
 	}
 	sweep(n.InboxDir(), ".ndjson")

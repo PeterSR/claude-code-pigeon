@@ -218,7 +218,7 @@ func TestApplyProjectConfigSeedsIdentityAndTopics(t *testing.T) {
 		t.Errorf("name/desc = %q/%q", name, desc)
 	}
 	// The public mailbox is always joined, config or not.
-	if strings.Join(subs, ",") != defaultSubs("deploys") {
+	if strings.Join(subs, ",") != defaultSubsIn(dir, "deploys") {
 		t.Errorf("subs = %v", subs)
 	}
 }
@@ -241,15 +241,16 @@ func TestApplyProjectConfigWillNotStealATakenName(t *testing.T) {
 		t.Errorf("the collision was not explained: %q", logged.String())
 	}
 	// Losing the name must not cost the session its topics.
-	if strings.Join(subs, ",") != defaultSubs("deploys") {
+	if strings.Join(subs, ",") != defaultSubsIn(dir, "deploys") {
 		t.Errorf("subs = %v", subs)
 	}
 }
 
 func TestApplyProjectConfigFallsBackToPublicTopicOnly(t *testing.T) {
 	withHome(t)
-	name, desc, subs := applyConfig(t, "aaaa1111", t.TempDir(), func(string, ...any) {})
-	if name != "" || desc != "" || strings.Join(subs, ",") != defaultSubs() {
+	dir := t.TempDir()
+	name, desc, subs := applyConfig(t, "aaaa1111", dir, func(string, ...any) {})
+	if name != "" || desc != "" || strings.Join(subs, ",") != defaultSubsIn(dir) {
 		t.Errorf("got %q/%q/%v, want an unnamed session on the public topic only", name, desc, subs)
 	}
 }
@@ -266,7 +267,7 @@ func TestRegisterLetsTheSessionOverrideProjectConfig(t *testing.T) {
 	t.Setenv(EnvClaudePID, "")
 
 	quiet := func(string, ...any) {}
-	if err := register(DefaultNamespace(), "aaaa1111", quiet); err != nil {
+	if err := register(DefaultNamespace(), "aaaa1111", CurrentRuntime(), quiet); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	if e, _ := ReadEntry("aaaa1111"); e.Name != "api" {
@@ -285,7 +286,7 @@ func TestRegisterLetsTheSessionOverrideProjectConfig(t *testing.T) {
 	}
 
 	// A monitor restart re-registers the same session id.
-	if err := register(DefaultNamespace(), "aaaa1111", quiet); err != nil {
+	if err := register(DefaultNamespace(), "aaaa1111", CurrentRuntime(), quiet); err != nil {
 		t.Fatalf("re-register: %v", err)
 	}
 	e, err := ReadEntry("aaaa1111")
@@ -310,16 +311,16 @@ func TestRegisterPreservesTopicCursorsAcrossRestarts(t *testing.T) {
 	t.Setenv(EnvProjectDir, dir)
 
 	quiet := func(string, ...any) {}
-	if err := register(DefaultNamespace(), "aaaa1111", quiet); err != nil {
+	if err := register(DefaultNamespace(), "aaaa1111", CurrentRuntime(), quiet); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	before := readCursors("aaaa1111")["deploys"]
 
 	// Something is published while this session's monitor is down.
-	if _, err := Publish("deploys", "shipped", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "shipped"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
-	if err := register(DefaultNamespace(), "aaaa1111", quiet); err != nil {
+	if err := register(DefaultNamespace(), "aaaa1111", CurrentRuntime(), quiet); err != nil {
 		t.Fatalf("re-register: %v", err)
 	}
 
@@ -453,7 +454,7 @@ func TestApplyProjectConfigRejectsAHostileRenderedName(t *testing.T) {
 		t.Errorf("the rejection was not explained:\n%s", logged.String())
 	}
 	// One bad field must not cost the session the rest of the config.
-	if strings.Join(subs, ",") != defaultSubs("ci") {
+	if strings.Join(subs, ",") != defaultSubsIn(dir, "ci") {
 		t.Errorf("subs = %v", subs)
 	}
 }
@@ -533,7 +534,7 @@ func TestPrivateSessionPublishesNoCwdOrDescription(t *testing.T) {
 	t.Setenv(EnvSessionID, "aaaa1111")
 	t.Setenv(EnvClaudePID, strconv.Itoa(os.Getpid()))
 
-	if err := register(DefaultNamespace(), "aaaa1111", func(string, ...any) {}); err != nil {
+	if err := register(DefaultNamespace(), "aaaa1111", CurrentRuntime(), func(string, ...any) {}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	e, err := ReadEntry("aaaa1111")

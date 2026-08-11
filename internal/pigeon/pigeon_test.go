@@ -1,9 +1,11 @@
 package pigeon
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -102,6 +104,23 @@ func armed(t *testing.T, id, name string) *Entry {
 	return e
 }
 
+// armedIn is armed in a named namespace, for tests about a genuinely live
+// session outside the default namespace.
+func armedIn(t *testing.T, ns Namespace, id, name string) *Entry {
+	t.Helper()
+	e := liveEntryIn(t, ns, id, name, "/tmp/work")
+	e.HeartbeatAt = nowRFC3339()
+	if err := ns.WriteEntry(e); err != nil {
+		t.Fatalf("WriteEntry: %v", err)
+	}
+	lock, acquired, err := tryExclusive(ns.LockPath(id))
+	if err != nil || !acquired {
+		t.Fatalf("take monitor lock: acquired=%v err=%v", acquired, err)
+	}
+	t.Cleanup(func() { lock.Close() })
+	return e
+}
+
 // mustNS parses a namespace a test wrote itself, where a rejection is a bug in
 // the test rather than a case worth handling.
 func mustNS(t *testing.T, name string) Namespace {
@@ -115,8 +134,15 @@ func mustNS(t *testing.T, name string) Namespace {
 
 // defaultSubs is what a session comes up subscribed to, plus whatever a config
 // added, in the order the entry stores them.
-func defaultSubs(extra ...string) string {
-	subs := append(defaultSubscriptions(DefaultNamespace()), extra...)
+//
+// Takes the cwd because the default set now includes a topic derived from it
+// (see CheckoutTopic): a session registering from a checkout joins that
+// checkout's room, so a helper that assumed "" would disagree with every test
+// that registers for real.
+func defaultSubs(extra ...string) string { return defaultSubsIn(CurrentCwd(), extra...) }
+
+func defaultSubsIn(cwd string, extra ...string) string {
+	subs := append(defaultSubscriptions(DefaultNamespace(), cwd, false), extra...)
 	sort.Strings(subs)
 	return strings.Join(subs, ",")
 }
@@ -202,7 +228,7 @@ func TestSendRoundTrip(t *testing.T) {
 	to := liveEntry(t, "bbbb2222-3333", "beta", "/tmp/y")
 
 	from := Sender{Kind: "session", SessionID: "aaaa1111-2222", Name: "alpha"}
-	msg, err := Send(to, "the build is green", from, "")
+	msg, err := Send(to, Draft{Text: "the build is green"}, from)
 	if err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -226,8 +252,78 @@ func TestSendRoundTrip(t *testing.T) {
 func TestSendRejectsEmpty(t *testing.T) {
 	withHome(t)
 	to := liveEntry(t, "cccc3333-4444", "", "/tmp/z")
-	if _, err := Send(to, "   \n\t ", Sender{Kind: "shell"}, ""); err == nil {
+	if _, err := Send(to, Draft{Text: "   \n\t "}, Sender{Kind: "shell"}); err == nil {
 		t.Fatal("expected an error for a whitespace-only message")
+	}
+}
+
+// A subject is rejected outright rather than truncated: the whole point of
+// SubjectLimit is that the sender can trust the subject arrived exactly as
+// written, which a silent truncation would break just as much as an
+// unenforced limit would.
+func TestSendRejectsAnOversizeSubject(t *testing.T) {
+	withHome(t)
+	to := liveEntry(t, "cccc3333-5555", "", "/tmp/z2")
+	over := strings.Repeat("s", SubjectLimit+1)
+	_, err := Send(to, Draft{Text: "hello", Subject: over}, Sender{Kind: "shell", Name: "sh"})
+	if err == nil {
+		t.Fatal("expected an error for a subject over the limit")
+	}
+	if !strings.Contains(err.Error(), "121") || !strings.Contains(err.Error(), "120") {
+		t.Errorf("error should name both the actual and allowed length: %v", err)
+	}
+	// A rejected draft must leave no trace: a half-sent message with a
+	// truncated subject would be worse than an outright refusal.
+	if _, err := os.Stat(SpoolPath(to.SessionID)); !os.IsNotExist(err) {
+		t.Error("Send wrote to the spool despite rejecting the subject")
+	}
+}
+
+func TestPublishRejectsAnOversizeSubject(t *testing.T) {
+	withHome(t)
+	over := strings.Repeat("s", SubjectLimit+1)
+	_, err := Publish("deploys", Draft{Text: "shipped", Subject: over}, Sender{Kind: "shell", Name: "sh"})
+	if err == nil {
+		t.Fatal("expected an error for a subject over the limit")
+	}
+	if !strings.Contains(err.Error(), "121") || !strings.Contains(err.Error(), "120") {
+		t.Errorf("error should name both the actual and allowed length: %v", err)
+	}
+}
+
+// A brief over BriefLimit is rejected outright, not truncated -- the same
+// promise SubjectLimit makes, generalised by validateBounded rather than
+// re-implemented for the second field.
+func TestSendRejectsAnOversizeBrief(t *testing.T) {
+	withHome(t)
+	to := liveEntry(t, "cccc3333-6666", "", "/tmp/z3")
+	over := strings.Repeat("b", BriefLimit+1)
+	_, err := Send(to, Draft{Text: "hello", Brief: over}, Sender{Kind: "shell", Name: "sh"})
+	if err == nil {
+		t.Fatal("expected an error for a brief over the limit")
+	}
+	if !strings.Contains(err.Error(), "601") || !strings.Contains(err.Error(), "600") {
+		t.Errorf("error should name both the actual and allowed length: %v", err)
+	}
+	if !strings.Contains(err.Error(), "brief") {
+		t.Errorf("error should name the field: %v", err)
+	}
+	// A rejected draft must leave no trace, the same guarantee an oversize
+	// subject gets.
+	if _, err := os.Stat(SpoolPath(to.SessionID)); !os.IsNotExist(err) {
+		t.Error("Send wrote to the spool despite rejecting the brief")
+	}
+}
+
+func TestPublishRejectsAnOversizeBrief(t *testing.T) {
+	withHome(t)
+	over := strings.Repeat("b", BriefLimit+1)
+	_, err := Publish("deploys", Draft{Text: "shipped", Brief: over}, Sender{Kind: "shell", Name: "sh"})
+	if err == nil {
+		t.Fatal("expected an error for a brief over the limit")
+	}
+	if !strings.Contains(err.Error(), "601") || !strings.Contains(err.Error(), "600") {
+		t.Errorf("error should name both the actual and allowed length: %v", err)
 	}
 }
 
@@ -240,7 +336,7 @@ func TestSendConcurrentWritersDoNotInterleave(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func() {
 			defer func() { done <- struct{}{} }()
-			_, _ = Send(to, strings.Repeat("x", 100), Sender{Kind: "shell", Name: "sh"}, "")
+			_, _ = Send(to, Draft{Text: strings.Repeat("x", 100)}, Sender{Kind: "shell", Name: "sh"})
 		}()
 	}
 	for i := 0; i < n; i++ {
@@ -267,7 +363,7 @@ func TestOversizeBodySpillsToPayload(t *testing.T) {
 	to := liveEntry(t, "eeee5555-6666", "", "/tmp/v")
 
 	long := strings.Repeat("a", BodyBudget*3)
-	msg, err := Send(to, long, Sender{Kind: "shell", Name: "sh"}, "")
+	msg, err := Send(to, Draft{Text: long}, Sender{Kind: "shell", Name: "sh"})
 	if err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -285,6 +381,96 @@ func TestOversizeBodySpillsToPayload(t *testing.T) {
 	// The notification itself must stay within the ~512 char clip.
 	if n := len([]rune(Render(msg))); n > 512 {
 		t.Errorf("rendered notification is %d chars, over the 512 clip", n)
+	}
+}
+
+// --- attachments -------------------------------------------------------------
+
+func writeTempFile(t *testing.T, name string, size int) string {
+	t.Helper()
+	dir := t.TempDir()
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, bytes.Repeat([]byte("x"), size), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return p
+}
+
+// A message may carry up to 5 attachments; the 6th is rejected outright
+// rather than silently dropped, and nothing from the draft is sent.
+func TestAttachRejectsMoreThanFiveFiles(t *testing.T) {
+	withHome(t)
+	to := liveEntry(t, "eeee5555-6666", "", "/tmp/v")
+	var paths []string
+	for i := 0; i < 6; i++ {
+		paths = append(paths, writeTempFile(t, fmt.Sprintf("f%d.txt", i), 10))
+	}
+	if _, err := Send(to, Draft{Text: "see attached", Attach: paths}, Sender{Kind: "shell", Name: "sh"}); err == nil {
+		t.Error("Send accepted 6 attachments; the limit is 5")
+	}
+}
+
+// A single attachment over the 256 KiB cap is rejected with a clear error,
+// not truncated or silently skipped.
+func TestAttachRejectsAnOversizeFile(t *testing.T) {
+	withHome(t)
+	to := liveEntry(t, "eeee5555-6666", "", "/tmp/v")
+	big := writeTempFile(t, "big.txt", maxAttachmentBytes+1)
+	_, err := Send(to, Draft{Text: "see attached", Attach: []string{big}}, Sender{Kind: "shell", Name: "sh"})
+	if err == nil {
+		t.Fatal("Send accepted an attachment over the size limit")
+	}
+	if !strings.Contains(err.Error(), "256") && !strings.Contains(err.Error(), fmt.Sprint(maxAttachmentBytes)) {
+		t.Errorf("error does not mention the size limit: %v", err)
+	}
+}
+
+// An attachment within the limits is copied into the recipient's payload
+// directory, named <id>-<basename>, and Render never mentions it.
+func TestAttachCopiesFileAndKeepsItOutOfRender(t *testing.T) {
+	withHome(t)
+	to := liveEntry(t, "eeee5555-6666", "", "/tmp/v")
+	src := writeTempFile(t, "stage-hunk.sh", 20)
+	msg, err := Send(to, Draft{Text: "see attached", Attach: []string{src}}, Sender{Kind: "shell", Name: "sh"})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if len(msg.Attach) != 1 {
+		t.Fatalf("Attach = %v, want exactly one stored path", msg.Attach)
+	}
+	if got, want := filepath.Base(msg.Attach[0]), msg.ID+"-stage-hunk.sh"; got != want {
+		t.Errorf("stored attachment basename = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(msg.Attach[0]); err != nil {
+		t.Fatalf("stored attachment missing: %v", err)
+	}
+	if strings.Contains(Render(msg), "stage-hunk.sh") {
+		t.Errorf("Render mentioned the attachment; the notification budget has no room for it:\n%s", Render(msg))
+	}
+}
+
+// pruning must never delete an attachment a message still points at.
+// collectPayloadRefs has to walk Attach as well as Payload, or a compaction
+// pass reclaims a file the log is still naming.
+func TestPruneKeepsALiveAttachment(t *testing.T) {
+	withHome(t)
+	to := liveEntry(t, "eeee5555-6666", "", "/tmp/v")
+	src := writeTempFile(t, "notes.txt", 20)
+	msg, err := Send(to, Draft{Text: "see attached", Attach: []string{src}}, Sender{Kind: "shell", Name: "sh"})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	attachPath := msg.Attach[0]
+	if _, err := os.Stat(attachPath); err != nil {
+		t.Fatalf("attachment missing before prune: %v", err)
+	}
+
+	removed, _ := CurrentNamespace().reclaimPayloads()
+	if removed != 0 {
+		t.Errorf("reclaimPayloads removed %d file(s), want 0: the attachment is still referenced", removed)
+	}
+	if _, err := os.Stat(attachPath); err != nil {
+		t.Fatalf("prune deleted a live attachment: %v", err)
 	}
 }
 
@@ -319,6 +505,50 @@ func TestRenderOmitsReplyForShellSender(t *testing.T) {
 	m := &Message{From: Sender{Kind: "shell", Name: "shell:p@h"}, Text: "hi"}
 	if got := Render(m); strings.Contains(got, "reply:") {
 		t.Errorf("Render() offered a reply handle to a shell sender: %q", got)
+	}
+}
+
+// A message with no subject must render byte-identical to how it always
+// has: subject support has to be additive, not a reformatting of the
+// ordinary case nobody asked to change.
+func TestRenderWithoutSubjectMatchesTheOriginalFormat(t *testing.T) {
+	m := &Message{
+		From:  Sender{Kind: "session", SessionID: "aaaa1111-2222", Name: "alpha", Cwd: "/home/p/api"},
+		Topic: "deploys",
+		Text:  "v2.1 rolled out",
+	}
+	got := Render(m)
+	want := "[pigeon #deploys] from alpha (api) :: v2.1 rolled out [reply: pigeon send alpha] [topic: pigeon publish deploys]"
+	if got != want {
+		t.Errorf("Render() = %q, want %q -- adding Subject changed the no-subject format", got, want)
+	}
+}
+
+// A brief is a pull-path concern only: Render builds the notification line,
+// and the notification budget did not grow to make room for it. A message
+// with a brief must therefore render byte-identical to the same message with
+// none -- the field is additive at the inbox tier and invisible everywhere
+// else.
+func TestRenderIgnoresBrief(t *testing.T) {
+	withBrief := &Message{
+		From:    Sender{Kind: "session", SessionID: "aaaa1111-2222", Name: "alpha", Cwd: "/home/p/api"},
+		Topic:   "deploys",
+		Text:    "v2.1 rolled out",
+		Subject: "release",
+		Brief:   "The 2.1 release rolled out to every region with no errors.",
+	}
+	withoutBrief := &Message{
+		From:    withBrief.From,
+		Topic:   withBrief.Topic,
+		Text:    withBrief.Text,
+		Subject: withBrief.Subject,
+	}
+	got, want := Render(withBrief), Render(withoutBrief)
+	if got != want {
+		t.Errorf("Render() with a brief = %q, want byte-identical to without one: %q", got, want)
+	}
+	if strings.Contains(got, withBrief.Brief) {
+		t.Errorf("Render() leaked the brief into the notification line: %q", got)
 	}
 }
 
@@ -369,6 +599,92 @@ func TestEntryPersistence(t *testing.T) {
 	RemoveEntry("aaaa1111-2222")
 	if _, err := ReadEntry("aaaa1111-2222"); err == nil {
 		t.Error("entry survived RemoveEntry")
+	}
+}
+
+// An entry an older pigeon wrote carries claudeName/claudeNameSource/ccVersion
+// rather than label/labelSource/runtimeVersion. Reading it must still populate
+// the new fields, since a live fleet upgrades one session at a time and every
+// reader -- ls, whoami, list_sessions -- has to make sense of whichever shape
+// is actually on disk.
+func TestReadEntryFoldsLegacyKeysIntoNewFields(t *testing.T) {
+	withHome(t)
+	sid := "1eaa1111-2222-3333-4444-555555555555"
+	legacy := `{
+		"sessionId": "` + sid + `",
+		"pid": 1,
+		"claudeName": "legacy-title",
+		"claudeNameSource": "user",
+		"ccVersion": "2.1.100"
+	}`
+	if err := os.WriteFile(filepath.Join(SessionsDir(), sid+".json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e, err := ReadEntry(sid)
+	if err != nil {
+		t.Fatalf("ReadEntry: %v", err)
+	}
+	if e.Label != "legacy-title" || e.LabelSource != "user" || e.RuntimeVersion != "2.1.100" {
+		t.Fatalf("Label=%q LabelSource=%q RuntimeVersion=%q; want legacy-title/user/2.1.100",
+			e.Label, e.LabelSource, e.RuntimeVersion)
+	}
+}
+
+// A freshly written entry must carry only the new keys: the legacy ones are
+// read, never written, however they got into the in-memory copy (a
+// migrateLegacy fold-in from a prior read, or a caller that set them by hand).
+func TestWriteEntryOmitsLegacyKeys(t *testing.T) {
+	withHome(t)
+	sid := "2eaa1111-2222-3333-4444-555555555555"
+	if err := WriteEntry(&Entry{
+		SessionID:              sid,
+		PID:                    1,
+		Label:                  "current-title",
+		LabelSource:            "user",
+		Runtime:                RuntimeClaudeCode,
+		RuntimeVersion:         "2.1.200",
+		LegacyClaudeName:       "should-not-be-written",
+		LegacyClaudeNameSource: "should-not-be-written",
+		LegacyCCVersion:        "should-not-be-written",
+	}); err != nil {
+		t.Fatalf("WriteEntry: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(SessionsDir(), sid+".json"))
+	if err != nil {
+		t.Fatalf("read entry file: %v", err)
+	}
+	for _, key := range []string{"claudeName", "claudeNameSource", "ccVersion"} {
+		if strings.Contains(string(raw), `"`+key+`"`) {
+			t.Errorf("written entry still carries legacy key %q:\n%s", key, raw)
+		}
+	}
+	for _, key := range []string{"label", "labelSource", "runtime", "runtimeVersion"} {
+		if !strings.Contains(string(raw), `"`+key+`"`) {
+			t.Errorf("written entry is missing new key %q:\n%s", key, raw)
+		}
+	}
+}
+
+// `pigeon ls`'s claude= column (see claudeCol in cmd/pigeon) and list_sessions'
+// equivalent both read Entry.Label, so a legacy entry must still surface a
+// label after ReadEntry folds claudeName in -- this is what keeps that column
+// non-blank for a session an older monitor is still heartbeating.
+func TestLegacyEntryStillPopulatesLabelForDisplay(t *testing.T) {
+	withHome(t)
+	sid := "3eaa1111-2222-3333-4444-555555555555"
+	legacy := `{"sessionId": "` + sid + `", "pid": 1, "claudeName": "old-style-label"}`
+	if err := os.WriteFile(filepath.Join(SessionsDir(), sid+".json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e, err := ReadEntry(sid)
+	if err != nil {
+		t.Fatalf("ReadEntry: %v", err)
+	}
+	if e.Label == "" {
+		t.Fatal("a legacy entry's label read back empty; the claude= column would show a dash")
+	}
+	if e.Label != "old-style-label" {
+		t.Fatalf("Label = %q, want old-style-label", e.Label)
 	}
 }
 
@@ -520,10 +836,10 @@ func TestValidTopic(t *testing.T) {
 func TestPublishAppendsToTopicLog(t *testing.T) {
 	withHome(t)
 	from := Sender{Kind: "session", SessionID: "aaaa1111-2222", Name: "alpha"}
-	if _, err := Publish("deploys", "v1 shipped", from); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "v1 shipped"}, from); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
-	if _, err := Publish("deploys", "v2 shipped", from); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "v2 shipped"}, from); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 
@@ -546,7 +862,7 @@ func TestPublishAppendsToTopicLog(t *testing.T) {
 
 func TestPublishRejectsBadTopic(t *testing.T) {
 	withHome(t)
-	if _, err := Publish("../etc", "x", Sender{Kind: "shell"}); err == nil {
+	if _, err := Publish("../etc", Draft{Text: "x"}, Sender{Kind: "shell"}); err == nil {
 		t.Fatal("expected a path-traversal topic to be rejected")
 	}
 }
@@ -576,11 +892,46 @@ func TestSubscribeAndUnsubscribe(t *testing.T) {
 	}
 }
 
+func TestSetDeliveryRejectsAnInvalidMode(t *testing.T) {
+	withHome(t)
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+	if err := SetDelivery("aaaa1111-2222", "deploys", "bogus"); err == nil {
+		t.Fatal("SetDelivery accepted an invalid mode")
+	}
+	if e, _ := ReadEntry("aaaa1111-2222"); e.Delivery != nil {
+		t.Errorf("Delivery = %v after a rejected mode, want untouched", e.Delivery)
+	}
+}
+
+// Setting a topic back to push removes its key rather than storing "push"
+// explicitly, so a session that never touched delivery modes and one that
+// dialled every topic back to push look identical on disk.
+func TestSetDeliveryToPushRemovesTheEntry(t *testing.T) {
+	withHome(t)
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+
+	if err := SetDelivery("aaaa1111-2222", "deploys", DeliveryDigest); err != nil {
+		t.Fatalf("SetDelivery (digest): %v", err)
+	}
+	e, _ := ReadEntry("aaaa1111-2222")
+	if e.Delivery["deploys"] != DeliveryDigest {
+		t.Fatalf("Delivery[deploys] = %q, want %q", e.Delivery["deploys"], DeliveryDigest)
+	}
+
+	if err := SetDelivery("aaaa1111-2222", "deploys", DeliveryPush); err != nil {
+		t.Fatalf("SetDelivery (push): %v", err)
+	}
+	e, _ = ReadEntry("aaaa1111-2222")
+	if _, ok := e.Delivery["deploys"]; ok {
+		t.Errorf("Delivery still has a %q key after setting it back to push: %v", "deploys", e.Delivery)
+	}
+}
+
 func TestSubscribeStartsAtEndOfLog(t *testing.T) {
 	withHome(t)
 	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
 	// Existing history must not be replayed into a new subscriber's context.
-	if _, err := Publish("deploys", "old news", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "old news"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := os.Stat(TopicPath("deploys"))
@@ -592,6 +943,86 @@ func TestSubscribeStartsAtEndOfLog(t *testing.T) {
 	}
 	if got := readCursors("aaaa1111-2222")["deploys"]; got != fi.Size() {
 		t.Errorf("cursor = %d, want end of log %d", got, fi.Size())
+	}
+}
+
+// A catch-up window plants the CONSUMPTION cursor (read:deploys) somewhere
+// short of the log's end, but the MONITOR cursor (deploys) still lands
+// exactly at the end -- unchanged from the no-catchup case above. Getting
+// this backwards would fire a burst of notifications for history nobody
+// asked to be pushed; this pins both cursors so a regression there fails
+// loudly.
+func TestSubscribeCatchupPlantsOnlyTheConsumptionCursor(t *testing.T) {
+	withHome(t)
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+	from := Sender{Kind: "shell", Name: "sh"}
+	for i := 0; i < 5; i++ {
+		if _, err := Publish("deploys", Draft{Text: fmt.Sprintf("msg-%d", i)}, from); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fi, err := os.Stat(TopicPath("deploys"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	logEnd := fi.Size()
+
+	waiting, err := CurrentNamespace().SubscribeCatchup("aaaa1111-2222", "deploys", "3")
+	if err != nil {
+		t.Fatalf("SubscribeCatchup: %v", err)
+	}
+	if waiting != 3 {
+		t.Errorf("waiting = %d, want 3", waiting)
+	}
+
+	cursors := readCursors("aaaa1111-2222")
+	if got := cursors["deploys"]; got != logEnd {
+		t.Errorf("monitor cursor = %d, want the log end %d: catch-up must never move it", got, logEnd)
+	}
+	if got := cursors[readCursorKey("deploys")]; got == logEnd {
+		t.Errorf("consumption cursor = %d, want somewhere short of the log end %d: catch-up did not plant it back", got, logEnd)
+	}
+
+	// The planted cursor must make exactly those 3 messages available as
+	// unread, no more and no fewer.
+	items, _, err := CurrentNamespace().ReadInbox("aaaa1111-2222", InboxQuery{UnreadOnly: true, MarkRead: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("ReadInbox after catch-up returned %d items, want 3: %+v", len(items), items)
+	}
+
+	// readat must stay unset: a catch-up window is not itself a pull, and its
+	// absence is what stops a session that only ever takes notifications from
+	// pinning a topic log open (see seedCursor's comment).
+	if _, ok := cursors[readAtCursorKey("deploys")]; ok {
+		t.Errorf("readat was set by catch-up alone; it must be set only by an actual ReadInbox pull")
+	}
+}
+
+// A duration-based catch-up window only counts what falls inside it.
+func TestSubscribeCatchupByDurationOnlyCountsRecentMessages(t *testing.T) {
+	withHome(t)
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+	topic := TopicPath("stale")
+	// A message older than the window, hand-timestamped so the test does not
+	// depend on real elapsed time.
+	appendRawMessage(t, topic, &Message{
+		ID: "m_old0000001a", TS: "2000-01-01T00:00:00Z", Topic: "stale",
+		From: Sender{Kind: "shell", Name: "sh"}, Text: "ancient history",
+	})
+	// One message inside the window.
+	if _, err := Publish("stale", Draft{Text: "fresh"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	waiting, err := CurrentNamespace().SubscribeCatchup("aaaa1111-2222", "stale", "30m")
+	if err != nil {
+		t.Fatalf("SubscribeCatchup: %v", err)
+	}
+	if waiting != 1 {
+		t.Errorf("waiting = %d, want 1 (only the message inside the 30m window)", waiting)
 	}
 }
 
@@ -631,6 +1062,44 @@ func TestListTopicsCountsSubscribers(t *testing.T) {
 	t.Errorf("%q missing from ListTopics", PublicTopic)
 }
 
+func TestSubscriberCountUnchangedWhenEveryoneIsLive(t *testing.T) {
+	withHome(t)
+	armed(t, "aaaa1111-2222", "alpha")
+	armed(t, "bbbb2222-3333", "beta")
+	if err := Subscribe("aaaa1111-2222", "deploys"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe("bbbb2222-3333", "deploys"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := CurrentNamespace().SubscriberCount("deploys", ""); got != 2 {
+		t.Errorf("SubscriberCount(deploys) = %d, want 2 -- both subscribers are live", got)
+	}
+}
+
+func TestSubscriberBreakdownSeparatesLiveFromDeaf(t *testing.T) {
+	withHome(t)
+	armed(t, "aaaa1111-2222", "alpha")              // live: monitor holds the lock
+	liveEntry(t, "bbbb2222-3333", "beta", "/tmp/b") // deaf: no monitor lock held
+	if err := Subscribe("aaaa1111-2222", "deploys"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe("bbbb2222-3333", "deploys"); err != nil {
+		t.Fatal(err)
+	}
+
+	live, deaf := CurrentNamespace().SubscriberBreakdown("deploys", "")
+	if live != 1 || deaf != 1 {
+		t.Errorf("SubscriberBreakdown(deploys) = (%d, %d), want (1, 1)", live, deaf)
+	}
+	// SubscriberCount must agree with the live half of the breakdown: a deaf
+	// subscriber cannot be told "reached" by either call.
+	if got := CurrentNamespace().SubscriberCount("deploys", ""); got != live {
+		t.Errorf("SubscriberCount(deploys) = %d, want %d (the live count)", got, live)
+	}
+}
+
 // --- follower -------------------------------------------------------------
 
 func TestFollowSourceDeliversNewLinesOnly(t *testing.T) {
@@ -642,10 +1111,10 @@ func TestFollowSourceDeliversNewLinesOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out := make(chan *Message, 4)
+	out := make(chan followedMessage, 4)
 	stop := make(chan struct{})
 	defer close(stop)
-	go followSource(path, endOffset(path), out, stop, nil, func(string, ...any) {})
+	go followSource(path, endOffset(path), "topic", out, stop, func(string, ...any) {})
 
 	post, _ := json.Marshal(&Message{ID: "new", Text: "after", From: Sender{Kind: "shell"}})
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
@@ -658,9 +1127,9 @@ func TestFollowSourceDeliversNewLinesOnly(t *testing.T) {
 	f.Close()
 
 	select {
-	case m := <-out:
-		if m.ID != "new" {
-			t.Fatalf("got message %q, want only lines appended after start", m.ID)
+	case fm := <-out:
+		if fm.msg.ID != "new" {
+			t.Fatalf("got message %q, want only lines appended after start", fm.msg.ID)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for the appended line")
@@ -674,10 +1143,10 @@ func TestFollowSourceRecoversFromTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out := make(chan *Message, 4)
+	out := make(chan followedMessage, 4)
 	stop := make(chan struct{})
 	defer close(stop)
-	go followSource(path, endOffset(path), out, stop, nil, func(string, ...any) {})
+	go followSource(path, endOffset(path), "topic", out, stop, func(string, ...any) {})
 
 	// Truncate, then write a fresh message: the follower must reset rather
 	// than sit past the end of a shorter file forever.
@@ -687,9 +1156,9 @@ func TestFollowSourceRecoversFromTruncation(t *testing.T) {
 	}
 
 	select {
-	case m := <-out:
-		if m.ID != "fresh" {
-			t.Fatalf("got %q, want fresh", m.ID)
+	case fm := <-out:
+		if fm.msg.ID != "fresh" {
+			t.Fatalf("got %q, want fresh", fm.msg.ID)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("follower did not recover from truncation")
@@ -698,16 +1167,20 @@ func TestFollowSourceRecoversFromTruncation(t *testing.T) {
 
 // --- rate limiting --------------------------------------------------------
 
+// A pure flood of normal traffic is capped short of maxPerMinute: the last
+// alertReserve slots of the window stay off-limits to it, so an alert would
+// always have room even though none was sent in this test.
 func TestRateLimiterSuppressesFloods(t *testing.T) {
 	withHome(t)
 	var sb strings.Builder
-	emit, _ := newRateLimiter(&sb, DefaultNamespace(), "/tmp/spool", time.Minute)
+	emit, _, _, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute, maxPerMinute)
 	for i := 0; i < maxPerMinute+25; i++ {
-		emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "line"})
+		emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "line"}, source: inboxCursorKey})
 	}
 	got := strings.Count(sb.String(), "\n")
-	if got != maxPerMinute {
-		t.Errorf("emitted %d lines, want the cap of %d", got, maxPerMinute)
+	want := maxPerMinute - alertReserve
+	if got != want {
+		t.Errorf("emitted %d lines, want the normal-traffic cap of %d (the rest is reserved for alerts)", got, want)
 	}
 }
 
@@ -719,13 +1192,14 @@ func TestRateLimiterNamesTheLogASuppressedMessageIsIn(t *testing.T) {
 	withHome(t)
 	ns := DefaultNamespace()
 	var sb strings.Builder
-	emit, flush := newRateLimiter(&sb, ns, ns.SpoolPath("aaaa1111"), time.Minute)
+	emit, _, flush, _ := newRateLimiter(&sb, ns, "", ns.SpoolPath("aaaa1111"), time.Minute, maxPerMinute)
 
-	// Fill the window with direct messages, then suppress a topic message.
-	for i := 0; i < maxPerMinute; i++ {
-		emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "direct"})
+	// Fill exactly the normal-traffic budget with direct messages, then
+	// suppress a topic message.
+	for i := 0; i < maxPerMinute-alertReserve; i++ {
+		emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "direct"}, source: inboxCursorKey})
 	}
-	emit(&Message{From: Sender{Kind: "shell", Name: "sh"}, Topic: "deploys", Text: "topic"})
+	emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Topic: "deploys", Text: "topic"}, source: "deploys"})
 
 	flush()
 
@@ -735,6 +1209,57 @@ func TestRateLimiterNamesTheLogASuppressedMessageIsIn(t *testing.T) {
 	}
 	if strings.Contains(out, ns.SpoolPath("aaaa1111")) {
 		t.Errorf("the notice named the direct spool for a topic message:\n%s", out)
+	}
+}
+
+// The reserve exists so a flood of routine traffic can never crowd out an
+// alert entirely: once ordinary messages have used up the normal-traffic
+// budget, an alert must still get through rather than being suppressed like
+// everything else.
+func TestAlertSurvivesAFloodThatExhaustsTheNormalBudget(t *testing.T) {
+	withHome(t)
+	var sb strings.Builder
+	emit, _, _, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute, maxPerMinute)
+
+	// Exhaust the normal-traffic budget and then some, so the flood alone
+	// would already be past what a plain cap could ever admit.
+	for i := 0; i < maxPerMinute; i++ {
+		emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "routine"}, source: inboxCursorKey})
+	}
+	emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Priority: PriorityAlert, Text: "the alert"}, source: inboxCursorKey})
+
+	if !strings.Contains(sb.String(), "the alert") {
+		t.Fatalf("an alert was suppressed by a flood of ordinary traffic it should have priority over:\n%s", sb.String())
+	}
+}
+
+// The suppression notice has to say which kind of message was dropped: a
+// suppressed alert is a materially worse event than a suppressed routine
+// message, and the notice is the only signal the recipient ever gets of
+// either.
+func TestSuppressionNoticeDistinguishesAlertsFromNormalMessages(t *testing.T) {
+	withHome(t)
+	var sb strings.Builder
+	emit, _, flush, _ := newRateLimiter(&sb, DefaultNamespace(), "", "/tmp/spool", time.Minute, maxPerMinute)
+
+	// Fill the normal-traffic budget, then spend the whole alert reserve too,
+	// so both a normal message and an alert have nowhere left in the window.
+	for i := 0; i < maxPerMinute-alertReserve; i++ {
+		emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "routine"}, source: inboxCursorKey})
+	}
+	for i := 0; i < alertReserve; i++ {
+		emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Priority: PriorityAlert, Text: "alert"}, source: inboxCursorKey})
+	}
+	emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Text: "one too many"}, source: inboxCursorKey})
+	emit(followedMessage{msg: &Message{From: Sender{Kind: "shell", Name: "sh"}, Priority: PriorityAlert, Text: "alert overflow"}, source: inboxCursorKey})
+
+	flush()
+	out := sb.String()
+	if !strings.Contains(out, "ALERT") {
+		t.Errorf("no notice distinguishes a suppressed alert from a suppressed normal message:\n%s", out)
+	}
+	if !strings.Contains(out, "further message(s) suppressed") {
+		t.Errorf("the ordinary suppression notice is missing:\n%s", out)
 	}
 }
 
@@ -887,7 +1412,7 @@ func TestConcurrentSubscribesDoNotLoseEachOther(t *testing.T) {
 func TestQueuedMailSurvivesUntilRead(t *testing.T) {
 	withHome(t)
 	to := liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
-	if _, err := Send(to, "queued while nobody listened", Sender{Kind: "shell", Name: "sh"}, ""); err != nil {
+	if _, err := Send(to, Draft{Text: "queued while nobody listened"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatal(err)
 	}
 	// A monitor that starts later must be able to see it: the spool is the
@@ -972,7 +1497,7 @@ func TestPruneClearsEverySessionFile(t *testing.T) {
 
 func TestPruneTopicsRemovesUnsubscribedLogs(t *testing.T) {
 	withHome(t)
-	if _, err := Publish("orphaned", "nobody listens to this", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := Publish("orphaned", Draft{Text: "nobody listens to this"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(TopicPath("orphaned")); err != nil {
@@ -997,7 +1522,7 @@ func TestPruneTopicsKeepsSubscribedLogs(t *testing.T) {
 	if err := Subscribe("aaaa1111-2222", "kept"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Publish("kept", "someone is listening", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := Publish("kept", Draft{Text: "someone is listening"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := PruneTopics(); err != nil {
@@ -1020,7 +1545,7 @@ func TestPruneTopicsCompactsWithoutMovingCursors(t *testing.T) {
 	from := Sender{Kind: "shell", Name: "sh"}
 	body := strings.Repeat("x", 250)
 	for i := 0; i < 600; i++ {
-		if _, err := Publish("busy", body, from); err != nil {
+		if _, err := Publish("busy", Draft{Text: body}, from); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1078,7 +1603,7 @@ func TestPruneTopicsWaitsForTheSlowestSubscriber(t *testing.T) {
 	}
 	from := Sender{Kind: "shell", Name: "sh"}
 	for i := 0; i < 600; i++ {
-		if _, err := Publish("shared", strings.Repeat("y", 250), from); err != nil {
+		if _, err := Publish("shared", Draft{Text: strings.Repeat("y", 250)}, from); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1128,10 +1653,10 @@ func TestFollowerResumesFromCursorAfterCompaction(t *testing.T) {
 
 	// The follower starts past the old entry, as a caught-up reader would. Its
 	// offset is logical, so it keeps meaning the same place after the cut.
-	out := make(chan *Message, 8)
+	out := make(chan followedMessage, 8)
 	stop := make(chan struct{})
 	defer close(stop)
-	go followSource(path, cut, out, stop, nil, func(string, ...any) {})
+	go followSource(path, cut, "topic", out, stop, func(string, ...any) {})
 
 	// Compact away the prefix the follower has already passed, exactly as
 	// pruneTopicDir does it: rewrite, then record what was cut.
@@ -1144,9 +1669,9 @@ func TestFollowerResumesFromCursorAfterCompaction(t *testing.T) {
 	write("fresh")
 
 	select {
-	case m := <-out:
-		if m.ID != "fresh" {
-			t.Fatalf("got %q; the follower replayed compacted history instead of resuming", m.ID)
+	case fm := <-out:
+		if fm.msg.ID != "fresh" {
+			t.Fatalf("got %q; the follower replayed compacted history instead of resuming", fm.msg.ID)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("follower stalled after the log was compacted")
@@ -1182,6 +1707,73 @@ func TestRenderBoundsPeerControlledFields(t *testing.T) {
 	}
 	if n := len([]rune(Render(m))); n > RenderBudget {
 		t.Fatalf("rendered %d chars from peer-controlled fields, over the %d budget", n, RenderBudget)
+	}
+}
+
+// TestRenderBoundsAHandWrittenSubject covers a message that never passed
+// through validateSubject at all: a spool line can be written by hand, so the
+// bound has to be enforced again here, the same way name/cwd/topic/namespace
+// already are just above.
+func TestRenderBoundsAHandWrittenSubject(t *testing.T) {
+	withHome(t)
+	m := &Message{
+		From:    Sender{Kind: "shell", Name: "sh"},
+		Text:    "hi",
+		Subject: strings.Repeat("s", 400),
+	}
+	got := Render(m)
+	if n := len([]rune(got)); n > RenderBudget {
+		t.Fatalf("rendered %d chars from a hand-written subject, over the %d budget", n, RenderBudget)
+	}
+	if strings.Contains(got, strings.Repeat("s", SubjectLimit+1)) {
+		t.Errorf("Render did not bound an oversize hand-written subject: %s", got)
+	}
+	if !strings.Contains(got, strings.Repeat("s", SubjectLimit-1)) {
+		t.Errorf("Render trimmed the subject well below its limit: %s", got)
+	}
+}
+
+// TestRenderSubjectLetsTheBodySqueezeBelowTheOldMinimum guards minBody's
+// second exception: without it, a long subject would force every rung of the
+// give-up ladder to fail the old 24-rune floor, dropping the reply address
+// and topic hint purely to protect a body that the subject already gives the
+// recipient a readable substitute for.
+func TestRenderSubjectLetsTheBodySqueezeBelowTheOldMinimum(t *testing.T) {
+	withHome(t)
+	m := &Message{
+		From: Sender{
+			Kind: "session", SessionID: "aaaa1111",
+			Name: strings.Repeat("n", 40), Cwd: "/" + strings.Repeat("c", 32),
+			Namespace: strings.Repeat("z", 32), // foreign to whatever this test's namespace is
+		},
+		Topic:   "@" + strings.Repeat("t", 32), // global, so the ns tag is also in play
+		Text:    strings.Repeat("x", 500),
+		Subject: strings.Repeat("j", SubjectLimit),
+	}
+	got := Render(m)
+	if n := len([]rune(got)); n > RenderBudget {
+		t.Fatalf("rendered %d chars, over the %d budget:\n%s", n, RenderBudget, got)
+	}
+	// The subject is never dropped, and here it is what makes the line tight
+	// enough that the body has to be squeezed well under the old 24-rune
+	// minimum -- so the assembly below only proves the point if the subject
+	// actually arrived in full.
+	if !strings.Contains(got, m.Subject) {
+		t.Fatalf("the subject itself was cut, which defeats this test:\n%s", got)
+	}
+	// Everything droppable has to survive here: minBody dropping to 0 is what
+	// lets the ladder succeed on its very first rung despite the tiny room
+	// left for the body, so nothing droppable ever needs to be given up.
+	for _, want := range []string{"[topic: pigeon publish", " (" + strings.Repeat("c", 32) + ")", "[reply: pigeon send -n ", "[ns: "} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q -- minBody must have reverted to 24 despite the subject:\n%s", want, got)
+		}
+	}
+	// And the body itself must be the thing that gave way: with a 500-rune
+	// text and hardly any room left after the subject, it cannot have
+	// survived whole.
+	if strings.Contains(got, strings.Repeat("x", 20)) {
+		t.Errorf("body was not squeezed despite the tight room the subject leaves it:\n%s", got)
 	}
 }
 
@@ -1227,4 +1819,140 @@ func TestPruneRemovesOrphanedStateFiles(t *testing.T) {
 			t.Errorf("the sweep unlinked a lock file (%s): %v", filepath.Base(p), err)
 		}
 	}
+}
+
+// TestUnattendedSweepSparesRecentOrphans covers the hazard that keeps the
+// automatic sweep from being the same call `pigeon prune` makes.
+//
+// A monitor removes its entry on the way out but leaves the spool, so mail
+// queued while nothing was listening survives until a monitor comes back for
+// it. Such a session is indistinguishable from a dead one -- no entry, so no
+// pid to test -- and sweeping it at the next registration would delete a live
+// session's unread mail. Age is the only signal available, so recent orphans
+// have to be spared even though the attended sweep takes them.
+func TestUnattendedSweepSparesRecentOrphans(t *testing.T) {
+	withHome(t)
+	ns := CurrentNamespace()
+
+	recent := "cccc3333-4444"
+	stale := "dddd4444-5555"
+	for _, id := range []string{recent, stale} {
+		if err := os.WriteFile(SpoolPath(id), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(SpoolPath(stale), old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	ns.reconcileOrphans(orphanGrace, "")
+
+	if _, err := os.Stat(SpoolPath(recent)); err != nil {
+		t.Error("the unattended sweep took a fresh orphan; a monitor that dies and rearms loses its mail")
+	}
+	if _, err := os.Stat(SpoolPath(stale)); !os.IsNotExist(err) {
+		t.Error("the unattended sweep spared an orphan two days old, so nothing ever collects the debris")
+	}
+
+	// The attended sweep is deliberately not age-guarded: someone typed
+	// `pigeon prune` and has decided.
+	ns.ReconcileOrphans()
+	if _, err := os.Stat(SpoolPath(recent)); !os.IsNotExist(err) {
+		t.Error("`pigeon prune` left a fresh orphan behind")
+	}
+}
+
+// TestUnattendedSweepSparesASessionWhoseProcessIsStillAlive is the guard that
+// age alone could not give.
+//
+// A cursor file is written when messages flow, not while a session merely
+// lives, so a quiet session's state can be older than any grace period while
+// the session is running perfectly well. Age would collect it, and its cursors
+// are re-seeded at the END of each log on the next registration, so everything
+// published during the gap is skipped rather than redelivered. The tombstone
+// RemoveEntry leaves names the owning process, which answers exactly.
+func TestUnattendedSweepSparesASessionWhoseProcessIsStillAlive(t *testing.T) {
+	withHome(t)
+	ns := CurrentNamespace()
+
+	const alive = "eeee5555-6666"
+	const departed = "ffff6666-7777"
+	for _, id := range []string{alive, departed} {
+		if err := os.WriteFile(SpoolPath(id), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().Add(-72 * time.Hour)
+		if err := os.Chtimes(SpoolPath(id), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// This process stands in for a claude that is still running while its
+	// monitor is between lives.
+	writeTombstone(t, ns, alive, os.Getpid())
+	// A pid that cannot be running: 0 is never a real process, and the reader
+	// rejects it, so use one that parses but is long gone.
+	writeTombstone(t, ns, departed, deadPID(t))
+
+	ns.reconcileOrphans(orphanGrace, "")
+
+	if _, err := os.Stat(SpoolPath(alive)); err != nil {
+		t.Error("swept the mail of a session whose process is still running; " +
+			"it will resume at the end of every log and skip the gap")
+	}
+	if _, err := os.Stat(SpoolPath(departed)); !os.IsNotExist(err) {
+		t.Error("kept state for a session whose process is gone, despite a tombstone saying so")
+	}
+}
+
+// TestUnattendedSweepNeverTakesTheRegisteringSession: register() sweeps before
+// it writes its own entry, so without the exclusion a session rearming after a
+// gap qualifies as an orphan and deletes the very spool it is about to follow.
+func TestUnattendedSweepNeverTakesTheRegisteringSession(t *testing.T) {
+	withHome(t)
+	ns := CurrentNamespace()
+
+	const sid = "aaaa7777-8888"
+	if err := os.WriteFile(SpoolPath(sid), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-72 * time.Hour)
+	if err := os.Chtimes(SpoolPath(sid), old, old); err != nil {
+		t.Fatal(err)
+	}
+	writeTombstone(t, ns, sid, deadPID(t))
+
+	// Everything says "collect me": no entry, ancient, owner gone. It is still
+	// spared, because it is the session registering right now.
+	ns.reconcileOrphans(orphanGrace, sid)
+	if _, err := os.Stat(SpoolPath(sid)); err != nil {
+		t.Fatal("the registering session's own spool was swept during its own registration")
+	}
+	// And it is genuinely collectable otherwise, or the assertion above proves
+	// nothing.
+	ns.reconcileOrphans(orphanGrace, "")
+	if _, err := os.Stat(SpoolPath(sid)); !os.IsNotExist(err) {
+		t.Error("the spool survived a sweep that did not exclude it, so the test above is vacuous")
+	}
+}
+
+func writeTombstone(t *testing.T, ns Namespace, sid string, pid int) {
+	t.Helper()
+	b, err := json.Marshal(tombstone{PID: pid, ProcStart: ProcStart(pid)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ns.tombstonePath(sid), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// deadPID returns a pid that is not running: a child that has already exited.
+func deadPID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	return cmd.Process.Pid
 }

@@ -67,16 +67,19 @@ type TemplateContext struct {
 	// Name is populated only for the onNameTaken template, where it holds the
 	// name that was already taken. It is empty everywhere else.
 	Name string
-	// ClaudeName is Claude Code's own session name (what /status shows), and
-	// ClaudeNameSource is how it arrived at it. They let a project reuse the
-	// host label, e.g. `"name": "{{.ClaudeName}}"`, and are filled in only when
+	// Label is the host's own session name (what /status shows, for Claude
+	// Code), and LabelSource is how it arrived at it. They let a project reuse
+	// the host label, e.g. `"name": "{{.Label}}"`, and are filled in only when
 	// rendering for the current session -- the only one whose index pigeon can
 	// key off CLAUDE_PID. They are empty otherwise, including in tests.
+	Label       string
+	LabelSource string
+	// ClaudeName and ClaudeNameSource are deprecated aliases for Label and
+	// LabelSource: an existing project config may already reference
+	// `.ClaudeName`, so both spellings keep resolving to the same value rather
+	// than breaking that config on upgrade.
 	ClaudeName       string
 	ClaudeNameSource string
-	// Label is an alias for ClaudeName, for templates that prefer the shorter
-	// word. It always holds the same value.
-	Label string
 }
 
 // NewTemplateContext gathers the facts a template may refer to for one session.
@@ -105,9 +108,10 @@ func NewTemplateContext(ns Namespace, sessionID, cwd string) TemplateContext {
 		Session:          sessionID,
 		Short:            Short(sessionID),
 		Seq:              seqInCwd(ns, sessionID, cwd),
+		Label:            claude.Name,
+		LabelSource:      claude.Source,
 		ClaudeName:       claude.Name,
 		ClaudeNameSource: claude.Source,
-		Label:            claude.Name,
 	}
 }
 

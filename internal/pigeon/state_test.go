@@ -214,7 +214,7 @@ func TestProcStartOfAnImpossiblePID(t *testing.T) {
 func TestPublishSpillsOversizeBodyToPayload(t *testing.T) {
 	withHome(t)
 	long := strings.Repeat("b", BodyBudget*2)
-	msg, err := Publish("deploys", long, Sender{Kind: "shell", Name: "sh"})
+	msg, err := Publish("deploys", Draft{Text: long}, Sender{Kind: "shell", Name: "sh"})
 	if err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
@@ -255,7 +255,7 @@ func TestListTopicsCountsOnlyLiveSubscribers(t *testing.T) {
 	withHome(t)
 	// A log on disk with nobody listening still has to be listed, or a topic
 	// somebody published to yesterday becomes invisible.
-	if _, err := Publish("orphaned", "anyone?", Sender{Kind: "shell", Name: "sh"}); err != nil {
+	if _, err := Publish("orphaned", Draft{Text: "anyone?"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	// A dead session's subscriptions must not inflate the count: it is exactly

@@ -63,7 +63,7 @@ func TestToolsListIsComplete(t *testing.T) {
 
 	want := []string{
 		"list_sessions", "send_message", "publish", "subscribe",
-		"unsubscribe", "list_topics", "list_namespaces", "whoami", "set_identity",
+		"unsubscribe", "set_delivery", "inbox", "list_topics", "list_namespaces", "whoami", "set_identity",
 	}
 	got := map[string]bool{}
 	for _, d := range defs {
@@ -241,6 +241,28 @@ func TestSubscribeAndListTopicsViaMCP(t *testing.T) {
 	}
 }
 
+func TestSetDeliveryViaMCP(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "aaaa1111-2222")
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+
+	got := toolText(t, "set_delivery", map[string]any{"topic": "deploys", "mode": "digest"})
+	if !strings.Contains(got, "digest") || !strings.Contains(got, "#deploys") {
+		t.Errorf("set_delivery returned %q", got)
+	}
+	e, err := ReadEntry("aaaa1111-2222")
+	if err != nil {
+		t.Fatalf("ReadEntry: %v", err)
+	}
+	if e.Delivery["deploys"] != DeliveryDigest {
+		t.Errorf("Delivery[%q] = %q, want %q", "deploys", e.Delivery["deploys"], DeliveryDigest)
+	}
+
+	if got := toolText(t, "set_delivery", map[string]any{"topic": "deploys", "mode": "bogus"}); !strings.Contains(got, "error") {
+		t.Errorf("set_delivery with an invalid mode returned %q, want an error", got)
+	}
+}
+
 func TestPublishReportsNobodyListening(t *testing.T) {
 	withHome(t)
 	t.Setenv(EnvSessionID, "aaaa1111-2222")
@@ -249,6 +271,58 @@ func TestPublishReportsNobodyListening(t *testing.T) {
 	got := toolText(t, "publish", map[string]any{"topic": "quiet", "text": "anyone?"})
 	if !strings.Contains(got, "Nobody is listening") {
 		t.Errorf("got %q, want an explicit no-subscribers note", got)
+	}
+}
+
+// A deaf-only subscriber must not read as "reached": the live count has to
+// exclude it, the deaf note has to name it, and the no-one's-listening
+// wording has to be the accurate one rather than the reassuring one.
+func TestPublishNotesADeafOnlySubscriber(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "aaaa1111-2222")
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+	liveEntry(t, "bbbb2222-3333", "beta", "/tmp/b") // deaf: no monitor lock held
+	if err := Subscribe("bbbb2222-3333", "deploys"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "publish", map[string]any{"topic": "deploys", "text": "shipping"})
+	if !strings.Contains(got, "0 other live session(s)") {
+		t.Errorf("got %q, want the deaf subscriber excluded from the live count", got)
+	}
+	if !strings.Contains(got, "NOTE: 1 subscriber(s) are deaf") {
+		t.Errorf("got %q, want the deaf subscriber called out", got)
+	}
+	if !strings.Contains(got, "protects nothing") {
+		t.Errorf("got %q, want the accurate no-one's-listening wording, not the reassuring one", got)
+	}
+}
+
+// A mix of live and deaf subscribers: the live count and the deaf note both
+// have to show up, and the "nobody is listening" wording must not, since
+// someone genuinely is.
+func TestPublishNotesDeafSubscribersAlongsideLiveOnes(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "aaaa1111-2222")
+	liveEntry(t, "aaaa1111-2222", "alpha", "/tmp/a")
+	armed(t, "bbbb2222-3333", "beta")
+	liveEntry(t, "cccc3333-4444", "gamma", "/tmp/c") // deaf: no monitor lock held
+	if err := Subscribe("bbbb2222-3333", "deploys"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Subscribe("cccc3333-4444", "deploys"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "publish", map[string]any{"topic": "deploys", "text": "shipping"})
+	if !strings.Contains(got, "1 other live session(s)") {
+		t.Errorf("got %q, want the live subscriber counted", got)
+	}
+	if !strings.Contains(got, "NOTE: 1 subscriber(s) are deaf") {
+		t.Errorf("got %q, want the deaf subscriber called out even though a live one exists", got)
+	}
+	if strings.Contains(got, "Nobody is listening") {
+		t.Errorf("got %q, want no reassurance when a live subscriber exists", got)
 	}
 }
 
@@ -411,7 +485,7 @@ func TestPublishToAGlobalTopicViaMCP(t *testing.T) {
 	t.Setenv(EnvSessionID, "aaaa1111-2222")
 	liveEntryIn(t, mustNS(t, "acme"), "aaaa1111-2222", "alpha", "/home/p/api")
 	other := mustNS(t, "other")
-	liveEntryIn(t, other, "bbbb2222-3333", "beta", "/home/p/web")
+	armedIn(t, other, "bbbb2222-3333", "beta")
 	if err := other.Subscribe("bbbb2222-3333", "@ops"); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
@@ -438,6 +512,216 @@ func TestListNamespacesViaMCP(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("list_namespaces is missing %q:\n%s", want, got)
 		}
+	}
+}
+
+// --- inbox (Task 1 / Task 2) ------------------------------------------------
+
+func TestInboxToolReturnsFullBodyPastTheNotificationClip(t *testing.T) {
+	withHome(t)
+	sid := "aaaa1111-2222"
+	t.Setenv(EnvSessionID, sid)
+	me := liveEntry(t, sid, "me", "/tmp/me")
+
+	long := strings.Repeat("x", BodyBudget+50)
+	if _, err := DefaultNamespace().Send(me, Draft{Text: long, Subject: "big one"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "inbox", map[string]any{})
+	if !strings.Contains(got, long) {
+		t.Errorf("inbox did not return the full %d-char body, which a notification would have clipped at %d:\n%s",
+			len(long), BodyBudget, got)
+	}
+	if !strings.Contains(got, "SUBJECT: big one") {
+		t.Errorf("inbox is missing the subject line:\n%s", got)
+	}
+}
+
+func TestInboxToolMarkReadFalseLeavesTheCursorAlone(t *testing.T) {
+	withHome(t)
+	sid := "bbbb2222-3333"
+	t.Setenv(EnvSessionID, sid)
+	me := liveEntry(t, sid, "me", "/tmp/me")
+	if _, err := DefaultNamespace().Send(me, Draft{Text: "hello"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "inbox", map[string]any{"mark_read": false})
+	if !strings.Contains(got, "hello") {
+		t.Fatalf("expected the message body, got %q", got)
+	}
+	if _, ok := readCursors(sid)[readCursorKey(inboxCursorKey)]; ok {
+		t.Error("mark_read: false advanced the consumption cursor")
+	}
+
+	// Nothing was consumed by the peek, so a second, default pull must still
+	// see the same message.
+	got2 := toolText(t, "inbox", map[string]any{})
+	if !strings.Contains(got2, "hello") {
+		t.Errorf("second pull did not see the message the peek left unread:\n%s", got2)
+	}
+}
+
+func TestInboxToolDetailSubjectOmitsBody(t *testing.T) {
+	withHome(t)
+	sid := "cccc3333-4444"
+	t.Setenv(EnvSessionID, sid)
+	me := liveEntry(t, sid, "me", "/tmp/me")
+	if _, err := DefaultNamespace().Send(me, Draft{Text: "the body text", Subject: "the subject"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "inbox", map[string]any{"detail": "subject"})
+	if !strings.Contains(got, "SUBJECT: the subject") {
+		t.Errorf("missing subject line:\n%s", got)
+	}
+	if strings.Contains(got, "the body text") {
+		t.Errorf("detail: subject leaked the body:\n%s", got)
+	}
+}
+
+// The default tier is brief, not full: a reader given only "prefix or
+// everything" measurably took the cheap prefix most of the time, so the
+// default has to be the cheap-but-readable middle tier instead of the whole
+// body.
+func TestInboxToolDefaultDetailReturnsBriefNotFullBody(t *testing.T) {
+	withHome(t)
+	sid := "jjjj0000-1111"
+	t.Setenv(EnvSessionID, sid)
+	me := liveEntry(t, sid, "me", "/tmp/me")
+	long := strings.Repeat("x", BodyBudget+50)
+	if _, err := DefaultNamespace().Send(me, Draft{
+		Text: long, Subject: "the subject", Brief: "a short brief that is not the body",
+	}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "inbox", map[string]any{})
+	if !strings.Contains(got, "a short brief that is not the body") {
+		t.Errorf("default detail did not show the brief:\n%s", got)
+	}
+	if strings.Contains(got, long) {
+		t.Errorf("default detail showed the full body, not the brief:\n%s", got)
+	}
+}
+
+// A sender who wrote no brief must not leave the reader with nothing: the
+// brief tier falls back to the full text rather than hide the message behind
+// a summary that was never written.
+func TestInboxToolBriefFallsBackToFullTextWhenNoneWritten(t *testing.T) {
+	withHome(t)
+	sid := "kkkk1111-2222"
+	t.Setenv(EnvSessionID, sid)
+	me := liveEntry(t, sid, "me", "/tmp/me")
+	if _, err := DefaultNamespace().Send(me, Draft{Text: "the whole body, no brief given"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "inbox", map[string]any{"detail": "brief"})
+	if !strings.Contains(got, "the whole body, no brief given") {
+		t.Errorf("brief tier hid the body of a message with no brief:\n%s", got)
+	}
+}
+
+// detail: "full" must return the body even when a brief exists -- the two
+// tiers are alternative views, not a fallback chain that always prefers the
+// short one.
+func TestInboxToolDetailFullReturnsBodyEvenWhenABriefExists(t *testing.T) {
+	withHome(t)
+	sid := "llll2222-3333"
+	t.Setenv(EnvSessionID, sid)
+	me := liveEntry(t, sid, "me", "/tmp/me")
+	if _, err := DefaultNamespace().Send(me, Draft{
+		Text: "the full body text", Brief: "the short brief",
+	}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := toolText(t, "inbox", map[string]any{"detail": "full"})
+	if !strings.Contains(got, "the full body text") {
+		t.Errorf("detail: full did not return the body:\n%s", got)
+	}
+}
+
+func TestInboxToolRejectsAnUnknownDetailValue(t *testing.T) {
+	withHome(t)
+	sid := "iiii9999-0000"
+	t.Setenv(EnvSessionID, sid)
+	liveEntry(t, sid, "me", "/tmp/me")
+
+	res, rerr := call(t, "tools/call", map[string]any{"name": "inbox", "arguments": map[string]any{"detail": "everything"}})
+	if rerr != nil {
+		t.Fatalf("unexpected protocol error: %v", rerr.Message)
+	}
+	if isErr, _ := res.(map[string]any)["isError"].(bool); !isErr {
+		t.Error("an unrecognised detail value should be an error result")
+	}
+}
+
+func TestInboxToolEmptyCaseReadsSensibly(t *testing.T) {
+	withHome(t)
+	sid := "dddd4444-5555"
+	t.Setenv(EnvSessionID, sid)
+	liveEntry(t, sid, "me", "/tmp/me")
+
+	got := toolText(t, "inbox", map[string]any{})
+	if !strings.Contains(got, "No unread messages") {
+		t.Errorf("got %q, want the empty-inbox message", got)
+	}
+	if !strings.Contains(got, "unread_only: false") {
+		t.Errorf("got %q, want a hint pointing at unread_only: false", got)
+	}
+
+	got2 := toolText(t, "inbox", map[string]any{"unread_only": false})
+	if got2 != "No messages." {
+		t.Errorf("got %q, want the plain no-messages line when unread_only is false", got2)
+	}
+}
+
+// The MCP process holds whatever session id CLAUDE_CODE_SESSION_ID has right
+// now, which after a /clear is a fresh id the monitor and its spool never
+// adopt. inbox must resolve identity through Self, the same fallback
+// CurrentSender uses, not through CurrentSessionID -- guessing here would
+// read, and mark read, a cursor file belonging to a session that never asked.
+func TestInboxToolResolvesIdentityThroughSelfAfterAClear(t *testing.T) {
+	withHome(t)
+	const armedWith = "aaaa1111-2222-3333-4444-555555555555"
+	want := cleared(t, armedWith, "ffff9999-8888-7777-6666-555555555555")
+
+	if _, err := DefaultNamespace().Send(want, Draft{Text: "still reachable"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
+		t.Fatal(err)
+	}
+	if CurrentSessionID() == armedWith {
+		t.Fatal("test setup did not actually diverge the environment's id from the armed one")
+	}
+
+	got := toolText(t, "inbox", map[string]any{})
+	if !strings.Contains(got, "still reachable") {
+		t.Errorf("inbox did not resolve identity through Self after a clear:\n%s", got)
+	}
+}
+
+// A guessed session id would silently corrupt somebody else's read cursor, so
+// the failure has to be a legible error, not a fallback to a plain-shell
+// identity nobody asked for.
+func TestInboxToolFailsClearlyWithNoSessionToResolve(t *testing.T) {
+	withHome(t)
+	t.Setenv(EnvSessionID, "")
+
+	res, rerr := call(t, "tools/call", map[string]any{"name": "inbox", "arguments": map[string]any{}})
+	if rerr != nil {
+		t.Fatalf("unexpected protocol error: %v", rerr.Message)
+	}
+	m := res.(map[string]any)
+	if isErr, _ := m["isError"].(bool); !isErr {
+		t.Error("inbox with no session to resolve should be an error result")
+	}
+	content := m["content"].([]any)
+	first, _ := content[0].(map[string]any)
+	text, _ := first["text"].(string)
+	if !strings.Contains(text, "identity") {
+		t.Errorf("got %q, want a message about not being able to resolve identity", text)
 	}
 }
 

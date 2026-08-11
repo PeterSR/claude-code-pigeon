@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/PeterSR/claude-code-pigeon/internal/pigeon"
 )
@@ -43,9 +45,14 @@ const usage = `pigeon -- message passing between live Claude Code sessions
   pigeon ls [--all] [--json]     list registered sessions
   pigeon send <target> <text>    send a message to one session
   pigeon publish <topic> <text>  publish to a topic (everyone subscribed)
-  pigeon subscribe <topic>       start receiving a topic in this session
+  pigeon ask [--deadline 30s] <topic> <text>  ask and BLOCK for the answers
+  pigeon answer <id> <ok|object|blocked> [note]  answer a pending ask
+  pigeon subscribe [--catchup <20|30m>] <topic>  start receiving a topic (optionally back-filling your inbox)
   pigeon unsubscribe <topic>     stop receiving it
+  pigeon delivery [<topic> <push|digest|quiet>]  set or list per-topic delivery modes
   pigeon listen [topic...]       receive messages in this shell (blocks)
+  pigeon inbox [--all] [--peek]  read this session's mail (brief by default; --subjects, --full)
+  pigeon thread <id>             print one conversation end to end
   pigeon topics                  list topics and subscriber counts
   pigeon namespaces              list namespaces and their session counts
   pigeon namespace [<name>]      show or set the namespace this shell uses
@@ -97,12 +104,22 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		err = cmdSend(rest, stdout, stderr)
 	case "publish", "pub":
 		err = cmdPublish(rest, stdout, stderr)
+	case "ask":
+		err = cmdAsk(rest, stdout, stderr)
+	case "answer":
+		err = cmdAnswer(rest, stdout, stderr)
 	case "subscribe", "sub":
-		err = cmdSubscribe(rest, stdout)
+		err = cmdSubscribe(rest, stdout, stderr)
 	case "unsubscribe", "unsub":
 		err = cmdUnsubscribe(rest, stdout)
+	case "delivery":
+		err = cmdDelivery(rest, stdout, stderr)
 	case "listen":
 		err = cmdListen(rest, stdout, stderr)
+	case "inbox":
+		err = cmdInbox(rest, stdout, stderr)
+	case "thread":
+		err = cmdThread(rest, stdout, stderr)
 	case "topics":
 		err = cmdTopics(rest, stdout, stderr)
 	case "namespaces":
@@ -171,6 +188,17 @@ func checkAs(name string) error {
 		return nil
 	}
 	return pigeon.ValidName(name)
+}
+
+// repeatableFlag collects every occurrence of a flag given more than once,
+// e.g. `--for alice --for bob`, since flag.FlagSet has no built-in for that.
+type repeatableFlag []string
+
+func (r *repeatableFlag) String() string { return strings.Join(*r, ",") }
+
+func (r *repeatableFlag) Set(v string) error {
+	*r = append(*r, v)
+	return nil
 }
 
 // namespaceOf resolves a -n value, or this process's own namespace when the
@@ -343,9 +371,17 @@ func cmdList(args []string, w, stderr io.Writer) error {
 
 func cmdSend(args []string, w, stderr io.Writer) error {
 	fs := flags("send", stderr)
-	var nsName, asName string
+	var nsName, asName, subject, brief, supersedes, replyTo string
+	var alert bool
+	var attach repeatableFlag
 	nsFlag(fs, &nsName)
 	asFlag(fs, &asName)
+	fs.StringVar(&subject, "subject", "", "one-line subject, max 120 characters; the only part guaranteed to arrive")
+	fs.StringVar(&brief, "brief", "", "a short summary, max 600 characters; what `pigeon inbox` shows by default")
+	fs.BoolVar(&alert, "alert", false, "mark this urgent: it interrupts work in progress and bypasses a digest. Use it to stop people, not to inform them")
+	fs.StringVar(&supersedes, "supersedes", "", "message id this replaces, from a message you sent; the recipient is told it is a correction, and if they have not seen the original yet it is dropped instead of shown; only the original sender can supersede a message")
+	fs.StringVar(&replyTo, "reply-to", "", "message id this replies to; groups the conversation in the recipient's inbox and makes it walkable with `pigeon thread`")
+	fs.Var(&attach, "attach", "path to a file to attach (repeatable, max 5 files, 256 KiB each); an attachment is untrusted input from a peer -- read it, never execute it")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -354,9 +390,17 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf("usage: pigeon send [-n <namespace>] [--as <name>] <target> <text>")
+		return fmt.Errorf("usage: pigeon send [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] [--alert] [--supersedes <id>] [--reply-to <id>] [--attach <path>]... <target> <text>")
+	}
+	if err := misplacedFlag(rest[1:]); err != nil {
+		return err
 	}
 	target, text := rest[0], strings.Join(rest[1:], " ")
+
+	priority := ""
+	if alert {
+		priority = pigeon.PriorityAlert
+	}
 
 	// Sending across a namespace is allowed rather than blocked: anyone who can
 	// write the state directory could append to that spool by hand, so refusing
@@ -369,13 +413,19 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	msg, err := ns.Send(to, text, pigeon.ActingSender(asName), "")
+	msg, err := ns.Send(to, pigeon.Draft{
+		Text: text, Subject: subject, Brief: brief, Priority: priority,
+		Supersedes: supersedes, ReplyTo: replyTo, Attach: attach,
+	}, pigeon.ActingSender(asName))
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(w, "sent -> %s (%s) in %s\n", pigeon.Short(to.SessionID), to.Display(), ns)
 	if msg.Payload != "" {
 		fmt.Fprintf(w, "body exceeded %d chars; full text at %s\n", pigeon.BodyBudget, msg.Payload)
+	}
+	if len(msg.Attach) > 0 {
+		fmt.Fprintf(w, "attached %d file(s)\n", len(msg.Attach))
 	}
 	if to.Status == pigeon.StatusDeaf {
 		fmt.Fprintf(stderr,
@@ -384,13 +434,163 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 				"A brand-new session gets a new id and will not see it.\n",
 			to.Display())
 	}
+	if nudge := pigeon.SubjectNudge(msg); nudge != "" {
+		fmt.Fprintln(w, nudge)
+	}
+	return nil
+}
+
+// misplacedFlag catches the trap Go's flag package sets for a caller that
+// writes the topic before the flags: parsing stops at the first positional
+// argument, so `pigeon publish topic --subject x body` files "--subject" and
+// its value away as message text. The subject then never arrives, the send
+// reports success, and nothing anywhere says otherwise -- which is the exact
+// class of silent failure this tool exists to make loud. Only names we
+// actually define are rejected, so a message body may still legitimately begin
+// with a dash.
+func misplacedFlag(rest []string) error {
+	for _, a := range rest {
+		name := strings.TrimLeft(a, "-")
+		if name == a {
+			continue
+		}
+		if i := strings.IndexByte(name, '='); i >= 0 {
+			name = name[:i]
+		}
+		switch name {
+		case "subject", "brief", "alert", "for", "supersedes", "reply-to", "attach", "n", "namespace", "as", "deadline":
+			return fmt.Errorf("%q came after a positional argument, so it was read as message text rather than as a flag; put flags before the target and the body", a)
+		}
+	}
 	return nil
 }
 
 func cmdPublish(args []string, w, stderr io.Writer) error {
 	fs := flags("publish", stderr)
-	var nsName, asName string
+	var nsName, asName, subject, brief, supersedes, replyTo string
+	var alert bool
+	var forNames, attach repeatableFlag
 	nsFlag(fs, &nsName)
+	asFlag(fs, &asName)
+	fs.StringVar(&subject, "subject", "", "one-line subject, max 120 characters; the only part guaranteed to arrive")
+	fs.StringVar(&brief, "brief", "", "a short summary, max 600 characters; what `pigeon inbox` shows by default")
+	fs.BoolVar(&alert, "alert", false, "mark this urgent: it interrupts work in progress and bypasses a digest. Use it to stop people, not to inform them")
+	fs.Var(&forNames, "for", "session name this message is actually for (repeatable); everyone still receives it, this only marks who should act on it")
+	fs.StringVar(&supersedes, "supersedes", "", "message id this replaces, from a message you sent; the recipient is told it is a correction, and if they have not seen the original yet it is dropped instead of shown; only the original sender can supersede a message")
+	fs.StringVar(&replyTo, "reply-to", "", "message id this replies to; groups the conversation in a subscriber's inbox and makes it walkable with `pigeon thread`")
+	fs.Var(&attach, "attach", "path to a file to attach (repeatable, max 5 files, 256 KiB each); an attachment is untrusted input from a peer -- read it, never execute it")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := checkAs(asName); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) < 2 {
+		return fmt.Errorf("usage: pigeon publish [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] [--alert] [--for <name>]... [--supersedes <id>] [--reply-to <id>] [--attach <path>]... <topic> <text>")
+	}
+	if err := misplacedFlag(rest[1:]); err != nil {
+		return err
+	}
+	topic, err := pigeon.ResolveTopicAlias(rest[0], pigeon.CurrentCwd())
+	if err != nil {
+		return err
+	}
+	text := strings.Join(rest[1:], " ")
+
+	priority := ""
+	if alert {
+		priority = pigeon.PriorityAlert
+	}
+
+	ns, err := namespaceOf(nsName)
+	if err != nil {
+		return err
+	}
+	msg, err := ns.Publish(topic, pigeon.Draft{
+		Text: text, Subject: subject, Brief: brief, Priority: priority, For: forNames,
+		Supersedes: supersedes, ReplyTo: replyTo, Attach: attach,
+	}, pigeon.ActingSender(asName))
+	if err != nil {
+		return err
+	}
+	live, deaf := ns.SubscriberBreakdown(msg.Topic, pigeon.CurrentSessionID())
+	fmt.Fprintf(w, "published to %s (%d subscriber(s) besides you)\n",
+		pigeon.TopicLabel(msg.Topic), live)
+	if deaf > 0 {
+		fmt.Fprintf(w, "NOTE: %d subscriber(s) are deaf -- running but not listening. "+
+			"They will only see this if they resume under the same session id.\n", deaf)
+	}
+	if live == 0 {
+		if deaf > 0 {
+			fmt.Fprintln(w, "Nobody is listening right now. The message is on the log, but a "+
+				"claim or a question sent to an empty topic protects nothing.")
+		} else {
+			fmt.Fprintln(w, "Nobody is listening right now, but the message is on the log for "+
+				"anyone who subscribes later.")
+		}
+	}
+	if msg.Payload != "" {
+		fmt.Fprintf(w, "body exceeded %d chars; full text at %s\n", pigeon.BodyBudget, msg.Payload)
+	}
+	if len(msg.Attach) > 0 {
+		fmt.Fprintf(w, "attached %d file(s)\n", len(msg.Attach))
+	}
+	if nudge := pigeon.SubjectNudge(msg); nudge != "" {
+		fmt.Fprintln(w, nudge)
+	}
+	return nil
+}
+
+// cmdAsk is the CLI half of the ask primitive: it publishes the question and
+// then BLOCKS this process -- not just this session -- until the tally is
+// ready, exactly like the MCP tool blocks the model. See ask.go's doc comment
+// for why blocking is the fix, not a shortcut around one.
+func cmdAsk(args []string, w, stderr io.Writer) error {
+	fs := flags("ask", stderr)
+	var nsName, asName, subject string
+	var deadline time.Duration
+	nsFlag(fs, &nsName)
+	asFlag(fs, &asName)
+	fs.StringVar(&subject, "subject", "", "one-line subject, max 120 characters")
+	fs.DurationVar(&deadline, "deadline", 0, "how long to wait, e.g. 30s or 2m (default 30s, max 5m)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := checkAs(asName); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) < 2 {
+		return fmt.Errorf("usage: pigeon ask [-n <namespace>] [--as <name>] [--subject <text>] [--deadline <dur>] <topic> <text>")
+	}
+	if err := misplacedFlag(rest[1:]); err != nil {
+		return err
+	}
+	topic, err := pigeon.ResolveTopicAlias(rest[0], pigeon.CurrentCwd())
+	if err != nil {
+		return err
+	}
+	text := strings.Join(rest[1:], " ")
+
+	ns, err := namespaceOf(nsName)
+	if err != nil {
+		return err
+	}
+	res, err := ns.Ask(topic, pigeon.Draft{Text: text, Subject: subject}, pigeon.ActingSender(asName), deadline)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(w, pigeon.RenderAskResult(res))
+	return nil
+}
+
+// cmdAnswer records one reply to a pending ask. The id and how to answer are
+// carried in the ask's own notification (see Render's askHint), so this takes
+// them as plain positional arguments rather than flags.
+func cmdAnswer(args []string, w, stderr io.Writer) error {
+	fs := flags("answer", stderr)
+	var asName string
 	asFlag(fs, &asName)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -400,39 +600,48 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf("usage: pigeon publish [-n <namespace>] [--as <name>] <topic> <text>")
+		return fmt.Errorf("usage: pigeon answer [--as <name>] <id> <ok|object|blocked> [note...]")
 	}
-	topic, text := rest[0], strings.Join(rest[1:], " ")
-	ns, err := namespaceOf(nsName)
-	if err != nil {
+	id, verdict := rest[0], rest[1]
+	note := strings.Join(rest[2:], " ")
+
+	if err := pigeon.CurrentNamespace().Answer(id, pigeon.ActingSender(asName), verdict, note); err != nil {
 		return err
 	}
-	msg, err := ns.Publish(topic, text, pigeon.ActingSender(asName))
-	if err != nil {
-		return err
-	}
-	num := ns.SubscriberCount(msg.Topic, pigeon.CurrentSessionID())
-	fmt.Fprintf(w, "published to %s (%d subscriber(s) besides you)\n",
-		pigeon.TopicLabel(msg.Topic), num)
-	if msg.Payload != "" {
-		fmt.Fprintf(w, "body exceeded %d chars; full text at %s\n", pigeon.BodyBudget, msg.Payload)
-	}
+	fmt.Fprintf(w, "recorded %s on %s\n", verdict, id)
 	return nil
 }
 
-func cmdSubscribe(args []string, w io.Writer) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: pigeon subscribe <topic>")
+func cmdSubscribe(args []string, w, stderr io.Writer) error {
+	fs := flags("subscribe", stderr)
+	var catchup string
+	fs.StringVar(&catchup, "catchup", "",
+		"replay a window into your inbox on subscribe: a count (\"20\") or a duration (\"30m\"); never sent as notifications")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
+	rest := fs.Args()
+	if len(rest) != 1 {
+		return fmt.Errorf("usage: pigeon subscribe [--catchup <20|30m>] <topic>")
+	}
+	resolved, err := pigeon.ResolveTopicAlias(rest[0], pigeon.CurrentCwd())
+	if err != nil {
+		return err
+	}
+	rest[0] = resolved
 	e, err := ownEntry()
 	if err != nil {
 		return err
 	}
-	if err := pigeon.Subscribe(e.SessionID, args[0]); err != nil {
+	waiting, err := pigeon.CurrentNamespace().SubscribeCatchup(e.SessionID, rest[0], catchup)
+	if err != nil {
 		return err
 	}
 	fmt.Fprintf(w, "subscribed to %s (takes effect within a second, no restart)\n",
-		pigeon.TopicLabel(args[0]))
+		pigeon.TopicLabel(rest[0]))
+	if catchup != "" {
+		fmt.Fprintln(w, strings.TrimSpace(pigeon.CatchupNote(waiting, catchup)))
+	}
 	return nil
 }
 
@@ -440,6 +649,11 @@ func cmdUnsubscribe(args []string, w io.Writer) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: pigeon unsubscribe <topic>")
 	}
+	resolved, err := pigeon.ResolveTopicAlias(args[0], pigeon.CurrentCwd())
+	if err != nil {
+		return err
+	}
+	args[0] = resolved
 	e, err := ownEntry()
 	if err != nil {
 		return err
@@ -448,6 +662,48 @@ func cmdUnsubscribe(args []string, w io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(w, "unsubscribed from %s\n", pigeon.TopicLabel(args[0]))
+	return nil
+}
+
+// cmdDelivery is get-or-set, like cmdName: with a topic and a mode it sets
+// this session's delivery for that topic; with neither it lists whatever is
+// not already push, since push is the default and listing every topic at the
+// default would just be `pigeon topics` with an extra column nobody asked for.
+func cmdDelivery(args []string, w, stderr io.Writer) error {
+	e, err := ownEntry()
+	if err != nil {
+		return err
+	}
+	if len(args) == 0 {
+		if len(e.Delivery) == 0 {
+			fmt.Fprintln(w, "every topic is push (the default); nothing is set to digest or quiet")
+			return nil
+		}
+		topics := make([]string, 0, len(e.Delivery))
+		for t := range e.Delivery {
+			topics = append(topics, t)
+		}
+		sort.Strings(topics)
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "TOPIC\tMODE")
+		for _, t := range topics {
+			fmt.Fprintf(tw, "%s\t%s\n", pigeon.TopicLabel(t), e.Delivery[t])
+		}
+		return tw.Flush()
+	}
+	if len(args) != 2 {
+		return fmt.Errorf("usage: pigeon delivery [<topic> <push|digest|quiet>]")
+	}
+	resolved, err := pigeon.ResolveTopicAlias(args[0], pigeon.CurrentCwd())
+	if err != nil {
+		return err
+	}
+	args[0] = resolved
+	if err := pigeon.SetDelivery(e.SessionID, args[0], args[1]); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "delivery for %s set to %s (takes effect within a second, no restart)\n",
+		pigeon.TopicLabel(args[0]), args[1])
 	return nil
 }
 
@@ -492,6 +748,96 @@ func cmdListen(args []string, stdout, stderr io.Writer) error {
 		Timeout:   *timeout,
 		TTY:       isTerminal(stdout),
 	}, stdout, stderr)
+}
+
+// cmdInbox is the CLI twin of the MCP inbox tool: same query knobs, same
+// renderer, so a human at a terminal and a model in the same session see
+// identical text.
+func cmdInbox(args []string, w, stderr io.Writer) error {
+	fs := flags("inbox", stderr)
+	limit := fs.Int("limit", 0, "how many messages (default 10, max 50)")
+	all := fs.Bool("all", false, "include messages already read, not only new ones")
+	peek := fs.Bool("peek", false, "do not mark returned messages as read")
+	subjects := fs.Bool("subjects", false, "print only subject lines, not full bodies")
+	brief := fs.Bool("brief", false, "print the sender's brief (default); falls back to the full body when none was written")
+	full := fs.Bool("full", false, "print whole message bodies")
+	var topic string
+	fs.StringVar(&topic, "topic", "", "only this topic")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	// This command is session-bound by definition -- it reads THIS session's
+	// mail -- so a plain shell gets a message that says that, rather than the
+	// raw "not inside a Claude Code session" Self returns for every caller.
+	if pigeon.CurrentSessionID() == "" {
+		return fmt.Errorf("inbox reads this session's own mail, and this shell is not inside a Claude Code session")
+	}
+	ns, e, err := pigeon.Self()
+	if err != nil {
+		return fmt.Errorf("this session is not registered with pigeon, so it has no inbox to read " +
+			"(install the plugin and restart, or run `pigeon arm`)")
+	}
+
+	// The three flags describe one choice, not three independent ones -- a
+	// caller who sets more than one has said something contradictory that
+	// silently picking a winner would hide.
+	set := 0
+	for _, b := range []bool{*subjects, *brief, *full} {
+		if b {
+			set++
+		}
+	}
+	if set > 1 {
+		return fmt.Errorf("give at most one of --subjects, --brief, --full")
+	}
+	wantDetail := ""
+	switch {
+	case *subjects:
+		wantDetail = "subject"
+	case *full:
+		wantDetail = "full"
+	case *brief:
+		wantDetail = "brief"
+	}
+	detail, err := pigeon.ResolveInboxDetail(wantDetail)
+	if err != nil {
+		return err
+	}
+	unreadOnly := !*all
+	items, more, err := ns.ReadInbox(e.SessionID, pigeon.InboxQuery{
+		Limit:      *limit,
+		UnreadOnly: unreadOnly,
+		Topic:      topic,
+		MarkRead:   !*peek,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(w, pigeon.RenderInbox(items, more, unreadOnly, detail, "--all", e, ns))
+	return nil
+}
+
+// cmdThread prints one conversation end to end, reconstructed from the logs
+// this session can see (its own spool and every topic it subscribes to).
+func cmdThread(args []string, w, stderr io.Writer) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: pigeon thread <id>")
+	}
+	if pigeon.CurrentSessionID() == "" {
+		return fmt.Errorf("thread reads from this session's own logs, and this shell is not inside a Claude Code session")
+	}
+	ns, e, err := pigeon.Self()
+	if err != nil {
+		return fmt.Errorf("this session is not registered with pigeon, so it has no logs to read " +
+			"(install the plugin and restart, or run `pigeon arm`)")
+	}
+	items, err := ns.ReadThread(e.SessionID, args[0])
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(w, pigeon.RenderThread(args[0], items, e, ns))
+	return nil
 }
 
 func cmdTopics(args []string, w, stderr io.Writer) error {
@@ -911,6 +1257,15 @@ func cmdPrune(args []string, w, stderr io.Writer) error {
 			return err
 		}
 		res.Add(got)
+
+		// An ask blocks until its own deadline, so once that has passed it is
+		// guaranteed closed -- there is nothing still-open a sweep could cut
+		// out from under a caller mid-wait.
+		asksRemoved, err := space.PruneAsks()
+		if err != nil {
+			return err
+		}
+		res.AsksRemoved += asksRemoved
 	}
 	// The global logs are swept once, counting subscribers in every namespace:
 	// cutting a prefix that only a session next door has yet to read would drop
@@ -920,12 +1275,18 @@ func cmdPrune(args []string, w, stderr io.Writer) error {
 		return err
 	}
 	res.Add(shared)
+	sharedAsks, err := pigeon.PruneSharedAsks()
+	if err != nil {
+		return err
+	}
+	res.AsksRemoved += sharedAsks
 
 	fmt.Fprintf(w, "pruned %d dead session(s)\n", dead)
 	fmt.Fprintf(w, "removed %d orphaned state file(s)\n", orphans)
 	fmt.Fprintf(w, "removed %d unsubscribed topic log(s), compacted %d, "+
 		"reclaimed %d payload file(s), freed %s\n",
 		res.TopicsRemoved, res.TopicsCompacted, res.PayloadsRemoved, humanBytes(res.BytesReclaimed))
+	fmt.Fprintf(w, "removed %d closed ask(s)\n", res.AsksRemoved)
 	if *allNS {
 		fmt.Fprintf(w, "swept %d namespace(s)\n", len(spaces))
 	}
@@ -975,14 +1336,14 @@ func pidCol(pid int) string {
 	return fmt.Sprintf("%d", pid)
 }
 
-// claudeCol renders the CLAUDE column of `pigeon ls`. A shell inbox is not a
-// Claude Code session and has no such name, so it is labelled as what it is
-// rather than shown as a blank waiting to be filled.
+// claudeCol renders the CLAUDE column of `pigeon ls`. A shell inbox is not an
+// agent session and has no such label, so it is labelled as what it is rather
+// than shown as a blank waiting to be filled.
 func claudeCol(e *pigeon.Entry) string {
 	if e.Ephemeral {
 		return "shell"
 	}
-	return dash(truncate(e.ClaudeName, 24))
+	return dash(truncate(e.Label, 24))
 }
 
 // isTerminal reports whether w is a terminal, so `pigeon listen` can default to
@@ -999,16 +1360,16 @@ func isTerminal(w io.Writer) bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }
 
-// claudeNameCol renders Claude Code's own session name for whoami, noting how it
+// claudeNameCol renders the host's own session label for whoami, noting how it
 // was arrived at so a mostly-cosmetic "derived" name is not read as a chosen one.
 func claudeNameCol(e *pigeon.Entry) string {
-	if strings.TrimSpace(e.ClaudeName) == "" {
+	if strings.TrimSpace(e.Label) == "" {
 		return "-"
 	}
-	if e.ClaudeNameSource != "" {
-		return fmt.Sprintf("%s (%s)", e.ClaudeName, e.ClaudeNameSource)
+	if e.LabelSource != "" {
+		return fmt.Sprintf("%s (%s)", e.Label, e.LabelSource)
 	}
-	return e.ClaudeName
+	return e.Label
 }
 
 func truncate(s string, n int) string {

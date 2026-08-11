@@ -94,7 +94,7 @@ func Listen(opts ListenOptions, stdout, stderr io.Writer) error {
 			close(done)
 		}
 	}
-	lines := make(chan *Message, 256)
+	lines := make(chan followedMessage, 256)
 
 	var (
 		sid  string
@@ -165,7 +165,7 @@ func Listen(opts ListenOptions, stdout, stderr io.Writer) error {
 		if !opts.Replay {
 			inboxOffset = endOffset(spool) // the spool is never compacted, so base is 0
 		}
-		go followSource(spool, inboxOffset, lines, done, nil, logf)
+		go followSource(spool, inboxOffset, inboxCursorKey, lines, done, logf)
 
 		// Topics: reuse the monitor's manager, so a `pigeon subscribe` against this
 		// inbox takes effect live, just as it would for a session.
@@ -183,7 +183,7 @@ func Listen(opts ListenOptions, stdout, stderr io.Writer) error {
 			if !opts.Replay {
 				off += endOffset(path)
 			}
-			go followSource(path, off, lines, done, nil, logf)
+			go followSource(path, off, ref.String(), lines, done, logf)
 		}
 		logf("listening on %s in namespace %s", topicList(topics), ns)
 	}
@@ -205,14 +205,40 @@ func Listen(opts ListenOptions, stdout, stderr io.Writer) error {
 		case <-timeout:
 			logf("timeout reached after %s", opts.Timeout)
 			return nil
-		case m := <-lines:
+		case fm := <-lines:
+			m := fm.msg
+			// Cursor ownership moved from followSource to whoever handles the
+			// message (see followSource's doc comment); this loop is that
+			// consumer. Persist only a named inbox's topic cursors, matching
+			// what manageSubscriptions used to do on its own: the direct
+			// spool's own cursor was never kept for an ephemeral inbox that
+			// has nothing to resume into (there is no `claude --resume`
+			// equivalent for a shell), and an anonymous tail registers no
+			// entry to persist a cursor against at all. Advanced before the
+			// self-broadcast check below, same as before: a message this
+			// loop declines to print has still been handled.
+			if sid != "" && fm.source != inboxCursorKey {
+				_ = ns.mutateCursors(sid, func(c map[string]int64) {
+					if fm.offset > c[fm.source] {
+						c[fm.source] = fm.offset
+					}
+				})
+			}
 			// Never echo our own broadcast back to us.
 			if sid != "" && m.From.SessionID == sid {
 				continue
 			}
 			if emitJSON {
 				ev := listenEvent{Message: m, Namespace: ns.String()}
-				if m.Payload != "" {
+				// Only ever read back a payload this session wrote itself.
+				// Render and the inbox both gate on the containing directory
+				// before so much as printing one of these paths; this read is
+				// the same trust decision taken further, since it puts the
+				// bytes themselves into output some other program consumes.
+				// Ungated, a hand-written line naming any file this user can
+				// read -- a key, a token, a history file -- would have had its
+				// contents pumped through the listener.
+				if ns.trustedPayloadPath(m.Payload) {
 					if b, err := os.ReadFile(m.Payload); err == nil {
 						ev.Body = string(b)
 					}
@@ -221,7 +247,13 @@ func Listen(opts ListenOptions, stdout, stderr io.Writer) error {
 					return err
 				}
 			} else {
-				fmt.Fprintln(stdout, ns.Render(m))
+				// sid is "" for an anonymous tail, which has no entry of its own to
+				// match a For list against -- the same as any other unnamed viewer.
+				var self *Entry
+				if sid != "" {
+					self, _ = ns.ReadEntry(sid)
+				}
+				fmt.Fprintln(stdout, ns.Render(m, self))
 			}
 			received++
 			if opts.Count > 0 && received >= opts.Count {
@@ -244,7 +276,7 @@ func registerEphemeral(ns Namespace, sid, name string, topics []TopicRef, replay
 		private = true
 	}
 
-	subs := defaultSubscriptions(ns)
+	subs := defaultSubscriptions(ns, cwd, private)
 	for _, ref := range topics {
 		subs = append(subs, ref.String())
 	}
@@ -282,7 +314,7 @@ func registerEphemeral(ns Namespace, sid, name string, topics []TopicRef, replay
 			base := readBase(ref.path(ns))
 			_ = ns.mutateCursors(sid, func(m map[string]int64) { m[ref.String()] = base })
 		} else {
-			_ = ns.seedCursor(sid, ref)
+			_, _ = ns.seedCursor(sid, ref, "")
 		}
 	}
 	return nil

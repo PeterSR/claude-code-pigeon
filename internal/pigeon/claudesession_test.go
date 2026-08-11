@@ -294,17 +294,17 @@ func TestResolveTargetPidAndPrefixOverlapIsNotAmbiguous(t *testing.T) {
 	}
 }
 
-// A derived Claude name is the cwd basename plus a suffix, so publishing it
-// would leak the very directory a private session withholds.
-func TestWriteEntryWithholdsClaudeNameWhenPrivate(t *testing.T) {
+// A derived label is the cwd basename plus a suffix, so publishing it would
+// leak the very directory a private session withholds.
+func TestWriteEntryWithholdsLabelWhenPrivate(t *testing.T) {
 	withHome(t)
 	sid := "cccc1111-2222-3333-4444-555555555555"
 	if err := WriteEntry(&Entry{
-		SessionID:        sid,
-		Cwd:              "/home/someone/dev/secret-client",
-		ClaudeName:       "secret-client-a1",
-		ClaudeNameSource: "derived",
-		Private:          true,
+		SessionID:   sid,
+		Cwd:         "/home/someone/dev/secret-client",
+		Label:       "secret-client-a1",
+		LabelSource: "derived",
+		Private:     true,
 	}); err != nil {
 		t.Fatalf("WriteEntry: %v", err)
 	}
@@ -312,14 +312,15 @@ func TestWriteEntryWithholdsClaudeNameWhenPrivate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadEntry: %v", err)
 	}
-	if e.ClaudeName != "" || e.ClaudeNameSource != "" {
-		t.Fatalf("private entry published claude name %q (%q); want withheld", e.ClaudeName, e.ClaudeNameSource)
+	if e.Label != "" || e.LabelSource != "" {
+		t.Fatalf("private entry published label %q (%q); want withheld", e.Label, e.LabelSource)
 	}
 }
 
-// A project can reuse the host label, e.g. "name": "{{.ClaudeName}}". The field
-// is populated only for the current session, whose index pigeon can locate.
-func TestTemplateClaudeNameRendersForCurrentSession(t *testing.T) {
+// {{.ClaudeName}} is a deprecated alias for {{.Label}}, kept working for a
+// project config written before the rename. The field is populated only for
+// the current session, whose index pigeon can locate.
+func TestTemplateClaudeNameAliasRendersForCurrentSession(t *testing.T) {
 	withHome(t)
 	pid := os.Getpid()
 	sid := "dddd1111-2222-3333-4444-555555555555"
@@ -336,8 +337,9 @@ func TestTemplateClaudeNameRendersForCurrentSession(t *testing.T) {
 	}
 }
 
-// .Label is an alias of .ClaudeName, so a template may use either word.
-func TestTemplateLabelAliasesClaudeName(t *testing.T) {
+// .ClaudeName is a deprecated alias of .Label, so a template may use either
+// word and get the same value.
+func TestTemplateClaudeNameAliasesLabel(t *testing.T) {
 	withHome(t)
 	pid := os.Getpid()
 	sid := "dddd1111-2222-3333-4444-555555555555"
@@ -360,7 +362,7 @@ func TestTemplateLabelAliasesClaudeName(t *testing.T) {
 
 // For any id that is not the current session, the field stays empty rather than
 // guess: another session's index is keyed by a pid this process does not know.
-func TestTemplateClaudeNameEmptyForOtherSession(t *testing.T) {
+func TestTemplateLabelEmptyForOtherSession(t *testing.T) {
 	withHome(t)
 	t.Setenv(EnvSessionID, "dddd1111-2222-3333-4444-555555555555")
 	t.Setenv(EnvClaudePID, strconv.Itoa(os.Getpid()))
@@ -368,7 +370,7 @@ func TestTemplateClaudeNameEmptyForOtherSession(t *testing.T) {
 
 	// Rendering for a *different* session id must not pick up this one's label.
 	ctx := NewTemplateContext(DefaultNamespace(), "eeee9999-0000-0000-0000-000000000000", t.TempDir())
-	if ctx.ClaudeName != "" {
-		t.Fatalf("ClaudeName=%q for a non-current session, want empty", ctx.ClaudeName)
+	if ctx.Label != "" {
+		t.Fatalf("Label=%q for a non-current session, want empty", ctx.Label)
 	}
 }

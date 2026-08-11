@@ -66,7 +66,7 @@ func TestListenAnonymousTailReceivesPublish(t *testing.T) {
 	})
 	l.waitReady(t)
 
-	if _, err := Publish("deploys", "v2.1 rolled out", peer()); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "v2.1 rolled out"}, peer()); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	if err := l.waitExit(t); err != nil {
@@ -85,7 +85,7 @@ func TestListenAnonymousTailReceivesPublish(t *testing.T) {
 func TestListenReplayVsFromNow(t *testing.T) {
 	t.Run("from now on skips history", func(t *testing.T) {
 		withHome(t)
-		if _, err := Publish("deploys", "published before", peer()); err != nil {
+		if _, err := Publish("deploys", Draft{Text: "published before"}, peer()); err != nil {
 			t.Fatalf("Publish: %v", err)
 		}
 		l := startListen(t, ListenOptions{
@@ -103,7 +103,7 @@ func TestListenReplayVsFromNow(t *testing.T) {
 
 	t.Run("replay drains history", func(t *testing.T) {
 		withHome(t)
-		if _, err := Publish("deploys", "published before", peer()); err != nil {
+		if _, err := Publish("deploys", Draft{Text: "published before"}, peer()); err != nil {
 			t.Fatalf("Publish: %v", err)
 		}
 		l := startListen(t, ListenOptions{
@@ -158,10 +158,10 @@ func TestListenInboxRegistersReceivesAndDeregisters(t *testing.T) {
 		t.Errorf("ResolveTarget(%q) = %v, %v; want the inbox %s", name, got, err, sid)
 	}
 
-	if _, err := Send(mailbox(sid), "direct-hello", peer(), ""); err != nil {
+	if _, err := Send(mailbox(sid), Draft{Text: "direct-hello"}, peer()); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
-	if _, err := Publish(PublicTopic, "topic-hello", peer()); err != nil {
+	if _, err := Publish(PublicTopic, Draft{Text: "topic-hello"}, peer()); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 
@@ -194,7 +194,7 @@ func TestListenJSONOutput(t *testing.T) {
 	})
 	l.waitReady(t)
 
-	if _, err := Publish("deploys", "json-body", peer()); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "json-body"}, peer()); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	if err := l.waitExit(t); err != nil {
@@ -234,7 +234,7 @@ func TestListenAutoNDJSONWhenNotTTY(t *testing.T) {
 	})
 	l.waitReady(t)
 
-	if _, err := Publish("deploys", "auto-json", peer()); err != nil {
+	if _, err := Publish("deploys", Draft{Text: "auto-json"}, peer()); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 	if err := l.waitExit(t); err != nil {
@@ -289,7 +289,7 @@ func TestListenSecondInboxSameNameFails(t *testing.T) {
 	}
 
 	// Stop the first cleanly by delivering its one message.
-	if _, err := Send(mailbox(sid), "bye", peer(), ""); err != nil {
+	if _, err := Send(mailbox(sid), Draft{Text: "bye"}, peer()); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	if err := first.waitExit(t); err != nil {

@@ -15,8 +15,8 @@ $ pigeon ls
 $ pigeon send alpha "the build is green"
 sent -> aaaa1111 (alpha)
 
-$ pigeon publish all "deploying to staging in 5"
-published to #all (2 subscriber(s) besides you)
+$ pigeon publish here "deploying to staging in 5"
+published to #api-server (2 subscriber(s) besides you)
 ```
 
 The receiving session wakes about a second later:
@@ -71,8 +71,13 @@ capabilities; the plugin just saves you doing it per session.
 pigeon ls [--all] [--json]      list sessions and whether they are listening
 pigeon send <target> <text>     send to one session
 pigeon publish <topic> <text>   publish to everyone subscribed
+pigeon inbox [--all] [--full]   read your own mail, in full, without a notification
+pigeon ask <topic> <text>       ask, and block until the answers are in
+pigeon answer <id> <verdict>    ok | object | blocked, with an optional note
+pigeon thread <id>              print one conversation end to end
 pigeon subscribe <topic>        join a topic (takes effect in ~1s, no restart)
 pigeon unsubscribe <topic>
+pigeon delivery [<topic> <mode>]  push | digest | quiet, per topic
 pigeon listen [topic...]        receive messages in this shell, blocking
 pigeon topics                   topics and subscriber counts
 pigeon namespaces               namespaces and their session counts
@@ -96,6 +101,12 @@ reply handle, because there is nowhere to reply to. From a shell that is
 [acting as an inbox](#listening-from-a-shell-automation) it is stamped as that inbox, so a
 reply reaches it.
 
+`send` and `publish` take `--subject`, `--brief`, `--alert`, `--reply-to`, `--supersedes` and
+`--attach`; `publish` also takes a repeatable `--for`. Flags must come before the target and the
+body -- Go's flag parsing stops at the first positional argument, so `pigeon publish topic
+--subject x body` would file the subject away as message text. pigeon refuses that rather than
+sending a message quietly missing the part you meant.
+
 `name` and `describe` also take `--template '{{.Dir}}-{{.Seq}}'`, rendered against this
 session. The fields and functions are the ones in [Project defaults](#project-defaults)
 below.
@@ -114,7 +125,7 @@ A project can declare what sessions started in it should look like, in
 ```
 
 A session opened in that checkout comes up already named `api`, already described, and
-already listening to `#deploys` and `#ci` alongside the default `#all` and `@all`. Commit
+already listening to `#deploys` and `#ci` alongside the defaults `#here`, `#namespace` and `@global`. Commit
 the file and everyone working on the repo gets the same wiring without configuring
 anything.
 
@@ -163,9 +174,9 @@ has to be escaped.
 | `.Short` | its first 8 characters, the form `pigeon ls` shows |
 | `.Seq` | 1 plus the number of live sessions already in this directory |
 | `.Name` | in `onNameTaken` only: the name that was already taken |
-| `.ClaudeName` | Claude Code's own session name, the one `/status` shows. Filled in only for the current session; empty otherwise. See [below](#the-pid-and-claude-codes-own-session-name) |
-| `.Label` | an alias for `.ClaudeName`, for templates that prefer the shorter word |
-| `.ClaudeNameSource` | how Claude Code arrived at it: `derived` from the cwd, or a value that marks it user-set |
+| `.Label` | the host's own session name, the one `/status` shows for Claude Code. Filled in only for the current session; empty otherwise. See [below](#the-pid-and-claude-codes-own-session-name) |
+| `.LabelSource` | how the host arrived at it: `derived` from the cwd, or a value that marks it user-set |
+| `.ClaudeName`, `.ClaudeNameSource` | deprecated aliases for `.Label` and `.LabelSource`, kept working for a project config written before the rename |
 
 | Function | What it does |
 |---|---|
@@ -244,8 +255,8 @@ declare, never on this, and it is not accepted as a send target. By default
 Claude Code derives it from the working directory, so it mostly echoes what
 `cwd` already says; it earns its column when you rename a session in Claude
 Code, which is the one name pigeon cannot derive for you. Templates can read it
-as `{{.ClaudeName}}`, so a workflow built around those renames can adopt it with
-`"name": "{{.ClaudeName}}"`.
+as `{{.Label}}`, so a workflow built around those renames can adopt it with
+`"name": "{{.Label}}"` (`{{.ClaudeName}}` still works, as a deprecated alias).
 
 pigeon reads it from Claude Code's own per-session index, which is another piece
 of shipped-but-undocumented behaviour (see [How it works](#how-it-works)), so it
@@ -256,8 +267,9 @@ directory the session asked to keep off the bus.
 
 ### Topics
 
-Every session joins `all` by default, so `pigeon publish all "…"` broadcasts to your
-namespace, and `@all` for the whole machine. Topics are append-only logs and each
+Every session joins three rooms by default: `here` (its own checkout, named after the
+repository), `namespace` (everyone in its namespace) and `@global` (everyone on the
+machine). `pigeon publish here "…"` is the one to reach for; the other two are wider. Topics are append-only logs and each
 subscriber keeps its own cursor, so publishing is O(1) regardless of how many sessions
 listen, and nobody consumes anyone else's messages. Subscribing starts from now --
 history is not replayed into your context.
@@ -315,6 +327,133 @@ can do all of this itself. `set_identity` takes `nameTemplate` and `descriptionT
 alongside the literal fields, with the same context and functions as the project config.
 `list_sessions`, `send_message`, `publish`, `subscribe` and `unsubscribe` take an optional
 `namespace`; leaving it out means this session's own.
+
+## Messages that cost the reader less
+
+A notification is clipped at about 512 characters by Claude Code, so roughly 300 of body
+survives and the rest goes to a payload file. Measured across a real five-session run, that
+clipped **every** message on the topic -- median 2,019 characters -- and the pointer to the rest
+was followed under three times in ten. Most messages were read as a prefix cut mid-sentence.
+
+So a message has three tiers, and the sender writes all of them:
+
+```console
+$ pigeon publish --subject "ws2 has NO orders at all -- every forecast screen is empty and correct" \
+                 --brief "Zero rows in orders, so the forecast answers 200 with order_count 0.
+                          An empty screen is exactly what a broken one looks like. Confirm your
+                          fixture rows EXIST before reading a result as a pass." \
+                 inventory-chain "...the full detail, including what I checked while I was in there..."
+```
+
+`subject` is the only part guaranteed to arrive, so it should be the conclusion rather than the
+topic. It is never what the notification line drops. `brief` is what `pigeon inbox` shows by
+default. `text` is everything.
+
+pigeon does not write these for you and will not try -- it is a static binary with no model
+behind it. That the sender is one is the whole reason this design is available here and would
+not be on a message bus for people.
+
+## Reading your own mail
+
+The notification is a doorbell. `inbox` is the door:
+
+```console
+$ pigeon inbox
+3 unread (2 on #inventory-chain, 1 direct):
+m_b04fc3046ecb  15:11  ad-hoc            #inventory-chain  (4 min ago)
+  SUBJECT: RELEASING api/inventory.py, models.py and the migrations
+  Timezone rework is in at 268ce1341. All 23 columns are timestamptz from birth...
+m_88b0c1f2a3d4  15:12  inv-invoices      #inventory-chain  -> you  (2 min ago)
+  SUBJECT: CLAIMING backend/app/api/inventory.py for Defect 2
+  ...
+```
+
+One call drains a whole burst, in full, with no payload paths to chase. `--full` for whole
+bodies, `--subjects` for one line each, `--all` to browse history without consuming it.
+
+Reading is tracked separately from notification. The monitor's cursor records what it has told
+you about; a second cursor records what you have actually read. Conflating them would let a
+pull silently suppress a notification, or a notification mark mail as read that nobody saw.
+
+## Attention, and who gets to take it
+
+| | |
+|---|---|
+| `pigeon delivery <topic> digest` | one line a minute instead of one per message |
+| `pigeon delivery <topic> quiet` | only that line; nothing interrupts |
+| `--alert` | interrupts a `digest` topic. Never a `quiet` one |
+| `--for <name>` | says who a broadcast is for. **Only they are interrupted**; everyone else keeps it in their inbox. Also interrupts a `digest` topic, for those named |
+
+**`--for` is the quietest thing you can do.** A broadcast that names nobody interrupts every
+subscriber, which is what it is for. One that names somebody interrupts only them: the rest still
+have the message, in the topic log and in `pigeon inbox`, it just does not cost them a turn. A
+name matches a session's declared name, its host label, or its short id, so a session that never
+named itself is still addressable.
+
+Addressing beats `--alert`, deliberately. A message urgent enough to escalate is urgent for the
+sessions it names, and waking everyone else because it matters to somebody else is the noise
+`--for` exists to remove. If you mean everybody, now, leave `--for` off.
+
+A digest looks like:
+
+```
+[pigeon] 6 waiting on #inventory-chain from indkoeb-ui, ad-hoc, project-overview -- read with the inbox tool
+```
+
+**`quiet` is absolute.** A peer's opinion of its own urgency does not override a session that
+asked not to be interrupted; the most an alert earns there is a line at the next tick. A mute a
+sufficiently insistent sender can override is not a mute.
+
+There are exactly two priorities. A third would make the scarce one common, which is what
+happened to shouting in capitals.
+
+## Asking, when the answer has to arrive first
+
+```console
+$ pigeon ask --deadline 30s ops "Removing a stale index.lock -- anyone mid-git?"
+ask m_9f2c1a2b3c4d closed after 18s: 2 ok, 1 object, 1 no answer (of 4 asked)
+  object  inv-purchaseplan -- it was not stale, I hold it
+  ok      indkoeb-ui
+  ok      ad-hoc
+  no answer  inv-invoices (live)
+```
+
+`ask` **blocks**. It publishes the question as an alert, then waits for the answers itself and
+returns the tally, so the asker cannot act before the window closes -- it is inside a tool call.
+The deadline lives in the asking process rather than in the monitor, because the monitor is the
+part that dies on resume, and an ask that depended on it would hang exactly when it mattered.
+
+The audience is fixed when the question is asked, and every non-answer is named along with what
+that session's status was at close. **Nothing in the output ever reads as "no objections":** a
+session that says nothing may be deaf, busy, or gone, and the one incident this exists for was a
+coordinator reading silence as consent and removing a lock that was live.
+
+## Correcting a message instead of sending another one
+
+```console
+$ pigeon publish --supersedes m_2a71... ops "NOTHING WAS DESTROYED. I was wrong."
+```
+
+A recipient who has seen the original is told this is a correction before reading a word of it.
+One who has not -- because the topic is on digest and the window has not closed -- never sees
+the original at all: it is dropped from the buffer and the alarm simply never happens.
+
+Only the original sender may supersede a message. Otherwise any peer could cancel someone else's
+alarm inside a digest window, or stamp a false retraction on a claim nobody withdrew.
+
+## Threads, catch-up and attachments
+
+`--reply-to <id>` links a message to its parent; `pigeon inbox` groups a run of them under one
+header, and `pigeon thread <id>` prints a conversation end to end. The notification line is
+deliberately untouched -- the budget cannot afford a thread tag and it would not help at doorbell
+time.
+
+`pigeon subscribe --catchup 20 <topic>` joins an in-flight topic with the last 20 messages
+waiting. They land in the **inbox**, not as twenty notifications: the monitor's cursor stays at
+the end of the log and only the read position moves back.
+
+`--attach <path>` sends files alongside a message, up to five and 256 KiB each. An attachment is
+a file a peer chose: read it, do not run it.
 
 ## Skills
 
@@ -388,10 +527,10 @@ history-expands in a shell, and `~` gets tilde-expanded, so those would fail in 
 have nothing to do with pigeon; `@` is shell-safe and reads differently from the `#` a
 namespaced topic renders with.
 
-**Every session subscribes to `@all` as well as `all`, and that is deliberate.** It is the
+**Every session subscribes to `@global` as well as `namespace`, and that is deliberate.** It is the
 one place the isolation is not absolute: a broadcast meant for everyone on the machine has
 to reach everyone on the machine. If you would rather not hear it, `pigeon unsubscribe
-@all`.
+@global`.
 
 A notification names the sender's namespace exactly when the message could have come from
 outside yours, because that is when it changes how you should read it and where a reply
@@ -565,9 +704,9 @@ A private namespace is:
   see or reach it at all.
 - **Entirely normal from inside.** Its members see each other, message each other, and
   see the other (non-private) namespaces around them, exactly as any session does.
-- **Sealed against machine-wide topics, both ways.** Its sessions do not join `@all`, do
+- **Sealed against machine-wide topics, both ways.** Its sessions do not join `@global`, do
   not receive any `@topic`, and cannot publish to one. A private namespace that could
-  still broadcast to `@all` would publish exactly what it was made private to keep in.
+  still broadcast to `@global` would publish exactly what it was made private to keep in.
 
 The escape hatch is your own terminal. The rule keys on `CLAUDE_CODE_SESSION_ID`, which
 Claude Code injects into everything it spawns -- the MCP server and the agent's shell
@@ -676,7 +815,15 @@ are written to `payloads/` and the recipient gets a path instead.
   sessions still works; only the space reclaim is skipped.
 - One machine. No network transport.
 - 30 notifications per minute per session; beyond that pigeon reports suppression rather
-  than being stopped by Claude Code.
+  than being stopped by Claude Code. Ten of those slots are reserved for alerts, so routine
+  traffic cannot crowd out a message that meant to stop you, and digest lines spend from that
+  reserve since one of them stands in for many messages.
+- A digest holds messages for up to a minute. If the monitor is killed in that window the line
+  is written best-effort and the read position is left alone, so a rearmed monitor re-reads
+  rather than resuming past messages nothing announced. The cost is a possible duplicate digest
+  line after a restart, which is the cheap side of that trade.
+- `ask` blocks the calling tool for up to its deadline (30s by default, 300s maximum). That is
+  the point of it, but it does mean the asking session does nothing else meanwhile.
 - Namespaces are organisation, not a security boundary. They keep unrelated work out of
   each other's listings and broadcasts; they do not stop anything that can write the state
   directory from reaching across, and `-n` exists precisely so you can.

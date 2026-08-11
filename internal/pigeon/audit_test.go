@@ -275,7 +275,7 @@ func TestCompactionDoesNotMoveAnyCursor(t *testing.T) {
 
 	body := strings.Repeat("x", 400)
 	for i := 0; i < 500; i++ {
-		if _, err := ns.Publish("busy", body, from); err != nil {
+		if _, err := ns.Publish("busy", Draft{Text: body}, from); err != nil {
 			t.Fatalf("Publish: %v", err)
 		}
 	}
@@ -338,7 +338,7 @@ func TestFollowerLosesNothingAcrossACompaction(t *testing.T) {
 	body := strings.Repeat("y", 400)
 	const total = 500
 	for i := 0; i < total; i++ {
-		if _, err := ns.Publish("busy", body, from); err != nil {
+		if _, err := ns.Publish("busy", Draft{Text: body}, from); err != nil {
 			t.Fatalf("Publish: %v", err)
 		}
 	}
@@ -359,11 +359,9 @@ func TestFollowerLosesNothingAcrossACompaction(t *testing.T) {
 	}
 
 	// Now follow from the stored cursor, as a restarting monitor does.
-	out := make(chan *Message, total)
+	out := make(chan followedMessage, total)
 	stop := make(chan struct{})
-	go followSource(path, ns.readCursors(slow.SessionID)["busy"], out, stop,
-		func(at int64) { _ = ns.mutateCursors(slow.SessionID, func(m map[string]int64) { m["busy"] = at }) },
-		func(string, ...any) {})
+	go followSource(path, ns.readCursors(slow.SessionID)["busy"], "busy", out, stop, func(string, ...any) {})
 
 	got := 0
 	deadline := time.After(10 * time.Second)
@@ -456,7 +454,7 @@ func TestRenderKeepsThePayloadPointerWhenSpaceIsTight(t *testing.T) {
 				Payload: payload,
 			}
 
-			got := ns.Render(m)
+			got := ns.Render(m, nil)
 			if n := len([]rune(got)); n > RenderBudget {
 				t.Errorf("line is %d runes, over the %d budget:\n%s", n, RenderBudget, got)
 			}
@@ -469,6 +467,83 @@ func TestRenderKeepsThePayloadPointerWhenSpaceIsTight(t *testing.T) {
 	}
 }
 
+// The subject is never-dropped for the same reason the payload pointer is,
+// so it has to survive the same tight-budget sweep TestRenderKeepsThe
+// PayloadPointerWhenSpaceIsTight already runs the pointer through.
+func TestRenderKeepsTheSubjectWhenSpaceIsTight(t *testing.T) {
+	// Swept by total home length rather than by a pad added to t.TempDir(),
+	// because a pad only means anything relative to a temp root whose length
+	// is the platform's business: the same pad that lands mid-ladder on Linux
+	// lands past the end of it on macOS and Windows, whose temp paths are far
+	// longer. The sibling sweep above learned this once already, and fixing it
+	// there by adding more pads left the assumption itself in place for this
+	// one to inherit.
+	//
+	// The ceiling is the ladder's own last rung, and it is a real boundary
+	// rather than an arbitrary one: past a home of roughly 180 bytes the
+	// payload pointer alone is close enough to the budget that the subject
+	// cannot fit beside it, and the ladder gives the subject up deliberately,
+	// because the pointer is the only part of the line with no substitute.
+	// That trade is the documented behaviour, so the sweep stops below it.
+	// A platform whose temp root is longer than a case's home cannot host that
+	// case at all, so the short end of the sweep skips on macOS and Windows.
+	// Counted rather than left to skip quietly: a sweep that skipped every case
+	// would report the invariant as holding while testing nothing, which is the
+	// reading this whole branch exists to remove.
+	ran := 0
+	for _, total := range []int{60, 90, 120, 150, 170} {
+		t.Run(fmt.Sprintf("home%d", total), func(t *testing.T) {
+			base := t.TempDir()
+			if len(base)+1 >= total {
+				t.Skipf("temp root is already %d bytes, past the %d-byte home this case tests", len(base), total)
+			}
+			home := filepath.Join(base, strings.Repeat("d", total-len(base)-1))
+			t.Setenv(EnvHome, home)
+			ns := mustNS(t, strings.Repeat("n", 60))
+			if err := ns.EnsureDirs(); err != nil {
+				t.Skipf("path too long for this filesystem: %v", err)
+			}
+			// Counted here rather than above the skips: a case that bailed on
+			// EnsureDirs asserted nothing either, and counting it would let the
+			// all-skipped guard below report coverage this sweep never had.
+			ran++
+
+			payload := filepath.Join(ns.PayloadsDir(), "m_deadbeefcafe.txt")
+			subject := strings.Repeat("j", 80)
+			m := &Message{
+				From: Sender{
+					Kind: "session", SessionID: "aaaa1111",
+					Name: strings.Repeat("s", 32), Cwd: "/tmp/" + strings.Repeat("w", 40),
+					Namespace: "elsewhere",
+				},
+				Topic:   strings.Repeat("t", 60),
+				Text:    strings.Repeat("body ", 200),
+				Payload: payload,
+				Subject: subject,
+			}
+
+			got := ns.Render(m, nil)
+			if n := len([]rune(got)); n > RenderBudget {
+				t.Errorf("line is %d runes, over the %d budget:\n%s", n, RenderBudget, got)
+			}
+			// The pointer is the only route to a body that did not fit inline.
+			if !strings.Contains(got, payload) {
+				t.Errorf("the payload pointer was cut, stranding the message:\n%s", got)
+			}
+			// The subject is the only part of the body a recipient is
+			// guaranteed to see; it must survive right alongside the pointer.
+			if !strings.Contains(got, subject) {
+				t.Errorf("the subject was dropped by the give-up ladder:\n%s", got)
+			}
+		})
+	}
+	if ran == 0 {
+		t.Fatalf("every case skipped: this platform's temp root is longer than the "+
+			"widest home the ladder can hold a subject in (%d bytes), so the invariant "+
+			"went untested rather than untrue", 170)
+	}
+}
+
 // The ordinary case must be unaffected: everything fits, so nothing is given up.
 func TestRenderKeepsEveryHintWhenThereIsRoom(t *testing.T) {
 	withHome(t)
@@ -478,7 +553,7 @@ func TestRenderKeepsEveryHintWhenThereIsRoom(t *testing.T) {
 		Topic: "deploys",
 		Text:  "short",
 	}
-	got := ns.Render(m)
+	got := ns.Render(m, nil)
 	for _, want := range []string{"[reply: pigeon send alpha]", "[topic: pigeon publish deploys]", ":: short"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q:\n%s", want, got)

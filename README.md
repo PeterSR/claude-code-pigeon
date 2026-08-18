@@ -693,29 +693,68 @@ separate connection — so a push is recorded optimistically. The message is nev
 is on the spool and in `pigeon inbox`. A session configured to refuse inbound messages, and
 therefore not interrupted, is behaving as configured.
 
-### Turning the monitor off
+### Turning the monitor on
 
-Once the socket can deliver, the monitor is optional. `pigeon monitoring off` stops your
-sessions announcing mail; nothing else changes.
+**No monitor is armed by default.** Not one that starts and stands down: none, no process
+at all. Installing a plugin is not a decision to run something in every session from then
+on, and once the socket can deliver, the monitor is no longer how a session is *reached*.
+It is the part that *announces* mail, which is a convenience you ask for:
 
 ```console
-$ pigeon monitoring off
-monitoring off: sessions stay registered and reachable over their socket,
-but nothing announces mail that lands on the spool. `pigeon inbox` still reads it.
-the digest and quiet delivery modes need a monitor, so they stop applying.
+$ pigeon monitoring on
+monitoring on: sessions will announce mail as it arrives
 running sessions are unaffected; this takes effect when a session next starts
 ```
 
-It is machine-level, in `$XDG_CONFIG_HOME/pigeon/config.json` as `"monitor": "off"`, and
+`pigeon monitoring off` puts it back, and is what you already have if you have never run
+either.
+
+```console
+$ pigeon monitoring off
+monitoring off (the default): sessions stay registered and reachable over their socket,
+but no monitor is started at all. `pigeon inbox` still reads mail that lands.
+the digest and quiet delivery modes need a monitor, so they stop applying.
+updated /home/you/.claude/skills/pigeon/monitors/monitors.json
+running sessions are unaffected; this takes effect when a session next starts
+```
+
+**Upgrading from a version that always armed one?** Run `pigeon install` once. Upgrading
+the binary does not rewrite a manifest already on disk, so an existing install keeps its
+`when: always` entry while the new default reads as off, and every session then starts a
+monitor that stands down and parks. `pigeon doctor` warns when it finds that mismatch.
+
+It is machine-level, in `$XDG_CONFIG_HOME/pigeon/config.json` as `"monitor": "on"`, and
 `PIGEON_MONITOR=on|off` overrides it for one session. Not a `.claude/pigeon.json` field,
 for the reason that keeps `private` and `transport` out of one.
 
-**What "off" does not mean.** The monitor is still spawned, and it has to be, because the
-monitor is what *registers* a session. An unregistered session has no entry, and with no
-entry there is no pid and no socket path to look up, so turning the process off outright
-would not make delivery socket-only; it would make the session unreachable by every
-transport at once. What "off" turns off is the delivering half: the monitor registers,
-leaves its entry in place, and exits without tailing the spool.
+**How a session is addressable with no monitor.** Registration is a plugin *hook*, not the
+monitor. `SessionStart` runs `pigeon register`, which writes the session's entry and exits;
+`SessionEnd` runs `pigeon deregister`, which removes it. A hook that exits costs nothing,
+where a monitor that exits does not (see below), so the entry that carries a session's pid,
+start token and namespace gets written without anything being left running.
+
+That is what makes the setting a real choice. `pigeon monitoring on|off` rewrites the
+plugin's `monitors.json`: on lists the monitor, off lists nothing. The manifest cannot
+express the condition itself -- `when` accepts only `always` or an on-skill-invoke trigger,
+and a monitor command that references `${user_config.*}` is rejected at plugin load -- so
+the condition is applied when the file is written. The hooks are written either way, since
+being findable is not the part anyone opted out of.
+
+Registering from a hook also fixes something older. `SessionStart` fires on `resume` as
+well as `startup`, so a resumed session registers every time; the monitor did not, because
+Claude Code rearms it inconsistently across a resume, sometimes under a new id and
+sometimes not at all.
+
+**If you arm a monitor and then turn delivery off for one session** with
+`PIGEON_MONITOR=off`, that monitor registers and then goes quiet rather than exiting. The
+difference is not academic. Claude Code reports a monitor that exits back into the session
+as having "ended without producing output", which reads as a failure rather than as a
+setting being honoured, so the session spends tokens explaining it at the moment the
+context is emptiest, and the obvious conclusion to draw is to restart the very thing you
+turned off. The parked process holds nothing: it releases the monitor lock on the way in,
+so `pigeon ls` reports `socket` and not `live`, and it exits once the session it belongs to
+is gone -- or idles for the life of the machine in the one case where `CLAUDE_PID` is unset,
+since a process that cannot tell whose session it is cannot tell when that session ended.
 
 So a session in this mode reports as `socket` in `pigeon ls`, is addressable as it always
 was, still accumulates mail on its spool, and still reads it with `pigeon inbox`. What you

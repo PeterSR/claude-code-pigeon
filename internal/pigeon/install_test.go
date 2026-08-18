@@ -59,9 +59,10 @@ func TestInstallWritesTheWholePlugin(t *testing.T) {
 		t.Fatalf("Install: %v", err)
 	}
 
-	// All three files matter: without the manifest the plugin does not load,
-	// without monitors.json nothing is armed, and without .mcp.json the tools
-	// the docs advertise simply do not exist for a documented install.
+	// Every file matters: without the manifest the plugin does not load,
+	// without hooks.json nothing registers and the session is invisible to its
+	// peers, and without .mcp.json the tools the docs advertise simply do not
+	// exist for a documented install.
 	var man pluginManifest
 	readJSONFile(t, filepath.Join(plugin, ".claude-plugin", "plugin.json"), &man)
 	if man.Name != "pigeon" {
@@ -74,17 +75,39 @@ func TestInstallWritesTheWholePlugin(t *testing.T) {
 		t.Error("plugin manifest has no description")
 	}
 
+	// No monitor by default. This is the assertion the whole design rests on:
+	// installing the plugin must not start a background process in every
+	// session from then on.
 	var mons []monitorSpec
-	readJSONFile(t, filepath.Join(plugin, "monitors", "monitors.json"), &mons)
-	if len(mons) != 1 {
-		t.Fatalf("got %d monitors, want exactly 1", len(mons))
+	readJSONFile(t, monitorsPath(plugin), &mons)
+	if len(mons) != 0 {
+		t.Errorf("a default install listed %d monitor(s), want none: %+v", len(mons), mons)
 	}
-	mon := mons[0]
-	if mon.When != "always" {
-		t.Errorf("monitor when = %q, want always -- anything else leaves sessions unarmed", mon.When)
+
+	// Registration is what replaces it, and it is not optional: a session that
+	// never registers has no entry, and with no entry it has no address at all,
+	// socket included.
+	var hooks hooksFile
+	readJSONFile(t, hooksPath(plugin), &hooks)
+	start := hooks.Hooks["SessionStart"]
+	if len(start) != 1 || len(start[0].Hooks) != 1 {
+		t.Fatalf("SessionStart hook is not a single command: %+v", start)
 	}
-	if mon.Name == "" || mon.Description == "" {
-		t.Errorf("monitor is missing a name or description: %+v", mon)
+	if !strings.HasSuffix(start[0].Hooks[0].Command, " register") {
+		t.Errorf("SessionStart runs %q, want it to end with \" register\"", start[0].Hooks[0].Command)
+	}
+	// Resume matters as much as startup: it is the case where the monitor's
+	// own rearm has never been reliable, so a session comes back alive and
+	// unregistered.
+	if m := start[0].Matcher; !strings.Contains(m, "startup") || !strings.Contains(m, "resume") {
+		t.Errorf("SessionStart matcher = %q, want it to cover startup and resume", m)
+	}
+	end := hooks.Hooks["SessionEnd"]
+	if len(end) != 1 || len(end[0].Hooks) != 1 {
+		t.Fatalf("SessionEnd hook is not a single command: %+v", end)
+	}
+	if !strings.HasSuffix(end[0].Hooks[0].Command, " deregister") {
+		t.Errorf("SessionEnd runs %q, want it to end with \" deregister\"", end[0].Hooks[0].Command)
 	}
 
 	var mcp struct {
@@ -137,11 +160,16 @@ func TestInstallWritesTheWholePlugin(t *testing.T) {
 // path plus " monitor" and nothing else.
 func TestInstalledMonitorCommandNeverInterpolatesTheSessionID(t *testing.T) {
 	_, plugin := withPluginHome(t)
+	// The monitor is only in the manifest when the machine has asked for it,
+	// so ask before checking what was written.
+	if err := SetMonitorEnabled(true); err != nil {
+		t.Fatalf("SetMonitorEnabled: %v", err)
+	}
 	if err := Install("dev", &strings.Builder{}); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
 
-	raw, err := os.ReadFile(filepath.Join(plugin, "monitors", "monitors.json"))
+	raw, err := os.ReadFile(monitorsPath(plugin))
 	if err != nil {
 		t.Fatalf("read monitors.json: %v", err)
 	}
@@ -152,7 +180,13 @@ func TestInstalledMonitorCommandNeverInterpolatesTheSessionID(t *testing.T) {
 	}
 
 	var mons []monitorSpec
-	readJSONFile(t, filepath.Join(plugin, "monitors", "monitors.json"), &mons)
+	readJSONFile(t, monitorsPath(plugin), &mons)
+	if len(mons) != 1 {
+		t.Fatalf("got %d monitors with monitoring on, want exactly 1", len(mons))
+	}
+	if mons[0].When != "always" {
+		t.Errorf("monitor when = %q, want always -- anything else leaves sessions unarmed", mons[0].When)
+	}
 	cmd := mons[0].Command
 	if !strings.HasSuffix(cmd, " monitor") {
 		t.Fatalf("monitor command = %q, want it to end with \" monitor\"", cmd)
@@ -185,10 +219,25 @@ func TestInstallIsIdempotent(t *testing.T) {
 	if man.Version != "2.0.0" {
 		t.Errorf("plugin version = %q, want the newer install to win", man.Version)
 	}
+	// Reinstalling must not quietly undo the setting in either direction. An
+	// upgrade is the obvious thing to run after changing anything, and a
+	// reinstall that re-armed every session would hand back the process
+	// somebody turned off.
 	var mons []monitorSpec
-	readJSONFile(t, filepath.Join(plugin, "monitors", "monitors.json"), &mons)
+	readJSONFile(t, monitorsPath(plugin), &mons)
+	if len(mons) != 0 {
+		t.Errorf("got %d monitor(s) after two default installs, want none", len(mons))
+	}
+
+	if err := SetMonitorEnabled(true); err != nil {
+		t.Fatalf("SetMonitorEnabled: %v", err)
+	}
+	if err := Install("3.0.0", &strings.Builder{}); err != nil {
+		t.Fatalf("Install (third): %v", err)
+	}
+	readJSONFile(t, monitorsPath(plugin), &mons)
 	if len(mons) != 1 {
-		t.Errorf("got %d monitors after two installs, want 1", len(mons))
+		t.Errorf("reinstalling with monitoring on gave %d monitor(s), want 1", len(mons))
 	}
 }
 
@@ -333,7 +382,10 @@ func TestArmPrintsTheMonitorCallWhenNothingIsListening(t *testing.T) {
 	got := out.String()
 	// Manual arming is a first-class path, so the exact call has to be there
 	// ready to run, persistent, and pointing at this binary.
-	for _, want := range []string{"Monitor(", "persistent=true", MonitorCommand(), "pigeon install"} {
+	// "pigeon monitoring on" rather than "pigeon install": installing no longer
+	// arms anything, so pointing someone at it would leave them with the same
+	// unarmed session they started with.
+	for _, want := range []string{"Monitor(", "persistent=true", MonitorCommand(), "pigeon monitoring on"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("Arm output is missing %q:\n%s", want, got)
 		}
@@ -365,5 +417,77 @@ func TestArmReportsAnAlreadyListeningMonitor(t *testing.T) {
 	}
 	if !strings.Contains(got, "alpha") {
 		t.Errorf("Arm did not report the session's address:\n%s", got)
+	}
+}
+
+// TestMonitoringSettingRewritesTheManifest: the setting has to reach the file
+// Claude Code actually loads, or "off" would mean a monitor that starts and
+// stands down -- which is a process per session, which is the thing being
+// avoided.
+func TestMonitoringSettingRewritesTheManifest(t *testing.T) {
+	_, plugin := withPluginHome(t)
+	if err := Install("dev", &strings.Builder{}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	var mons []monitorSpec
+	readJSONFile(t, monitorsPath(plugin), &mons)
+	if len(mons) != 0 {
+		t.Fatalf("installed with %d monitor(s), want none by default", len(mons))
+	}
+
+	if _, _, err := SyncPluginManifest(true); err != nil {
+		t.Fatalf("SyncPluginManifest(true): %v", err)
+	}
+	readJSONFile(t, monitorsPath(plugin), &mons)
+	if len(mons) != 1 {
+		t.Fatalf("after turning monitoring on: %d monitor(s), want 1", len(mons))
+	}
+
+	if _, _, err := SyncPluginManifest(false); err != nil {
+		t.Fatalf("SyncPluginManifest(false): %v", err)
+	}
+	readJSONFile(t, monitorsPath(plugin), &mons)
+	if len(mons) != 0 {
+		t.Fatalf("after turning monitoring off: %d monitor(s), want none", len(mons))
+	}
+
+	// The hooks survive both, because registration is not what anyone opted
+	// out of.
+	var hooks hooksFile
+	readJSONFile(t, hooksPath(plugin), &hooks)
+	if len(hooks.Hooks["SessionStart"]) == 0 {
+		t.Error("turning monitoring off removed the registration hook; the session would have no address at all")
+	}
+}
+
+// A machine that never ran `pigeon install` has nothing to rewrite, and that is
+// not a failure: arming by hand is a supported way to run pigeon.
+func TestSyncPluginManifestWithNoInstalledPlugin(t *testing.T) {
+	withHome(t)
+	withUserHome(t)
+	changed, _, err := SyncPluginManifest(true)
+	if err != nil {
+		t.Fatalf("SyncPluginManifest: %v", err)
+	}
+	if changed {
+		t.Error("reported writing a manifest when no plugin is installed")
+	}
+}
+
+// A one-session override must not be able to rewrite what every other session
+// loads.
+func TestMonitorConfiguredIgnoresTheEnvironmentOverride(t *testing.T) {
+	withHome(t)
+	withUserHome(t)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	writeMonitorConfig(t, UserConfig{})
+
+	t.Setenv(EnvMonitor, MonitorOn)
+	if MonitorConfigured() {
+		t.Errorf("%s decided the machine's manifest; only the config may", EnvMonitor)
+	}
+	if on, _ := MonitorEnabled(); !on {
+		t.Errorf("%s stopped deciding this session, which it must still do", EnvMonitor)
 	}
 }

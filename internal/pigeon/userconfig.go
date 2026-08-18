@@ -58,7 +58,9 @@ type UserConfig struct {
 	// which is not private.
 	Namespaces map[string]NamespacePolicy `json:"namespaces,omitempty"`
 	// Monitor says whether this machine's sessions run a delivering monitor:
-	// "on" or "off". Absent means on, which is what pigeon has always done.
+	// "on" or "off". Absent means off: a plugin does not get to start a
+	// background process in every session on the strength of having been
+	// installed, so announcing mail is something you turn on.
 	//
 	// "off" does NOT mean no monitor process. The monitor is what registers a
 	// session, and an unregistered session has no address at all, so nothing
@@ -122,9 +124,10 @@ func readUserConfig() UserConfig {
 			c.Transport = ""
 		}
 	}
-	// Dropped rather than treated as "off". A typo must not silently stop a
-	// machine's sessions from receiving mail, which is the failure this whole
-	// setting exists to let someone choose deliberately.
+	// Dropped rather than guessed at, and dropping it means the default, which
+	// is off. A misspelled setting therefore costs the monitor someone meant to
+	// ask for -- visible the next time they wonder why nothing announced
+	// anything -- rather than silently arming one they did not.
 	if c.Monitor != "" && c.Monitor != MonitorOn && c.Monitor != MonitorOff {
 		c.Monitor = ""
 	}
@@ -184,12 +187,12 @@ func SetMonitorEnabled(on bool) error {
 		return fmt.Errorf("create %s: %w", filepath.Dir(path), err)
 	}
 	c := readUserConfig()
-	// On is the default, so it is written as an absent key rather than as
-	// "on". A config file should say what someone chose to change.
+	// Off is the default, so it is written as an absent key rather than as
+	// "off". A config file should say what someone chose to change.
 	if on {
-		c.Monitor = ""
+		c.Monitor = MonitorOn
 	} else {
-		c.Monitor = MonitorOff
+		c.Monitor = ""
 	}
 	if err := writeUserConfig(c); err != nil {
 		return err

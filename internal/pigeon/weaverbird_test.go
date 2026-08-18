@@ -172,6 +172,11 @@ func TestWeaverbirdValue_SilentWhenLive(t *testing.T) {
 // session is the only one registered.
 func TestWeaverbirdValue_DeafWithWaitingCount(t *testing.T) {
 	withHome(t)
+	withUserHome(t)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	// Deaf is only a fault on a machine that asked for a monitor; see
+	// TestWeaverbirdValue_MonitorOffIsNotAnAlarm for the other half.
+	writeMonitorConfig(t, UserConfig{Monitor: MonitorOn})
 	beta := liveEntry(t, "bbbb2222", "beta", "/tmp/work")
 	t.Setenv(EnvSessionID, "bbbb2222")
 
@@ -192,9 +197,53 @@ func TestWeaverbirdValue_DeafWithWaitingCount(t *testing.T) {
 	if !ok || v.Class != wb.ClassWarn || v.FullText != "3 waiting" || v.ShortText != "3" {
 		t.Errorf("pigeon.wait = %+v, ok=%v, want warn/\"3 waiting\"/\"3\"", v, ok)
 	}
+	// Deaf is only a warning on a machine that ASKED for a monitor. Without
+	// this the test would be asserting the wallpaper case: no monitor is armed
+	// by default, so an unconditional warn here lights up forever.
 	mv, ok := valueByID(vals, "pigeon.monitor")
 	if !ok || mv.FullText != "monitor deaf" || mv.ShortText != "deaf" || mv.Class != wb.ClassWarn {
 		t.Errorf("pigeon.monitor = %+v, ok=%v, want monitor deaf/warn", mv, ok)
+	}
+}
+
+// TestWeaverbirdValue_MonitorOffIsNotAnAlarm: the machine never asked for a
+// monitor, so not having one is the configuration working. A warning that is
+// always on is not a warning, and the reading it invites is that something
+// needs fixing -- which ends with somebody turning monitoring back on to make
+// the colour go away.
+func TestWeaverbirdValue_MonitorOffIsNotAnAlarm(t *testing.T) {
+	withHome(t)
+	withUserHome(t)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	writeMonitorConfig(t, UserConfig{})
+	liveEntry(t, "offff444", "quiet", "/tmp/work")
+	t.Setenv(EnvSessionID, "offff444")
+
+	vals, err := WeaverbirdValue(wb.Session{}, nil)
+	if err != nil {
+		t.Fatalf("WeaverbirdValue: %v", err)
+	}
+	mv, ok := valueByID(vals, "pigeon.monitor")
+	if !ok {
+		t.Fatalf("pigeon.monitor is missing from %+v", vals)
+	}
+	if mv.Class == wb.ClassWarn || mv.Class == wb.ClassDanger {
+		t.Errorf("pigeon.monitor = %+v, want no alarm for a monitor nobody asked for", mv)
+	}
+	if mv.FullText != "monitor off" {
+		t.Errorf("pigeon.monitor text = %q, want it to name the setting rather than the symptom", mv.FullText)
+	}
+
+	// And the same state IS an alarm once the machine has asked for one,
+	// because then a missing monitor is a monitor that died.
+	writeMonitorConfig(t, UserConfig{Monitor: MonitorOn})
+	vals, err = WeaverbirdValue(wb.Session{}, nil)
+	if err != nil {
+		t.Fatalf("WeaverbirdValue: %v", err)
+	}
+	mv, _ = valueByID(vals, "pigeon.monitor")
+	if mv.Class != wb.ClassWarn || mv.FullText != "monitor deaf" {
+		t.Errorf("with monitoring on, pigeon.monitor = %+v, want the deaf warning back", mv)
 	}
 }
 
@@ -218,11 +267,17 @@ func TestWeaverbirdValue_DeafWithNoCountWhenSpoolIsEmpty(t *testing.T) {
 	}
 }
 
-// TestWeaverbirdValue_NotArmed: an unregistered session, old enough that
-// the arming grace window does not apply, is a real alarm. It must say
-// "not armed", and not the "waiting" text the deaf/dead branch uses for mail genuinely piling up on a spool -- no monitor ever
-// armed here, so there is nothing counting mail at all.
-func TestWeaverbirdValue_NotArmed(t *testing.T) {
+// TestWeaverbirdValue_Unregistered: a session with no entry in any namespace,
+// old enough that the registration grace window does not apply, is a real
+// alarm -- nothing can address it at all.
+//
+// It must say "unregistered" rather than "not armed", because a session
+// registers itself from a SessionStart hook whether or not a monitor is ever
+// armed. Reaching this state means the hook did not run, which is a fault;
+// having no monitor is now the default and is not one. And it must not reuse
+// the "waiting" text the deaf/dead branch uses for mail piling up on a spool,
+// since nothing is counting mail here at all.
+func TestWeaverbirdValue_Unregistered(t *testing.T) {
 	withHome(t)
 	t.Setenv(EnvSessionID, "cccc3333")
 
@@ -234,11 +289,11 @@ func TestWeaverbirdValue_NotArmed(t *testing.T) {
 		t.Fatalf("vals = %+v, want exactly one record", vals)
 	}
 	v := vals[0]
-	if v.Class != wb.ClassWarn || v.FullText != "not armed" || v.ShortText != "not armed" {
-		t.Errorf("v = %+v, want pigeon.wait/warn/\"not armed\", not the waiting-count wording", v)
+	if v.Class != wb.ClassWarn || v.FullText != "unregistered" {
+		t.Errorf("v = %+v, want pigeon.wait/warn/\"unregistered\", not the waiting-count wording", v)
 	}
 	if v.FullText == "waiting" {
-		t.Errorf("v.FullText = %q, not-armed must not reuse the deaf/dead waiting text", v.FullText)
+		t.Errorf("v.FullText = %q, unregistered must not reuse the deaf/dead waiting text", v.FullText)
 	}
 }
 

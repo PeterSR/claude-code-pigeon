@@ -65,6 +65,8 @@ const usage = `pigeon -- message passing between live Claude Code sessions
   pigeon prune                   forget dead sessions and reclaim topic logs
   pigeon monitoring [on|off]     show or set whether sessions announce their mail
   pigeon monitor                 run the inbox monitor (used by the plugin)
+  pigeon register                register this session (used by the plugin hook)
+  pigeon deregister              deregister this session (used by the plugin hook)
   pigeon mcp                     run the MCP server (used by the plugin)
   pigeon version
 
@@ -145,6 +147,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		err = cmdMonitoring(rest, stdout, stderr)
 	case "monitor":
 		err = pigeon.RunMonitor(stdout, stderr)
+	// Both hooks write to stderr only, never stdout: a SessionStart hook's
+	// stdout is fed back into the session as context, and a plugin announcing
+	// itself there would cost tokens in every session forever.
+	case "register":
+		err = pigeon.RegisterHook(hookStdin(stdin), stderr)
+	case "deregister":
+		err = pigeon.DeregisterHook(hookStdin(stdin), stderr)
 	case "mcp":
 		err = pigeon.RunMCP(stdin, stdout, version)
 	case "version", "--version", "-v":
@@ -339,7 +348,7 @@ func cmdList(args []string, w, stderr io.Writer) error {
 	}
 	if len(entries) == 0 {
 		fmt.Fprintf(w, "no registered pigeon sessions in namespace %s\n", ns)
-		fmt.Fprintln(w, "(a session registers when its monitor arms at startup;")
+		fmt.Fprintln(w, "(a session registers itself at startup, from a plugin hook;")
 		fmt.Fprintln(w, " run `pigeon install` then restart Claude Code)")
 		if !*allNS {
 			printElsewhere(w, ns)
@@ -1068,16 +1077,34 @@ func cmdMonitoring(args []string, w, stderr io.Writer) error {
 		return err
 	}
 
+	// The setting is not only a value something reads at runtime any more: it
+	// decides whether the plugin manifest lists a monitor at all, which is what
+	// makes "off" mean no process rather than a parked one. So writing the
+	// config is only half of the change, and the half that does nothing on its
+	// own.
+	synced, path, serr := pigeon.SyncPluginManifest(on)
+
 	if on {
 		fmt.Fprintln(w, "monitoring on: sessions will announce mail as it arrives")
 	} else {
-		fmt.Fprintln(w, "monitoring off: sessions stay registered and reachable over their socket,")
-		fmt.Fprintln(w, "but nothing announces mail that lands on the spool. `pigeon inbox` still reads it.")
+		fmt.Fprintln(w, "monitoring off (the default): sessions stay registered and reachable over their socket,")
+		fmt.Fprintln(w, "but no monitor is started at all. `pigeon inbox` still reads mail that lands.")
 		fmt.Fprintln(w, "the digest and quiet delivery modes need a monitor, so they stop applying.")
 	}
-	// A monitor reads this once, at session start, and cannot be rebound -- the
-	// same reason a namespace change does not move a running session. Saying so
-	// here is what stops someone concluding the setting does not work.
+	switch {
+	case serr != nil:
+		fmt.Fprintf(stderr, "note: the setting was saved but the plugin manifest could not be updated: %v\n", serr)
+		fmt.Fprintf(stderr, "      run `pigeon install` to rewrite it\n")
+	case synced:
+		fmt.Fprintf(w, "updated %s\n", path)
+	default:
+		// Not an error: arming by hand is a supported way to run pigeon, and
+		// somebody who never installed the plugin has nothing to rewrite.
+		fmt.Fprintln(stderr, "note: no installed plugin found, so only the setting changed")
+	}
+	// Neither a monitor nor a manifest can be rebound mid-session -- the same
+	// reason a namespace change does not move a running session. Saying so here
+	// is what stops someone concluding the setting does not work.
 	fmt.Fprintln(w, "running sessions are unaffected; this takes effect when a session next starts")
 
 	if effective, origin := pigeon.MonitorEnabled(); effective != on {
@@ -1514,4 +1541,29 @@ func abbrev(p string, n int) string {
 		return p
 	}
 	return "…" + string(r[len(r)-n+1:])
+}
+
+// hookStdin hands the hook commands their payload, or nothing when stdin is a
+// terminal.
+//
+// Without the check these commands hang. Reading a hook payload is
+// io.ReadAll(stdin), which at a terminal blocks until the person types Ctrl-D --
+// and `pigeon doctor` recommends running `pigeon register` by hand to register a
+// session that has no entry. Somebody follows that advice, watches the command
+// sit there saying nothing, and concludes registration is broken. Both commands
+// already fall back to the environment for everything the payload carries, so
+// there is nothing to lose by not waiting.
+func hookStdin(in io.Reader) io.Reader {
+	f, ok := in.(*os.File)
+	if !ok {
+		return in
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return in
+	}
+	if fi.Mode()&os.ModeCharDevice != 0 {
+		return nil
+	}
+	return in
 }

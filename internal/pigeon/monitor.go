@@ -119,7 +119,7 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	}
 	defer lock.Close()
 
-	if err := register(ns, sid, rt, logf); err != nil {
+	if err := register(ns, sid, rt, currentSessionFacts(), logf); err != nil {
 		logf("registration failed: %v", err)
 	}
 
@@ -130,7 +130,9 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	logf("armed session=%s namespace=%s spool=%s", sid, ns, spool)
 
 	// Stand down here if this machine has turned delivery off, AFTER registering
-	// and before anything that would have to be unwound.
+	// and before anything that would have to be unwound. Standing down means
+	// going quiet, not going away: see idleUntilSessionEnds for why the process
+	// stays.
 	//
 	// The registry entry is deliberately left behind, which is the one thing
 	// that makes this mode work at all. Everywhere else a monitor exits it
@@ -149,6 +151,12 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	// delivering for this session", and from here on none is.
 	if on, origin := MonitorEnabled(); !on {
 		logf("monitor delivery is off (from %s); registered and standing down, mail arrives over the socket", origin)
+		// Released here rather than left to the deferred Close, which will not
+		// run for as long as we idle below. The lock means "a monitor is
+		// delivering for this session", and from here on none is, so peers have
+		// to see `socket` and not `live`.
+		lock.Close()
+		idleUntilSessionEnds()
 		return nil
 	}
 
@@ -762,9 +770,17 @@ const (
 // the same reason: a surprise here is a session that stopped announcing mail,
 // and the first question is always what decided that.
 //
-// Highest wins: PIGEON_MONITOR, then the machine config, then on. There is no
+// Highest wins: PIGEON_MONITOR, then the machine config, then OFF. There is no
 // per-invocation flag, because the invocation is not the operator's to make --
 // Claude Code spawns the monitor, not a person.
+//
+// Off is the default because arming a delivering background process in every
+// session is not a decision a plugin gets to make for the person who installed
+// it. It was the only way to receive when it was written; the socket transport
+// removed that, and what is left is an opt-in convenience -- announcing mail
+// that lands while nobody is looking. Someone who wants that says so once with
+// `pigeon monitoring on`, and everybody else gets a session that stays
+// addressable without a process watching it.
 //
 // Deliberately NOT a `.claude/pigeon.json` field, the same line userconfig.go
 // draws for `private` and `transport`. A cloned repository does not get to
@@ -775,10 +791,28 @@ const (
 // monitor is what REGISTERS a session, and an unregistered session has no
 // address, so turning the process off entirely would not make delivery
 // socket-only, it would make the session unreachable by every transport at
-// once. Off means the monitor registers, leaves its entry in place, and exits
+// once. Off means the monitor registers, leaves its entry in place, and idles
 // without tailing the spool -- so the session keeps its address and its mail,
-// and simply stops being interrupted by it. See RunMonitor.
+// and simply stops being interrupted by it. It idles rather than exits because
+// an exit is itself an interruption; see idleUntilSessionEnds. See RunMonitor.
+// MonitorConfigured is the MACHINE's answer alone: the config, then the
+// default, with no environment override consulted.
+//
+// The distinction matters exactly once, and it is worth the separate function.
+// PIGEON_MONITOR is a one-session override, and the plugin manifest is not a
+// one-session thing -- it decides whether a monitor is spawned for every
+// session that starts from now on. Writing the manifest from MonitorEnabled
+// would let a single shell that happened to export the variable rewrite the
+// arrangement for the whole machine.
+func MonitorConfigured() bool {
+	if raw := LoadUserConfig().Monitor; raw != "" {
+		return raw == MonitorOn
+	}
+	return false
+}
+
 func MonitorEnabled() (bool, string) {
+	unusable := ""
 	if raw := strings.TrimSpace(os.Getenv(EnvMonitor)); raw != "" {
 		switch strings.ToLower(raw) {
 		case MonitorOff:
@@ -786,14 +820,18 @@ func MonitorEnabled() (bool, string) {
 		case MonitorOn:
 			return true, EnvMonitor
 		}
-		// An unusable value is ignored rather than read as "off", so a typo
-		// cannot silently stop a machine's mail.
-		return true, EnvMonitor + " is not on or off, so it was ignored"
+		// Ignored means IGNORED: fall through to the layer below rather than
+		// deciding anything of its own. A typo in a one-session override must
+		// not be able to arm a monitor on a machine whose config says not to.
+		unusable = EnvMonitor + " is not on or off, so it was ignored; "
 	}
 	if raw := LoadUserConfig().Monitor; raw != "" {
-		return raw != MonitorOff, UserConfigPath()
+		return raw == MonitorOn, unusable + UserConfigPath()
 	}
-	return true, "default"
+	// Off, and off is the safe direction to fail in now: the cost of a
+	// misspelled setting is a monitor you have to ask for again, not a
+	// background process you did not ask for at all.
+	return false, unusable + "default"
 }
 
 // tryMonitorLock attempts to take the session's liveness lock without waiting.
@@ -803,7 +841,29 @@ func (n Namespace) tryMonitorLock(sessionID string) (io.Closer, bool, error) {
 	return tryExclusive(n.LockPath(sessionID))
 }
 
-func register(ns Namespace, sid string, rt Runtime, logf func(string, ...any)) error {
+// sessionFacts is what a registration needs to know about the live session it
+// is describing, as opposed to what it can work out for itself. It is a
+// parameter rather than something register reads from the environment because
+// registration no longer only ever happens inside a process Claude Code spawned
+// with the session's own variables set: a lifecycle hook knows these from the
+// payload on its stdin and from Claude Code's own session registry, and has to
+// be able to say so. See RegisterHook.
+type sessionFacts struct {
+	// PID is the CLAUDE CODE process, never this one. It is what liveness,
+	// socket resolution and pruning are all decided against, so a wrong value
+	// here is not a cosmetic error: it either strands a live session or keeps a
+	// dead one answering.
+	PID int
+	Cwd string
+}
+
+// currentSessionFacts reads them from this process's environment, which is
+// correct for anything Claude Code spawned into the session directly.
+func currentSessionFacts() sessionFacts {
+	return sessionFacts{PID: CurrentClaudePID(), Cwd: CurrentCwd()}
+}
+
+func register(ns Namespace, sid string, rt Runtime, facts sessionFacts, logf func(string, ...any)) error {
 	// A session hard-killed before its monitor's deferred RemoveEntry runs
 	// leaves a dead entry behind -- otherwise only `pigeon prune` clears it.
 	// Sweeping here means the namespace tidies itself as sessions come and go,
@@ -832,8 +892,8 @@ func register(ns Namespace, sid string, rt Runtime, logf func(string, ...any)) e
 	// for a pid that has since been recycled onto some unrelated process.
 	ns.clearTombstone(sid)
 
-	pid := CurrentClaudePID()
-	cwd := CurrentCwd()
+	pid := facts.PID
+	cwd := facts.Cwd
 
 	// The config is read at every registration, but only *seeds* identity at
 	// the first one. Reading it every time is what keeps `private` honest: it
@@ -1461,5 +1521,50 @@ func sortedKeys(m map[string]int) []string {
 func block() {
 	for {
 		time.Sleep(time.Hour)
+	}
+}
+
+// standDownPoll is how often a stood-down monitor checks whether its session is
+// still there. A var so a test can shrink it; nothing observes the delay but
+// the process table.
+var standDownPoll = 30 * time.Second
+
+// idleUntilSessionEnds parks a monitor that has registered and has nothing to
+// deliver, and it exists because RETURNING is not free. Claude Code reports a
+// monitor that exits back into the session as having "ended without producing
+// output", which reads as a failure rather than as a setting being honoured.
+// The session then spends tokens describing it, in every session, at the moment
+// the context is emptiest -- and the obvious conclusion to draw from it is to
+// restart the very thing this machine turned off. A stand-down that costs a
+// paragraph per session is not a stand-down, so the only way out is not to take
+// it. Same reasoning as block(), which every other stand-down path already uses
+// for the same reason.
+//
+// Unlike block() it does not idle forever. Those paths stand down before
+// registering, so an orphan left behind by one holds nothing and answers for
+// nobody; this one has an entry. Leaving a sleeping process behind for every
+// session that ever ran is a worse deal than the exit it is avoiding. Claude
+// Code's pid is this session's lifetime, and once that is gone there is nobody
+// left to be told anything, so returning then costs nothing.
+//
+// It installs no signal handler, and must not. Parking happens BEFORE the
+// signal trap further down, so SIGTERM keeps its default disposition and a
+// TaskStop or a plain `kill` ends the process at once instead of meeting a loop
+// that ignores the polite ask. Nothing is lost by dying that way here: the lock
+// is already released and the entry is meant to outlive us, so there is nothing
+// a handler would have to unwind. Moving the trap above this point would
+// silently turn a parked monitor into one that cannot be stopped politely.
+func idleUntilSessionEnds() {
+	pid := CurrentClaudePID()
+	if pid <= 0 {
+		block()
+		return
+	}
+	want := ProcStart(pid)
+	for {
+		if !ProcessAlive(pid, want) {
+			return
+		}
+		time.Sleep(standDownPoll)
 	}
 }

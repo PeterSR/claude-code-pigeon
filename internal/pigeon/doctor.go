@@ -295,15 +295,61 @@ func checkPlugin() []Check {
 
 	out := []Check{ok("plugin", dir)}
 
-	// The monitor spec is the link that arms sessions. A missing or renamed
-	// entry means every new session comes up unreachable.
-	var mons []monitorSpec
-	monPath := filepath.Join(dir, "monitors", "monitors.json")
-	if b, err := os.ReadFile(monPath); err != nil {
-		out = append(out, fail("monitor spec", "missing "+monPath, "run `pigeon install` again"))
-	} else if err := json.Unmarshal(b, &mons); err != nil || len(mons) == 0 {
-		out = append(out, fail("monitor spec", monPath+" is unreadable", "run `pigeon install` again"))
+	// The hooks are what register a session, and they are the one part of the
+	// plugin that is never optional: a session that does not register has no
+	// entry, and with no entry it has no pid, no start token and no socket path,
+	// so nothing can reach it by any transport. This is also the exact shape of
+	// a plugin installed before hooks existed -- it looks complete, and every
+	// session it loads into is invisible.
+	var hooks hooksFile
+	hookPath := hooksPath(dir)
+	if b, err := os.ReadFile(hookPath); err != nil {
+		out = append(out, fail("session hooks", "missing "+hookPath,
+			"sessions never register, so peers cannot see them; run `pigeon install` again"))
+	} else if err := json.Unmarshal(b, &hooks); err != nil || len(hooks.Hooks["SessionStart"]) == 0 {
+		out = append(out, fail("session hooks", hookPath+" has no SessionStart hook",
+			"sessions never register, so peers cannot see them; run `pigeon install` again"))
+	} else if len(hooks.Hooks["SessionEnd"]) == 0 {
+		// Checked separately rather than folded into the line above, because
+		// the two failures are not the same size and the advice differs. No
+		// SessionStart means invisible; no SessionEnd means visible forever,
+		// which is untidy rather than broken.
+		out = append(out, warn("session hooks", "registers on start, but "+hookPath+" has no SessionEnd hook",
+			"sessions will not deregister when they end, so listings keep them until something sweeps; "+
+				"run `pigeon install` again"))
 	} else {
+		out = append(out, ok("session hooks", "register on start, deregister on end"))
+	}
+
+	// The monitor spec is the link that ANNOUNCES mail, and its absence is a
+	// setting rather than a fault: a machine that has not asked for announcing
+	// has no monitor entry on purpose. Only the combination of a listed monitor
+	// and a broken binary is worth reporting as wrong.
+	var mons []monitorSpec
+	monPath := monitorsPath(dir)
+	b, rerr := os.ReadFile(monPath)
+	switch {
+	case rerr != nil:
+		out = append(out, warn("monitor spec", "missing "+monPath,
+			"sessions still register and still receive over their socket; run `pigeon install` to restore the file"))
+	case json.Unmarshal(b, &mons) != nil:
+		out = append(out, fail("monitor spec", monPath+" is unreadable", "run `pigeon install` again"))
+	case len(mons) == 0:
+		// Said plainly, because "no monitor listed" and "monitor broken" look
+		// identical from the outside and only one of them is a problem.
+		out = append(out, ok("monitor spec",
+			"no monitor armed (monitoring off); run `pigeon monitoring on` to be told when mail arrives"))
+	case !MonitorConfigured():
+		// The manifest and the setting disagree, which is exactly what an
+		// upgrade leaves behind: a plugin installed when the monitor was the
+		// only way to receive still lists it, while the setting it is now read
+		// against says off. Every session then spawns a monitor that registers,
+		// stands down and parks -- a process per session, doing nothing, which
+		// is the state turning monitoring off is supposed to avoid.
+		out = append(out, warn("monitor spec",
+			"the plugin still arms a monitor, but monitoring is off, so one starts and stands down in every session",
+			"run `pigeon monitoring off` (or `pigeon install`) to rewrite "+monPath+", then restart Claude Code"))
+	default:
 		out = append(out, checkMonitorBinary(mons[0].Command))
 	}
 
@@ -402,7 +448,8 @@ func checkRegistration() []Check {
 	own, e, err := Self()
 	if err != nil {
 		return []Check{fail("this session", "not registered, so nothing can reach it",
-			"install the plugin and restart, or run `pigeon arm` to arm this session alone")}
+			"registration happens in a plugin hook at session start: install the plugin and restart, "+
+				"or run `pigeon register` here to register this session alone")}
 	}
 
 	out := make([]Check, 0, 3)

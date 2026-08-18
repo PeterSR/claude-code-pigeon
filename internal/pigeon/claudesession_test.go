@@ -141,7 +141,7 @@ func TestWidgetStillNotArmedWhenAnotherProcessOwnsTheEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WeaverbirdValue: %v", err)
 	}
-	if v, ok := valueByID(vals, "pigeon.wait"); !ok || v.FullText != "not armed" {
+	if v, ok := valueByID(vals, "pigeon.wait"); !ok || v.FullText != "unregistered" {
 		t.Errorf("pigeon.wait = %+v, ok=%v, want not armed (no entry for this process)", v, ok)
 	}
 }
@@ -196,7 +196,7 @@ func TestWidgetNotArmedOnceGracePasses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WeaverbirdValue: %v", err)
 	}
-	if v, ok := valueByID(vals, "pigeon.wait"); !ok || v.FullText != "not armed" {
+	if v, ok := valueByID(vals, "pigeon.wait"); !ok || v.FullText != "unregistered" {
 		t.Errorf("pigeon.wait = %+v, ok=%v, want not armed once the grace window has passed", v, ok)
 	}
 }

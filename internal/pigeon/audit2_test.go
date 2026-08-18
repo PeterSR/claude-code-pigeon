@@ -24,7 +24,7 @@ func TestDeliveryModesSurviveAMonitorRearm(t *testing.T) {
 	}
 	const sid = "aaaa1111"
 	quiet := func(string, ...any) {}
-	if err := register(ns, sid, CurrentRuntime(), quiet); err != nil {
+	if err := register(ns, sid, CurrentRuntime(), currentSessionFacts(), quiet); err != nil {
 		t.Fatal(err)
 	}
 	if err := ns.Subscribe(sid, "deploys"); err != nil {
@@ -36,7 +36,7 @@ func TestDeliveryModesSurviveAMonitorRearm(t *testing.T) {
 
 	// The rearm. Same session id, same namespace: a monitor coming back after
 	// a resume, which is exactly what register is for.
-	if err := register(ns, sid, CurrentRuntime(), quiet); err != nil {
+	if err := register(ns, sid, CurrentRuntime(), currentSessionFacts(), quiet); err != nil {
 		t.Fatal(err)
 	}
 

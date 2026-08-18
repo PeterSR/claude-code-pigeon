@@ -333,7 +333,7 @@ func TestRegisterSkipsPruningADeadLookingSessionWhoseLockIsHeld(t *testing.T) {
 	}
 
 	t.Setenv(EnvClaudePID, strconv.Itoa(os.Getpid()))
-	if err := register(ns, newSID, CurrentRuntime(), func(string, ...any) {}); err != nil {
+	if err := register(ns, newSID, CurrentRuntime(), currentSessionFacts(), func(string, ...any) {}); err != nil {
 		t.Fatalf("register(%s): %v", newSID, err)
 	}
 
@@ -555,15 +555,17 @@ func TestMonitoringOffRegistersAndStandsDown(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- RunMonitor(stdout, stderr) }()
 
-	// It must RETURN, not block. Nothing signals it, so a monitor that tailed
-	// the spool here would hang until the deadline.
+	// It must go QUIET, and quiet is the whole point: every line of stdout
+	// becomes a notification in the session, and a monitor that exits is
+	// itself reported as one. Either would spend tokens at the start of every
+	// session to announce that a setting is being honoured.
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("RunMonitor: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("RunMonitor did not stand down with monitoring off")
+		t.Fatalf("RunMonitor returned (%v); an exit is reported to the session as a failed monitor", err)
+	case <-time.After(time.Second):
+	}
+	if got := stdout.String(); got != "" {
+		t.Errorf("a stood-down monitor wrote to the session:\n%s", got)
 	}
 
 	if !stderr.has("standing down") {
@@ -586,6 +588,36 @@ func TestMonitoringOffRegistersAndStandsDown(t *testing.T) {
 	// lock. That is the state AnnotateReach promotes to `socket`.
 	if got := e.status(ns); got != StatusDeaf {
 		t.Errorf("status = %q, want %q", got, StatusDeaf)
+	}
+}
+
+// TestAStoodDownMonitorExitsWithItsSession: idling is what keeps the stand-down
+// silent, but a process that idles forever would leave one behind for every
+// session that ever ran on the machine. Once Claude Code is gone there is
+// nobody left to be told anything, so exiting then is free.
+func TestAStoodDownMonitorExitsWithItsSession(t *testing.T) {
+	withHome(t)
+	withUserHome(t)
+	t.Setenv(EnvMonitor, MonitorOff)
+	t.Setenv(EnvOptOut, "")
+
+	t.Setenv(EnvSessionID, "off22222-2222-2222-2222-222222222222")
+	t.Setenv(EnvClaudePID, strconv.Itoa(deadPID(t)))
+
+	old := standDownPoll
+	standDownPoll = 10 * time.Millisecond
+	t.Cleanup(func() { standDownPoll = old })
+
+	done := make(chan error, 1)
+	go func() { done <- RunMonitor(&syncWriter{}, &syncWriter{}) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunMonitor: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a stood-down monitor outlived the session it belonged to")
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/PeterSR/claude-code-pigeon/internal/pigeon"
 )
@@ -1368,4 +1369,78 @@ func TestInboxOutsideASessionSaysSo(t *testing.T) {
 	}
 	wantContains(t, r, "stderr", "inbox")
 	wantContains(t, r, "stderr", "session")
+}
+
+// TestMonitoringRewritesTheInstalledManifest covers the wiring rather than the
+// mechanism: SyncPluginManifest has its own tests, but nothing noticed if
+// cmdMonitoring stopped calling it -- and without that call the setting is a
+// value in a config file that no longer decides anything, since what actually
+// arms a monitor is the manifest Claude Code loads.
+func TestMonitoringRewritesTheInstalledManifest(t *testing.T) {
+	withHome(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+	t.Setenv(pigeon.EnvMonitor, "")
+
+	if r := invoke(t, "install"); r.code != 0 {
+		t.Fatalf("install: %s", r)
+	}
+	manifest := filepath.Join(home, ".claude", "skills", "pigeon", "monitors", "monitors.json")
+
+	read := func() []map[string]any {
+		t.Helper()
+		b, err := os.ReadFile(manifest)
+		if err != nil {
+			t.Fatalf("read manifest: %v", err)
+		}
+		var mons []map[string]any
+		if err := json.Unmarshal(b, &mons); err != nil {
+			t.Fatalf("parse manifest: %v\n%s", err, b)
+		}
+		return mons
+	}
+
+	if got := read(); len(got) != 0 {
+		t.Fatalf("a default install armed %d monitor(s), want none: %v", len(got), got)
+	}
+
+	if r := invoke(t, "monitoring", "on"); r.code != 0 {
+		t.Fatalf("monitoring on: %s", r)
+	}
+	if got := read(); len(got) != 1 {
+		t.Errorf("after `monitoring on` the manifest has %d monitor(s), want 1: %v", len(got), got)
+	}
+
+	if r := invoke(t, "monitoring", "off"); r.code != 0 {
+		t.Fatalf("monitoring off: %s", r)
+	}
+	if got := read(); len(got) != 0 {
+		t.Errorf("after `monitoring off` the manifest still arms %d monitor(s): %v", len(got), got)
+	}
+}
+
+// The hook commands must not block waiting for a payload that is never coming.
+// doctor tells people to run `pigeon register` by hand, and io.ReadAll on a
+// terminal waits for Ctrl-D, so without the guard that advice hangs.
+func TestRegisterWithNoStdinDoesNotBlock(t *testing.T) {
+	withHome(t)
+	sid := "clihook1-1111-1111-1111-111111111111"
+	t.Setenv(pigeon.EnvSessionID, sid)
+	t.Setenv(pigeon.EnvOptOut, "")
+
+	done := make(chan result, 1)
+	go func() { done <- invoke(t, "register") }()
+	select {
+	case r := <-done:
+		if r.code != 0 {
+			t.Fatalf("register: %s", r)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("`pigeon register` blocked with no payload on stdin")
+	}
+	if _, err := pigeon.CurrentNamespace().ReadEntry(sid); err != nil {
+		t.Errorf("register with no payload did not fall back to the environment: %v", err)
+	}
 }

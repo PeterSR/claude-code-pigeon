@@ -58,7 +58,7 @@ func Arm(w io.Writer) error {
 		fmt.Fprintf(w, "Monitoring is off for this machine (from %s), so a monitor armed the\n", origin)
 		fmt.Fprintf(w, "ordinary way will register and stand down. Mail still arrives over the\n")
 		fmt.Fprintf(w, "socket, and `pigeon inbox` still reads it.\n\n")
-		fmt.Fprintf(w, "To turn it back on everywhere:  pigeon monitoring on\n")
+		fmt.Fprintf(w, "To announce mail in every session from now on:  pigeon monitoring on\n")
 		fmt.Fprintf(w, "To override for this session only, arm with:\n\n")
 		fmt.Fprintf(w, "  %s=%s %s\n\n", EnvMonitor, MonitorOn, cmd)
 		return nil
@@ -71,9 +71,10 @@ func Arm(w io.Writer) error {
 	fmt.Fprintf(w, "    persistent=true,\n")
 	fmt.Fprintf(w, "    description=\"pigeon inbox\"\n")
 	fmt.Fprintf(w, "  )\n\n")
-	fmt.Fprintf(w, "Arm it for EVERY session from now on, with the plugin:\n\n")
-	fmt.Fprintf(w, "  pigeon install     # then restart Claude Code\n\n")
-	fmt.Fprintf(w, "Both run the same monitor with the same capabilities; the plugin\n")
+	fmt.Fprintf(w, "Arm it for EVERY session from now on:\n\n")
+	fmt.Fprintf(w, "  pigeon install         # if the plugin is not installed yet\n")
+	fmt.Fprintf(w, "  pigeon monitoring on   # then restart Claude Code\n\n")
+	fmt.Fprintf(w, "Both run the same monitor with the same capabilities; the setting\n")
 	fmt.Fprintf(w, "just saves you doing it per session.\n")
 	return nil
 }

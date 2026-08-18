@@ -341,7 +341,7 @@ func TestEveryNamespaceJoinsBothPublicMailboxes(t *testing.T) {
 	t.Setenv(EnvClaudePID, "")
 	t.Setenv(EnvProjectDir, t.TempDir())
 
-	if err := register(acme, "aaaa1111", CurrentRuntime(), func(string, ...any) {}); err != nil {
+	if err := register(acme, "aaaa1111", CurrentRuntime(), currentSessionFacts(), func(string, ...any) {}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	e, err := acme.ReadEntry("aaaa1111")

@@ -178,18 +178,31 @@ func withPlugin(t *testing.T) string {
 	t.Helper()
 	home := withUserHome(t)
 	dir := filepath.Join(home, ".claude", "skills", "pigeon")
-	for _, d := range []string{filepath.Join(dir, ".claude-plugin"), filepath.Join(dir, "monitors")} {
+	for _, d := range []string{filepath.Join(dir, ".claude-plugin"), filepath.Join(dir, "monitors"), filepath.Join(dir, "hooks")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
+	}
+	// A correctly installed plugin registers its sessions. Tests about the
+	// monitor should start from that, not from a plugin that is already broken
+	// in a more fundamental way.
+	if err := writeJSON(hooksPath(dir), hooksManifest("/usr/bin/pigeon")); err != nil {
+		t.Fatalf("write hooks.json: %v", err)
 	}
 	return dir
 }
 
 func writePluginMonitor(t *testing.T, dir, command string) {
 	t.Helper()
+	// A manifest that lists a monitor only makes sense on a machine that asked
+	// for one. Without this the checks below never reach the binary: doctor
+	// reports the more urgent finding first, that the manifest and the setting
+	// disagree.
+	if err := SetMonitorEnabled(true); err != nil {
+		t.Fatalf("SetMonitorEnabled: %v", err)
+	}
 	mons := []monitorSpec{{Name: "pigeon-inbox", Command: command, When: "always"}}
-	if err := writeJSON(filepath.Join(dir, "monitors", "monitors.json"), mons); err != nil {
+	if err := writeJSON(monitorsPath(dir), mons); err != nil {
 		t.Fatalf("write monitors.json: %v", err)
 	}
 	cfg := map[string]any{"mcpServers": map[string]any{"pigeon": map[string]any{"command": "/usr/bin/pigeon"}}}
@@ -496,5 +509,45 @@ func TestCheckLevelString(t *testing.T) {
 		if got := level.String(); got != want {
 			t.Errorf("%d.String() = %q, want %q", level, got, want)
 		}
+	}
+}
+
+// TestDoctorFlagsAManifestThatStillArmsAMonitorAfterAnUpgrade: the state an
+// upgrade leaves behind. The plugin was installed when the monitor was the only
+// way to receive, so it still lists one; the setting it is now read against says
+// off. Every session then spawns a monitor that registers, stands down and
+// parks. Nothing else in the system reports that, and from the outside it is
+// indistinguishable from the feature not working.
+func TestDoctorFlagsAManifestThatStillArmsAMonitorAfterAnUpgrade(t *testing.T) {
+	withHome(t)
+	dir := withPlugin(t)
+	writePluginMonitor(t, dir, MonitorCommand())
+	// The upgrade: the setting goes to off while the manifest is left alone.
+	if err := SetMonitorEnabled(false); err != nil {
+		t.Fatalf("SetMonitorEnabled: %v", err)
+	}
+
+	got := findCheck(t, Diagnose(), "monitor spec")
+	if got.Level != CheckWarn {
+		t.Errorf("monitor spec check = %+v, want a warning about the mismatch", got)
+	}
+	if !strings.Contains(got.Hint, "pigeon monitoring off") && !strings.Contains(got.Hint, "pigeon install") {
+		t.Errorf("hint does not say how to rewrite the manifest: %+v", got)
+	}
+}
+
+// A plugin from before hooks existed looks complete and leaves every session it
+// loads into invisible, which is the worst shape a failure can have.
+func TestDoctorFlagsAPluginWithNoRegistrationHook(t *testing.T) {
+	withHome(t)
+	dir := withPlugin(t)
+	writePluginMonitor(t, dir, MonitorCommand())
+	if err := os.RemoveAll(filepath.Join(dir, "hooks")); err != nil {
+		t.Fatal(err)
+	}
+
+	got := findCheck(t, Diagnose(), "session hooks")
+	if got.Level != CheckFail || !strings.Contains(got.Hint, "pigeon install") {
+		t.Errorf("session hooks check = %+v, want a failure telling them to reinstall", got)
 	}
 }

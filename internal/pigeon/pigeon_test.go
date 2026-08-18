@@ -9,16 +9,49 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
 // withHome isolates state per test so nothing touches a real ~/.claude/pigeon.
+//
+// It isolates the MACHINE CONFIG too, which does not live under PIGEON_HOME and
+// so is not covered by the line above. That gap was not theoretical: the moment
+// `monitoring off` existed, a developer who had set it on their own machine
+// watched twenty delivery tests time out, because every monitor they started
+// read that file, registered and stood down exactly as asked. A test suite must
+// not ask the developer what they prefer.
 func withHome(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv(EnvHome, dir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
+	// The socket transport is the one channel that does NOT go through
+	// PIGEON_HOME: it addresses an operating system process, so isolating the
+	// state directory does not contain it. A test that calls register() stamps
+	// its entry with CLAUDE_PID, and `go test` run from inside a Claude Code
+	// session inherits a REAL one -- at which point a fixture published to a
+	// fixture topic resolves a live session's inbox socket and arrives in
+	// somebody's actual conversation. It has: `[pigeon #deploys] from sh ::
+	// shipped` is a test, and it was delivered to the developer running it.
+	//
+	// Pointing it at the test binary keeps entries live, which several tests
+	// depend on, while making them unresolvable as Claude sessions: the pid
+	// either matches no socket at all, or matches a stale one whose process
+	// start token cannot match this binary's.
+	t.Setenv(EnvClaudePID, strconv.Itoa(os.Getpid()))
+	// Delivery is off by default now, and almost every test here is about
+	// delivery -- without this they all register, stand down and wait for a
+	// message that nothing will ever announce. Tests ABOUT the setting override
+	// it themselves, which is the same shape as the namespace and opt-out vars.
+	t.Setenv(EnvMonitor, MonitorOn)
+	// The parsed config is cached process-wide, so redirecting the path is only
+	// half of it: drop what an earlier test read, and drop what this one wrote
+	// on the way out so the next test does not inherit it.
+	resetUserConfigForTest()
+	t.Cleanup(resetUserConfigForTest)
 	if err := EnsureDirs(); err != nil {
 		t.Fatalf("EnsureDirs: %v", err)
 	}

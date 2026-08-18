@@ -282,7 +282,7 @@ func TestRegisterLetsTheSessionOverrideProjectConfig(t *testing.T) {
 	t.Setenv(EnvClaudePID, "")
 
 	quiet := func(string, ...any) {}
-	if err := register(DefaultNamespace(), "aaaa1111", CurrentRuntime(), quiet); err != nil {
+	if err := register(DefaultNamespace(), "aaaa1111", CurrentRuntime(), currentSessionFacts(), quiet); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	if e, _ := ReadEntry("aaaa1111"); e.Name != "api" {
@@ -301,7 +301,7 @@ func TestRegisterLetsTheSessionOverrideProjectConfig(t *testing.T) {
 	}
 
 	// A monitor restart re-registers the same session id.
-	if err := register(DefaultNamespace(), "aaaa1111", CurrentRuntime(), quiet); err != nil {
+	if err := register(DefaultNamespace(), "aaaa1111", CurrentRuntime(), currentSessionFacts(), quiet); err != nil {
 		t.Fatalf("re-register: %v", err)
 	}
 	e, err := ReadEntry("aaaa1111")
@@ -326,7 +326,7 @@ func TestRegisterPreservesTopicCursorsAcrossRestarts(t *testing.T) {
 	t.Setenv(EnvProjectDir, dir)
 
 	quiet := func(string, ...any) {}
-	if err := register(DefaultNamespace(), "aaaa1111", CurrentRuntime(), quiet); err != nil {
+	if err := register(DefaultNamespace(), "aaaa1111", CurrentRuntime(), currentSessionFacts(), quiet); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	before := readCursors("aaaa1111")["deploys"]
@@ -335,7 +335,7 @@ func TestRegisterPreservesTopicCursorsAcrossRestarts(t *testing.T) {
 	if _, err := Publish("deploys", Draft{Text: "shipped"}, Sender{Kind: "shell", Name: "sh"}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
-	if err := register(DefaultNamespace(), "aaaa1111", CurrentRuntime(), quiet); err != nil {
+	if err := register(DefaultNamespace(), "aaaa1111", CurrentRuntime(), currentSessionFacts(), quiet); err != nil {
 		t.Fatalf("re-register: %v", err)
 	}
 
@@ -549,7 +549,7 @@ func TestPrivateSessionPublishesNoCwdOrDescription(t *testing.T) {
 	t.Setenv(EnvSessionID, "aaaa1111")
 	t.Setenv(EnvClaudePID, strconv.Itoa(os.Getpid()))
 
-	if err := register(DefaultNamespace(), "aaaa1111", CurrentRuntime(), func(string, ...any) {}); err != nil {
+	if err := register(DefaultNamespace(), "aaaa1111", CurrentRuntime(), currentSessionFacts(), func(string, ...any) {}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	e, err := ReadEntry("aaaa1111")

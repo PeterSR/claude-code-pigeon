@@ -206,13 +206,22 @@ func waitingValue(n int) wb.Value {
 	}
 }
 
-// notArmedValue renders the never-armed alarm: no monitor ever attached to
-// this session, so there is no spool being drained and no count to give.
-// Deliberately not the "waiting" wording waitingValue uses for a deaf or
-// dead monitor with mail piling up -- the two states cannot receive for
-// different reasons, and the fix for each is different.
+// notArmedValue renders the unregistered alarm: this session has no entry in
+// any namespace, so nothing can address it and there is no spool being drained
+// and no count to give.
+//
+// It says "unregistered" rather than "not armed" because registration is no
+// longer something a monitor does. A session registers itself from a
+// SessionStart hook whether or not any monitor is ever armed, so reaching this
+// state means the hook did not run or could not write -- which is a real fault
+// worth a warning, and a different one from having no monitor, which is now the
+// default and is not a fault at all.
+//
+// Deliberately not the "waiting" wording waitingValue uses for a deaf or dead
+// monitor with mail piling up -- the two states cannot receive for different
+// reasons, and the fix for each is different.
 func notArmedValue() wb.Value {
-	return wb.Value{ID: "pigeon.wait", FullText: "not armed", ShortText: "not armed", Class: wb.ClassWarn}
+	return wb.Value{ID: "pigeon.wait", FullText: "unregistered", ShortText: "unreg", Class: wb.ClassWarn}
 }
 
 // monitorValue renders pigeon.monitor's one value record from a resolved
@@ -230,6 +239,21 @@ func monitorValue(e *Entry) wb.Value {
 	case StatusLive:
 		return wb.Value{ID: "pigeon.monitor", FullText: "monitor live", ShortText: "live", Class: wb.ClassOK}
 	case StatusDeaf:
+		// "Deaf" and "off" are the same absence of a monitor and completely
+		// different facts, and since no monitor is armed by default, calling
+		// the second one deaf would light this widget yellow on every machine
+		// that never asked for one, forever. A warning that is always on is not
+		// a warning, it is decoration -- and the reading it invites is that
+		// something needs fixing, which would end with somebody undoing the
+		// setting to make the colour go away.
+		//
+		// Read from the config alone rather than MonitorEnabled: this process
+		// is spawned per render by the status bar, not by the session, so a
+		// PIGEON_MONITOR meant for one session is not reliably in its
+		// environment and the machine's standing answer is the honest one.
+		if !MonitorConfigured() {
+			return wb.Value{ID: "pigeon.monitor", FullText: "monitor off", ShortText: "off", Class: wb.ClassNeutral}
+		}
 		return wb.Value{ID: "pigeon.monitor", FullText: "monitor deaf", ShortText: "deaf", Class: wb.ClassWarn}
 	default: // StatusDead
 		return wb.Value{ID: "pigeon.monitor", FullText: "monitor dead", ShortText: "dead", Class: wb.ClassDanger}

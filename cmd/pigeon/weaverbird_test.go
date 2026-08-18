@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -62,6 +63,17 @@ func parseValueNDJSON(t *testing.T, out string) map[string]wb.Value {
 // internal/pigeon's own tests already cover.
 func TestWeaverbirdCommand_ValueReportsWaitingCount(t *testing.T) {
 	withHome(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+	// A missing monitor is only a fault on a machine that asked for one. No
+	// monitor is armed by default, so without this the deaf path being tested
+	// here reports "monitor off" instead.
+	r0 := invoke(t, "monitoring", "on")
+	if r0.code != 0 {
+		t.Fatalf("monitoring on: %s", r0)
+	}
 	beta := register(t, "bbbb2222-0000-0000-0000-000000000000", "beta")
 	t.Setenv(pigeon.EnvSessionID, "")
 

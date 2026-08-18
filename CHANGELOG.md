@@ -7,28 +7,74 @@ All notable changes to this project are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- **Session registration is a plugin hook, so the monitor is genuinely optional.**
+  `SessionStart` runs `pigeon register` and `SessionEnd` runs `pigeon deregister`, both
+  written by `pigeon install` and both new commands. Registration used to be something the
+  monitor did on its way to delivering, which is what made the process mandatory: no
+  monitor meant no entry, and an entry is what carries a session's pid, start token and
+  namespace, so a session without one is unreachable by every transport including the
+  socket. A hook writes the entry and exits, and unlike a monitor an exiting hook is not
+  reported back into the session as a failure.
+
+  This also fixes registration across a resume. `SessionStart` matches `resume` as well as
+  `startup`, so a resumed session registers every time; the monitor did not, because Claude
+  Code rearms it inconsistently across a resume.
+
+  Neither hook writes to stdout, deliberately: a `SessionStart` hook's stdout is fed back
+  into the session as context, so anything printed there would cost tokens in every session.
+
 - `pigeon monitoring [on|off]` decides whether this machine's sessions announce their mail,
   stored as `"monitor"` in the machine config with `PIGEON_MONITOR` overriding it for one
-  session. It exists because the socket transport made the monitor optional: a running
-  session can be reached without one, so being interrupted by a background process is now a
-  choice rather than the only way to receive.
+  session either way -- one session opting out of a machine that announces, or opting in on
+  a machine that does not.
 
-  "Off" is narrower than it sounds, and the narrowness is the design. The monitor is still
-  spawned, because the monitor is what REGISTERS a session, and an unregistered session has
-  no entry, no pid and no socket path, so turning the process off outright would not make
-  delivery socket-only -- it would make the session unreachable by every transport at once.
-  Off means the monitor registers, leaves its entry in place, and exits without tailing the
-  spool. The entry deliberately outlives the process, which is the one place a monitor does
-  not deregister on the way out; nothing leaks, because every registration sweeps entries
-  whose process is gone and a session in this mode still registers.
+  A session with no monitor keeps everything except being told. It registers, stays
+  addressable, still accumulates mail on its spool and still reads it with `pigeon inbox`;
+  it reports as `socket`. What it gives up is the notification: no announcement when
+  something arrives, no `digest` or `quiet` (both need a monitor to buffer), and no rate
+  limiter, which lives in the monitor too.
 
-  A session in this mode reports as `socket`, stays addressable, still accumulates mail and
-  still reads it with `pigeon inbox`. What is given up is being told: no notification, no
-  `digest` or `quiet` (both need a monitor to buffer), and no rate limiter. `doctor` tells a
-  monitor that was turned off apart from one that died, since the recovery differs, and
-  fails only on the combination that leaves nothing able to reach the session at all:
-  monitoring off and an unreachable socket. `pigeon arm` says so up front and prints the
-  env override, so arming one session by hand still works on a machine that turned it off.
+  `pigeon doctor` tells a monitor that was turned off apart from one that died, since the
+  recovery differs, and fails only on the combination that leaves nothing able to reach the
+  session at all: monitoring off and an unreachable socket. It also warns when the installed
+  manifest still arms a monitor while the setting says off, which is what an upgrade leaves
+  behind. `pigeon arm` says so up front and prints the env override, so arming one session
+  by hand still works on a machine that has turned monitoring off.
+
+### Changed
+- **No monitor is armed by default.** Installing a plugin is not a decision to run a
+  background process in every session from then on, and the socket transport removed the
+  reason it had to be one: a running session is reachable without a monitor, so what a
+  monitor adds is the *announcing*, which is now something you ask for with
+  `pigeon monitoring on`. A machine that has never set it gets sessions that register, stay
+  addressable, accumulate mail and read it with `pigeon inbox`, and are not interrupted.
+
+  Off means no process, not a process that starts and stands down. `pigeon monitoring
+  on|off` rewrites the plugin's `monitors.json`, listing the monitor or listing nothing,
+  because the manifest cannot express the condition itself: `when` accepts only `always` or
+  an on-skill-invoke trigger, and a command referencing `${user_config.*}` is rejected at
+  plugin load. The hooks are written either way. `pigeon install` preserves the setting
+  rather than re-arming.
+
+  **Upgrading: run `pigeon install` once.** Upgrading the binary alone does not rewrite a
+  manifest that is already on disk, so an existing install keeps its `when: always` entry
+  while the new default reads as off -- which means a monitor that starts, stands down and
+  parks in every session: a process per session that announces nothing, the exact
+  combination this change exists to remove. `pigeon install` rewrites the manifest to match
+  the setting and writes the hooks that older installs do not have. `pigeon doctor` warns
+  when it finds that mismatch. If you would rather keep announcing, run
+  `pigeon monitoring on`, which rewrites the manifest as well.
+
+### Fixed
+- The test suite no longer takes its answers, or its aim, from the machine it runs on. Two
+  things escaped `PIGEON_HOME` isolation. The machine config lives under `XDG_CONFIG_HOME`,
+  so a developer who had run `pigeon monitoring off` watched twenty delivery tests time out
+  as every test monitor read their preference and stood down exactly as asked. Worse, the
+  socket transport addresses an operating system process rather than the state directory:
+  a test that registers a session stamped the real `CLAUDE_PID` it inherited from `go test`
+  run inside a Claude Code session, so a fixture published to a fixture topic resolved a
+  live inbox socket and arrived in the developer's own conversation as
+  `[pigeon #deploys] from sh :: shipped`. Both channels are isolated now.
 
 ## [0.3.0] - 2026-08-18
 

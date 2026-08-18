@@ -66,6 +66,33 @@ All notable changes to this project are documented here. Format follows
   `pigeon monitoring on`, which rewrites the manifest as well.
 
 ### Fixed
+- **A monitor exiting no longer unregisters a session that is still running.** Removing the
+  entry on the way out was left over from when the monitor was what wrote it; registration
+  moved to the `SessionStart` hook and the deferred removal did not move with it, so the
+  monitor went on deleting something it no longer owned. The entry names a live claude
+  process, so losing it mid-life takes away the address of a session that is still working
+  and still answering on its socket, and nothing puts it back: `SessionStart` matches
+  `startup` and `resume`, neither of which a running session reaches. Turning monitoring
+  off is enough to trigger it for every armed session at once, and a plugin reload, the
+  watchdog, a signal or a crash does the same thing one session at a time. Removal belongs
+  to `SessionEnd`, which is the only event that means the session is over. Nothing leaks by
+  leaving the entry: `register` sweeps entries whose process is gone, and `reconcileOrphans`
+  collects the spool and cursors behind them, on the schedule they always did.
+- The hook tests had never actually run on Windows, and five of them failed the first time
+  they did. `vet` was failing earlier in the job on a test helper that lived in a Unix-only
+  file, and once that moved, the hook payload fixture turned out to paste the session's cwd
+  between two quotes. A real cwd comes from `t.TempDir()`, which on Windows is a path full
+  of backslashes, and between quotes those are JSON escapes -- `\U`, `\A` and `\T` are not
+  valid ones -- so the payload never parsed. `readHookInput` treats an unparseable payload
+  as an absent one by design, so the hook correctly registered nothing and said it had no
+  session id. The fixture is marshalled now, and the regression test feeds a backslashed
+  cwd on every platform, because the defect is in reading the payload rather than in
+  anything the operating system does.
+- A data race between the two stand-down tests, over the poll interval a parked monitor
+  reads. A stood-down monitor idles until its claude process exits, so a test that parks
+  one on the test binary's own pid can never end it, and that goroutine keeps reading the
+  interval for the rest of the run; the next test shortened it to keep itself quick. It is
+  shortened in `TestMain` now, before anything is reading.
 - The test suite no longer takes its answers, or its aim, from the machine it runs on. Two
   things escaped `PIGEON_HOME` isolation. The machine config lives under `XDG_CONFIG_HOME`,
   so a developer who had run `pigeon monitoring off` watched twenty delivery tests time out

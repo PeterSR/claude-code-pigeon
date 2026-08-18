@@ -57,6 +57,15 @@ type UserConfig struct {
 	// Namespaces is policy per namespace. Absent means the default policy,
 	// which is not private.
 	Namespaces map[string]NamespacePolicy `json:"namespaces,omitempty"`
+	// Monitor says whether this machine's sessions run a delivering monitor:
+	// "on" or "off". Absent means on, which is what pigeon has always done.
+	//
+	// "off" does NOT mean no monitor process. The monitor is what registers a
+	// session, and an unregistered session has no address at all, so nothing
+	// could be delivered to it by any transport. What "off" turns off is the
+	// DELIVERING half: the monitor registers, leaves the entry in place, and
+	// exits instead of tailing the spool. See MonitorEnabled and RunMonitor.
+	Monitor string `json:"monitor,omitempty"`
 	// Transport is the standing preference for how recipients are woken:
 	// "auto", "socket" or "monitor". Absent means auto. See Transport and
 	// CurrentTransport for the precedence this sits in, and for why this is a
@@ -113,6 +122,12 @@ func readUserConfig() UserConfig {
 			c.Transport = ""
 		}
 	}
+	// Dropped rather than treated as "off". A typo must not silently stop a
+	// machine's sessions from receiving mail, which is the failure this whole
+	// setting exists to let someone choose deliberately.
+	if c.Monitor != "" && c.Monitor != MonitorOn && c.Monitor != MonitorOff {
+		c.Monitor = ""
+	}
 	return c
 }
 
@@ -153,6 +168,29 @@ func SetUserNamespace(ns Namespace) error {
 	}
 	c := readUserConfig()
 	c.Namespace = ns.String()
+	if err := writeUserConfig(c); err != nil {
+		return err
+	}
+	userConfigCached = c
+	return nil
+}
+
+// SetMonitorEnabled persists whether this machine's sessions run a delivering
+// monitor, preserving everything else in the file. Takes effect at the next
+// session start, since a monitor reads this once and cannot be rebound.
+func SetMonitorEnabled(on bool) error {
+	path := UserConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create %s: %w", filepath.Dir(path), err)
+	}
+	c := readUserConfig()
+	// On is the default, so it is written as an absent key rather than as
+	// "on". A config file should say what someone chose to change.
+	if on {
+		c.Monitor = ""
+	} else {
+		c.Monitor = MonitorOff
+	}
 	if err := writeUserConfig(c); err != nil {
 		return err
 	}

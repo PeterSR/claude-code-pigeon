@@ -63,6 +63,7 @@ const usage = `pigeon -- message passing between live Claude Code sessions
   pigeon doctor [--json]         check whether this session can receive mail
   pigeon weaverbird spec|value   status widgets for a weaverbird status line
   pigeon prune                   forget dead sessions and reclaim topic logs
+  pigeon monitoring [on|off]     show or set whether sessions announce their mail
   pigeon monitor                 run the inbox monitor (used by the plugin)
   pigeon mcp                     run the MCP server (used by the plugin)
   pigeon version
@@ -140,6 +141,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		err = cmdWeaverbird(rest, stdin, stdout)
 	case "prune":
 		err = cmdPrune(rest, stdout, stderr)
+	case "monitoring":
+		err = cmdMonitoring(rest, stdout, stderr)
 	case "monitor":
 		err = pigeon.RunMonitor(stdout, stderr)
 	case "mcp":
@@ -1022,6 +1025,67 @@ func cmdNamespaces(args []string, w, stderr io.Writer) error {
 // preference for shell invocations; it does not move a running session, whose
 // namespace was fixed when its monitor armed and whose lock and topics all live
 // in that namespace's directory.
+// cmdMonitoring is get-or-set for whether this machine's sessions run a
+// delivering monitor, in the shape of `pigeon namespace`.
+//
+// Turning it off is a real choice with a real cost, so the output states the
+// cost rather than making someone find it in the README. What is lost is the
+// digest and quiet delivery modes, which only a monitor can honour, and the
+// rate limiter. What is kept is everything else: the session stays registered
+// and addressable, its mail still lands on the spool, and `pigeon inbox` still
+// reads it. Delivery becomes socket-only.
+func cmdMonitoring(args []string, w, stderr io.Writer) error {
+	fs := flags("monitoring", stderr)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) == 0 {
+		on, origin := pigeon.MonitorEnabled()
+		state := pigeon.MonitorOff
+		if on {
+			state = pigeon.MonitorOn
+		}
+		// State alone on stdout so `$(pigeon monitoring)` is usable; where it
+		// came from on stderr, matching `pigeon namespace`.
+		fmt.Fprintln(w, state)
+		fmt.Fprintf(stderr, "(from %s)\n", origin)
+		return nil
+	}
+	if len(rest) != 1 {
+		return fmt.Errorf("usage: pigeon monitoring [on|off]")
+	}
+	var on bool
+	switch strings.ToLower(strings.TrimSpace(rest[0])) {
+	case pigeon.MonitorOn:
+		on = true
+	case pigeon.MonitorOff:
+		on = false
+	default:
+		return fmt.Errorf("unknown setting %q: want on or off", rest[0])
+	}
+	if err := pigeon.SetMonitorEnabled(on); err != nil {
+		return err
+	}
+
+	if on {
+		fmt.Fprintln(w, "monitoring on: sessions will announce mail as it arrives")
+	} else {
+		fmt.Fprintln(w, "monitoring off: sessions stay registered and reachable over their socket,")
+		fmt.Fprintln(w, "but nothing announces mail that lands on the spool. `pigeon inbox` still reads it.")
+		fmt.Fprintln(w, "the digest and quiet delivery modes need a monitor, so they stop applying.")
+	}
+	// A monitor reads this once, at session start, and cannot be rebound -- the
+	// same reason a namespace change does not move a running session. Saying so
+	// here is what stops someone concluding the setting does not work.
+	fmt.Fprintln(w, "running sessions are unaffected; this takes effect when a session next starts")
+
+	if effective, origin := pigeon.MonitorEnabled(); effective != on {
+		fmt.Fprintf(stderr, "note: %s still overrides this\n", origin)
+	}
+	return nil
+}
+
 func cmdNamespace(args []string, w, stderr io.Writer) error {
 	fs := flags("namespace", stderr)
 	if err := fs.Parse(args); err != nil {

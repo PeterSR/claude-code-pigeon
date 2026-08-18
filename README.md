@@ -693,6 +693,41 @@ separate connection — so a push is recorded optimistically. The message is nev
 is on the spool and in `pigeon inbox`. A session configured to refuse inbound messages, and
 therefore not interrupted, is behaving as configured.
 
+### Turning the monitor off
+
+Once the socket can deliver, the monitor is optional. `pigeon monitoring off` stops your
+sessions announcing mail; nothing else changes.
+
+```console
+$ pigeon monitoring off
+monitoring off: sessions stay registered and reachable over their socket,
+but nothing announces mail that lands on the spool. `pigeon inbox` still reads it.
+the digest and quiet delivery modes need a monitor, so they stop applying.
+running sessions are unaffected; this takes effect when a session next starts
+```
+
+It is machine-level, in `$XDG_CONFIG_HOME/pigeon/config.json` as `"monitor": "off"`, and
+`PIGEON_MONITOR=on|off` overrides it for one session. Not a `.claude/pigeon.json` field,
+for the reason that keeps `private` and `transport` out of one.
+
+**What "off" does not mean.** The monitor is still spawned, and it has to be, because the
+monitor is what *registers* a session. An unregistered session has no entry, and with no
+entry there is no pid and no socket path to look up, so turning the process off outright
+would not make delivery socket-only; it would make the session unreachable by every
+transport at once. What "off" turns off is the delivering half: the monitor registers,
+leaves its entry in place, and exits without tailing the spool.
+
+So a session in this mode reports as `socket` in `pigeon ls`, is addressable as it always
+was, still accumulates mail on its spool, and still reads it with `pigeon inbox`. What you
+give up is being *told*: no notification when something arrives, no `digest` or `quiet`
+(those need a monitor to buffer), and no 30-per-minute rate limiter, since that lives in
+the monitor too.
+
+`pigeon doctor` knows the difference between a monitor that was turned off and one that
+died, and says so, because the recovery for the two is not the same. The one combination
+worth alarm is monitoring off *and* an unreachable socket, which leaves nothing able to
+reach the session at all; that is a `FAIL`.
+
 ### Upgrading from 0.2
 
 `auto` is the default, so the socket path turns on the moment you upgrade. The check that

@@ -48,6 +48,22 @@ func Arm(w io.Writer) error {
 	}
 
 	cmd := MonitorCommand()
+
+	// Said before the instructions, not after, because otherwise someone
+	// follows them and watches the monitor register and exit immediately. The
+	// env override is shown rather than described: arming by hand is an
+	// explicit act for one session, and it should be able to outrank a standing
+	// preference without anyone having to change the machine's config first.
+	if on, origin := MonitorEnabled(); !on {
+		fmt.Fprintf(w, "Monitoring is off for this machine (from %s), so a monitor armed the\n", origin)
+		fmt.Fprintf(w, "ordinary way will register and stand down. Mail still arrives over the\n")
+		fmt.Fprintf(w, "socket, and `pigeon inbox` still reads it.\n\n")
+		fmt.Fprintf(w, "To turn it back on everywhere:  pigeon monitoring on\n")
+		fmt.Fprintf(w, "To override for this session only, arm with:\n\n")
+		fmt.Fprintf(w, "  %s=%s %s\n\n", EnvMonitor, MonitorOn, cmd)
+		return nil
+	}
+
 	fmt.Fprintf(w, "Session %s has no listening monitor.\n\n", Short(sid))
 	fmt.Fprintf(w, "Arm it for THIS session only, with the Monitor tool:\n\n")
 	fmt.Fprintf(w, "  Monitor(\n")

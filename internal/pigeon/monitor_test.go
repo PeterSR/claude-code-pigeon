@@ -535,6 +535,60 @@ func TestABroadcastNamingYouStillInterrupts(t *testing.T) {
 	}
 }
 
+// TestMonitoringOffRegistersAndStandsDown: the whole design of `monitoring off`
+// rests on the monitor still registering. An unregistered session has no entry,
+// and with no entry there is no pid, no process start token and no socket path,
+// so socket delivery could not find it either -- turning the monitor off would
+// not make delivery socket-only, it would make the session unreachable.
+func TestMonitoringOffRegistersAndStandsDown(t *testing.T) {
+	withHome(t)
+	withUserHome(t)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv(EnvMonitor, MonitorOff)
+	t.Setenv(EnvOptOut, "")
+
+	sid := "off11111-1111-1111-1111-111111111111"
+	t.Setenv(EnvSessionID, sid)
+	t.Setenv(EnvClaudePID, strconv.Itoa(os.Getpid()))
+
+	stdout, stderr := &syncWriter{}, &syncWriter{}
+	done := make(chan error, 1)
+	go func() { done <- RunMonitor(stdout, stderr) }()
+
+	// It must RETURN, not block. Nothing signals it, so a monitor that tailed
+	// the spool here would hang until the deadline.
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunMonitor: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("RunMonitor did not stand down with monitoring off")
+	}
+
+	if !stderr.has("standing down") {
+		t.Errorf("no reason logged for standing down:\n%s", stderr.String())
+	}
+
+	// The entry has to OUTLIVE the process. Everywhere else a monitor exits it
+	// deregisters, and inheriting that here would delete the address the socket
+	// transport needs.
+	ns := CurrentNamespace()
+	e, err := ns.ReadEntry(sid)
+	if err != nil {
+		t.Fatalf("the session was not left registered: %v", err)
+	}
+	if e.PID != os.Getpid() {
+		t.Errorf("entry pid = %d, want this process so the socket lookup can find it", e.PID)
+	}
+
+	// Deaf, not dead: the claude process is alive, nothing holds the monitor
+	// lock. That is the state AnnotateReach promotes to `socket`.
+	if got := e.status(ns); got != StatusDeaf {
+		t.Errorf("status = %q, want %q", got, StatusDeaf)
+	}
+}
+
 // TestCheckoutTopicIsTheRepositoryNotTheDirectory: a session started in a
 // subdirectory has to land with its peers, not in a room of its own.
 func TestCheckoutTopicIsTheRepositoryNotTheDirectory(t *testing.T) {

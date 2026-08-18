@@ -56,6 +56,11 @@ const (
 	// speaking as. It only takes effect outside a real Claude Code session; see
 	// ActingIdentity.
 	EnvAs = "PIGEON_AS"
+	// EnvMonitor overrides whether this session runs a delivering monitor --
+	// see MonitorEnabled. Read by the monitor from the environment Claude Code
+	// spawned it in, so exporting it from a shell profile turns the monitor off
+	// for every session started from that shell without touching the config.
+	EnvMonitor = "PIGEON_MONITOR"
 	// EnvTransport selects how a recipient is woken -- see Transport. Per
 	// invocation, for the same reason as the two above: a script states how it
 	// wants its mail delivered, and that outranks a standing preference set

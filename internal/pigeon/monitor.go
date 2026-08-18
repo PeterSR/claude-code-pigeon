@@ -129,6 +129,29 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	}
 	logf("armed session=%s namespace=%s spool=%s", sid, ns, spool)
 
+	// Stand down here if this machine has turned delivery off, AFTER registering
+	// and before anything that would have to be unwound.
+	//
+	// The registry entry is deliberately left behind, which is the one thing
+	// that makes this mode work at all. Everywhere else a monitor exits it
+	// removes its entry (see the deferred RemoveEntry below), because a missing
+	// monitor used to mean a session nothing could reach. That is no longer
+	// true: a running session still has its inbox socket bound, so an entry
+	// with no monitor behind it is a perfectly good address -- `pigeon ls`
+	// already reports exactly that state as `socket`.
+	//
+	// Nothing leaks. register sweeps entries whose process is gone every time
+	// any session registers, and a session in this mode still registers, so the
+	// sweep keeps running on the same schedule it always did.
+	//
+	// The lock goes with us on the way out, via the deferred Close above, and
+	// that is correct rather than incidental: the lock means "a monitor is
+	// delivering for this session", and from here on none is.
+	if on, origin := MonitorEnabled(); !on {
+		logf("monitor delivery is off (from %s); registered and standing down, mail arrives over the socket", origin)
+		return nil
+	}
+
 	// Trap before doing anything interruptible, so a signal arriving during
 	// startup is not lost, and release the handlers on the way out.
 	sigc := make(chan os.Signal, 1)
@@ -726,6 +749,51 @@ func manageSubscriptions(ns Namespace, sid string, out chan<- followedMessage, d
 			}
 		}
 	}
+}
+
+// MonitorOn and MonitorOff are the two values of the `monitor` setting.
+const (
+	MonitorOn  = "on"
+	MonitorOff = "off"
+)
+
+// MonitorEnabled reports whether this session should run a DELIVERING monitor,
+// and where the answer came from, in the same shape as CurrentTransport and for
+// the same reason: a surprise here is a session that stopped announcing mail,
+// and the first question is always what decided that.
+//
+// Highest wins: PIGEON_MONITOR, then the machine config, then on. There is no
+// per-invocation flag, because the invocation is not the operator's to make --
+// Claude Code spawns the monitor, not a person.
+//
+// Deliberately NOT a `.claude/pigeon.json` field, the same line userconfig.go
+// draws for `private` and `transport`. A cloned repository does not get to
+// decide whether your sessions announce their mail.
+//
+// What "off" means is narrower than it sounds, and the narrowness is the whole
+// design. It does not stop the monitor being spawned, and it must not: the
+// monitor is what REGISTERS a session, and an unregistered session has no
+// address, so turning the process off entirely would not make delivery
+// socket-only, it would make the session unreachable by every transport at
+// once. Off means the monitor registers, leaves its entry in place, and exits
+// without tailing the spool -- so the session keeps its address and its mail,
+// and simply stops being interrupted by it. See RunMonitor.
+func MonitorEnabled() (bool, string) {
+	if raw := strings.TrimSpace(os.Getenv(EnvMonitor)); raw != "" {
+		switch strings.ToLower(raw) {
+		case MonitorOff:
+			return false, EnvMonitor
+		case MonitorOn:
+			return true, EnvMonitor
+		}
+		// An unusable value is ignored rather than read as "off", so a typo
+		// cannot silently stop a machine's mail.
+		return true, EnvMonitor + " is not on or off, so it was ignored"
+	}
+	if raw := LoadUserConfig().Monitor; raw != "" {
+		return raw != MonitorOff, UserConfigPath()
+	}
+	return true, "default"
 }
 
 // tryMonitorLock attempts to take the session's liveness lock without waiting.

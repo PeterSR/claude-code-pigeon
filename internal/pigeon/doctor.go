@@ -416,13 +416,31 @@ func checkRegistration() []Check {
 		// reporting a failure would send someone restarting a session that works
 		// -- the same false alarm the `socket` status exists to remove from `ls`.
 		if SocketReachable(e) {
-			out = append(out, warn("this session",
-				"no monitor is listening, but its socket answers, so mail sent over the socket still arrives",
-				"topics on digest or quiet still need a monitor; restart the session to get one back"))
+			// Told apart because the advice differs completely. A monitor that
+			// died is a fault and the fix is to restart; a monitor that was
+			// turned off is the configuration working, and telling someone to
+			// restart would undo what they chose and then not even fix it,
+			// since the next monitor would read the same setting and stand
+			// down again.
+			if on, origin := MonitorEnabled(); !on {
+				out = append(out, ok("this session",
+					"monitoring is off (from "+origin+"); registered and reachable over its socket"))
+			} else {
+				out = append(out, warn("this session",
+					"no monitor is listening, but its socket answers, so mail sent over the socket still arrives",
+					"topics on digest or quiet still need a monitor; restart the session to get one back"))
+			}
 		} else {
-			out = append(out, fail("this session",
-				"registered, no monitor is listening, and its socket did not answer either",
-				"the monitor died or never started; restart the session, or run `pigeon arm`"))
+			if on, origin := MonitorEnabled(); !on {
+				out = append(out, fail("this session",
+					"monitoring is off (from "+origin+") and its socket did not answer, so nothing can reach it",
+					"socket delivery is the only path left when monitoring is off, and it is unavailable here; "+
+						"run `pigeon monitoring on` and restart the session"))
+			} else {
+				out = append(out, fail("this session",
+					"registered, no monitor is listening, and its socket did not answer either",
+					"the monitor died or never started; restart the session, or run `pigeon arm`"))
+			}
 		}
 	default:
 		out = append(out, fail("this session", "registered but its process looks gone",

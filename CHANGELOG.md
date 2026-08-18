@@ -88,6 +88,14 @@ All notable changes to this project are documented here. Format follows
   session id. The fixture is marshalled now, and the regression test feeds a backslashed
   cwd on every platform, because the defect is in reading the payload rather than in
   anything the operating system does.
+- **The plugin is installed where Claude Code actually looks for it.** The install target
+  was resolved from the home directory alone, but it sits inside Claude Code's own config
+  directory, which moves with `CLAUDE_CONFIG_DIR`. On a machine that sets it, `pigeon
+  install` scaffolded under `~/.claude/skills`, reported success, and nothing ever loaded
+  the plugin; `pigeon monitoring on|off`, which rewrites the manifest in place, wrote to
+  that same unread path. It resolves through the same lookup as the rest of Claude Code's
+  files now. This also makes the setting testable: exercising `monitoring on|off` used to
+  mean writing to the real manifest no matter how the environment was redirected.
 - A data race between the two stand-down tests, over the poll interval a parked monitor
   reads. A stood-down monitor idles until its claude process exits, so a test that parks
   one on the test binary's own pid can never end it, and that goroutine keeps reading the

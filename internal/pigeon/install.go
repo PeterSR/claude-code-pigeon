@@ -30,12 +30,21 @@ var pigeonUsageSkill []byte
 //
 // It must be personal scope: a project-scope plugin's monitors are silently
 // dropped, even after the workspace is trusted.
+//
+// Resolved through claudeConfigDir rather than straight off the home
+// directory, because the target is inside Claude Code's own config directory
+// and that moves with CLAUDE_CONFIG_DIR. Reading only the home directory put
+// the plugin at ~/.claude/skills on a machine whose Claude Code loads plugins
+// from somewhere else entirely, so `pigeon install` reported success having
+// written to a path nothing would ever read -- and `pigeon monitoring on|off`
+// rewrote the manifest at that same unread path, which is also what made the
+// setting impossible to exercise without touching the real one.
 func pluginDir() (string, error) {
-	h, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
+	dir := claudeConfigDir()
+	if dir == "" {
+		return "", fmt.Errorf("locate the Claude Code config directory: set %s or a home directory", EnvConfigDir)
 	}
-	return filepath.Join(h, ".claude", "skills", "pigeon"), nil
+	return filepath.Join(dir, "skills", "pigeon"), nil
 }
 
 type pluginManifest struct {

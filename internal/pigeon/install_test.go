@@ -14,6 +14,12 @@ func withPluginHome(t *testing.T) (home, plugin string) {
 	t.Helper()
 	withHome(t)
 	home = withUserHome(t)
+	// Claimed, not merely ignored: pluginDir reads it ahead of the home
+	// directory, so a developer who has it set would otherwise watch these
+	// tests scaffold into, and Uninstall delete from, their real Claude Code
+	// config directory. Redirecting the home directory alone is no longer
+	// enough to contain them.
+	t.Setenv(EnvConfigDir, "")
 
 	got, err := pluginDir()
 	if err != nil {
@@ -49,6 +55,48 @@ func readJSONFile(t *testing.T, path string, v any) {
 	}
 	if err := json.Unmarshal(b, v); err != nil {
 		t.Fatalf("parse %s: %v\n%s", path, err, b)
+	}
+}
+
+// The plugin belongs wherever Claude Code keeps its config, which is not always
+// under the home directory. Resolving it from the home directory alone put the
+// plugin somewhere Claude Code never looks on a machine that sets
+// CLAUDE_CONFIG_DIR, so install reported success and nothing loaded -- and
+// `pigeon monitoring on|off`, which rewrites the manifest in place, could not be
+// exercised without writing to the real one.
+func TestPluginDirFollowsTheClaudeConfigDir(t *testing.T) {
+	withHome(t)
+	home := withUserHome(t)
+
+	t.Setenv(EnvConfigDir, "")
+	got, err := pluginDir()
+	if err != nil {
+		t.Fatalf("pluginDir: %v", err)
+	}
+	if want := filepath.Join(home, ".claude", "skills", "pigeon"); got != want {
+		t.Errorf("with %s unset, pluginDir() = %q, want %q", EnvConfigDir, got, want)
+	}
+
+	elsewhere := t.TempDir()
+	t.Setenv(EnvConfigDir, elsewhere)
+	got, err = pluginDir()
+	if err != nil {
+		t.Fatalf("pluginDir: %v", err)
+	}
+	if want := filepath.Join(elsewhere, "skills", "pigeon"); got != want {
+		t.Errorf("pluginDir() = %q, want %q -- a plugin written under the home directory instead would never be loaded", got, want)
+	}
+
+	// The whole install has to follow, not just the path calculation: a
+	// manifest is only worth writing where something will read it.
+	if err := Install("1.2.3", &strings.Builder{}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(elsewhere, "skills", "pigeon", "hooks", "hooks.json")); err != nil {
+		t.Errorf("install did not write into %s: %v", EnvConfigDir, err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".claude", "skills", "pigeon")); err == nil {
+		t.Error("install also scaffolded under the home directory, which is the path nothing loads")
 	}
 }
 

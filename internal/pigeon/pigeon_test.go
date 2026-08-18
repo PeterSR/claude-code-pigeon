@@ -92,6 +92,14 @@ func requireRenameOverOpenFile(t *testing.T) {
 	}
 }
 
+// mailbox addresses a session by id. Send only needs the id, so this avoids
+// registering a second entry that would then show up in ListSessions.
+//
+// It lives here rather than beside the monitor tests that use it most, because
+// the hook tests use it too and those build on Windows, where monitor_test.go
+// does not.
+func mailbox(sid string) *Entry { return &Entry{SessionID: sid} }
+
 // liveEntry registers a session backed by this test process, so liveness checks
 // see a real pid. Its status is "deaf" (no monitor holds the lock), which is
 // still addressable -- that is the point of distinguishing deaf from dead.

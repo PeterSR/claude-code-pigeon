@@ -28,6 +28,15 @@ import (
 // killing the test binary, which is otherwise the default action.
 func TestMain(m *testing.M) {
 	signal.Notify(make(chan os.Signal, 8), syscall.SIGTERM)
+
+	// Shortened here rather than in the one test that needs it quick, because
+	// by then it is a write to a variable another test's monitor is already
+	// reading. A stood-down monitor parks until its claude process dies, and a
+	// test that parks one on its own pid can never end it, so that goroutine
+	// polls this value for the rest of the run. Setting it before any test
+	// starts is the only assignment that happens-before every read.
+	standDownPoll = 10 * time.Millisecond
+
 	os.Exit(m.Run())
 }
 
@@ -172,10 +181,6 @@ func withDigestInterval(t *testing.T, d time.Duration) {
 func peer() Sender {
 	return Sender{Kind: "session", SessionID: "bbbb2222-3333", Name: "beta", Cwd: "/home/p/web"}
 }
-
-// mailbox addresses a session by id. Send only needs the id, so this avoids
-// registering a second entry that would then show up in ListSessions.
-func mailbox(sid string) *Entry { return &Entry{SessionID: sid} }
 
 // --- lifecycle -------------------------------------------------------------
 
@@ -609,10 +614,6 @@ func TestAStoodDownMonitorExitsWithItsSession(t *testing.T) {
 
 	t.Setenv(EnvSessionID, "off22222-2222-2222-2222-222222222222")
 	t.Setenv(EnvClaudePID, strconv.Itoa(deadPID(t)))
-
-	old := standDownPoll
-	standDownPoll = 10 * time.Millisecond
-	t.Cleanup(func() { standDownPoll = old })
 
 	done := make(chan error, 1)
 	go func() { done <- RunMonitor(&syncWriter{}, &syncWriter{}) }()

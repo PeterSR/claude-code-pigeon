@@ -4,7 +4,7 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
 [semantic versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.0] - 2026-08-18
 
 ### Added
 - **Session registration is a plugin hook, so the monitor is genuinely optional.**
@@ -914,7 +914,8 @@ First release.
   nothing is not enough: recipients read the `shell:user@host` stamp as an address
   and waste a call discovering it is not one.
 
-[Unreleased]: https://github.com/PeterSR/claude-code-pigeon/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/PeterSR/claude-code-pigeon/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/PeterSR/claude-code-pigeon/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/PeterSR/claude-code-pigeon/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/PeterSR/claude-code-pigeon/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/PeterSR/claude-code-pigeon/releases/tag/v0.1.0

@@ -57,6 +57,11 @@ type UserConfig struct {
 	// Namespaces is policy per namespace. Absent means the default policy,
 	// which is not private.
 	Namespaces map[string]NamespacePolicy `json:"namespaces,omitempty"`
+	// Transport is the standing preference for how recipients are woken:
+	// "auto", "socket" or "monitor". Absent means auto. See Transport and
+	// CurrentTransport for the precedence this sits in, and for why this is a
+	// machine setting rather than a project one.
+	Transport string `json:"transport,omitempty"`
 }
 
 var (
@@ -98,6 +103,14 @@ func readUserConfig() UserConfig {
 	for name := range c.Namespaces {
 		if ValidNamespace(name) != nil {
 			delete(c.Namespaces, name)
+		}
+	}
+	// Dropped rather than defaulted-with-a-warning, for the same reason the
+	// fields above are: this file is read on every listing, and a typo here
+	// must cost the preference, not the command.
+	if c.Transport != "" {
+		if _, err := ValidTransport(c.Transport); err != nil {
+			c.Transport = ""
 		}
 	}
 	return c

@@ -535,6 +535,21 @@ func TestABroadcastNamingYouStillInterrupts(t *testing.T) {
 	}
 }
 
+// mkCheckout makes dir look like a primary git checkout to repoRoot, which
+// means a .git directory that actually contains HEAD. An empty .git directory
+// is not a repository to git and is deliberately not one to pigeon either, so
+// a fixture that omits HEAD is testing a case that cannot arise.
+func mkCheckout(t *testing.T, dir string) {
+	t.Helper()
+	git := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(git, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(git, "HEAD"), []byte("ref: refs/heads/main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestCheckoutTopicIsTheRepositoryNotTheDirectory: a session started in a
 // subdirectory has to land with its peers, not in a room of its own.
 func TestCheckoutTopicIsTheRepositoryNotTheDirectory(t *testing.T) {
@@ -544,9 +559,7 @@ func TestCheckoutTopicIsTheRepositoryNotTheDirectory(t *testing.T) {
 	if err := os.MkdirAll(sub, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	mkCheckout(t, repo)
 
 	if got := CheckoutTopic(repo); got != "caterflow-inventory" {
 		t.Errorf("CheckoutTopic(repo) = %q", got)
@@ -604,9 +617,7 @@ func TestCheckoutTopicFoldsNamesIntoTheCharset(t *testing.T) {
 func TestHereResolvesToTheCheckoutsOwnRoom(t *testing.T) {
 	root := t.TempDir()
 	repo := filepath.Join(root, "caterflow-inventory")
-	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	mkCheckout(t, repo)
 
 	mustResolve := func(topic, cwd string) string {
 		t.Helper()
@@ -644,9 +655,7 @@ func TestHereResolvesToTheCheckoutsOwnRoom(t *testing.T) {
 // a session through it first.
 func TestHereRefusesToNameAPrivateCheckoutsRoom(t *testing.T) {
 	repo := writeProjectConfig(t, `{"private": true}`)
-	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	mkCheckout(t, repo)
 
 	got, err := ResolveTopicAlias("here", repo)
 	if err == nil {
@@ -1647,4 +1656,101 @@ func TestWatchdogStopsWhenTheMonitorDoes(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("watchdog outlived its stop signal (goroutine leak)")
 	}
+}
+
+// --- socket transport ------------------------------------------------------
+
+// A message the sender already pushed over the socket must not be announced a
+// second time by the monitor. This is the branch that keeps the two transports
+// from costing a recipient two interruptions for one message.
+//
+// The barrier matters: "nothing was printed" is unfalsifiable on its own, since
+// a monitor that had simply not got there yet would look identical. So a second
+// message follows the suppressed one down the same spool, and only once THAT
+// has been delivered do we know the first was read, considered, and
+// deliberately not printed.
+func TestMonitorDoesNotAnnounceAMessageAlreadyPushedOverTheSocket(t *testing.T) {
+	withHome(t)
+	const sid = "mon-pushed-1"
+	m := startMonitor(t, sid)
+
+	msg, err := Send(mailbox(sid), Draft{Text: "already delivered over the socket"}, peer())
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	// Written by hand rather than by wake: this test is about what the monitor
+	// does with the field, and standing up a real Claude Code socket to produce
+	// it would be testing ccsock instead.
+	markPushed(t, sid, msg.ID, sid)
+
+	if _, err := Send(mailbox(sid), Draft{Text: "the barrier message"}, peer()); err != nil {
+		t.Fatalf("Send (barrier): %v", err)
+	}
+	eventually(t, 6*time.Second, "the barrier message", func() bool {
+		return m.stdout.has("the barrier message")
+	})
+
+	if m.stdout.has("already delivered over the socket") {
+		t.Error("the monitor announced a message that had already been pushed over the socket")
+	}
+	// Handled, not skipped: the cursor has to cross it or the monitor
+	// reconsiders it forever.
+	if got := readCursors(sid)[inboxCursorKey]; got <= 0 {
+		t.Errorf("inbox cursor = %d, want it advanced past both messages", got)
+	}
+	// The READ cursor must NOT have moved. A push is a doorbell, not a reading:
+	// carrying the consumption cursor over it would mark mail as read that the
+	// recipient never opened, and `pigeon inbox` would show nothing.
+	if got := readCursors(sid)[readCursorKey(inboxCursorKey)]; got != 0 {
+		t.Errorf("read cursor = %d, want 0: a socket push does not mark mail read", got)
+	}
+}
+
+// markPushed rewrites the spool, stamping pushedTo onto one message. It edits
+// the file rather than calling wake because the whole point is to test the
+// monitor's reading of the field, independently of how it came to be set.
+func markPushed(t *testing.T, sid, msgID string, pushedTo ...string) {
+	t.Helper()
+	path := SpoolPath(sid)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the spool: %v", err)
+	}
+	var out []string
+	for _, line := range strings.Split(strings.TrimRight(string(b), "\n"), "\n") {
+		msg, err := ParseMessage(line)
+		if err != nil {
+			t.Fatalf("ParseMessage: %v", err)
+		}
+		if msg.ID == msgID {
+			msg.PushedTo = pushedTo
+		}
+		enc, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		out = append(out, string(enc))
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(out, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("rewriting the spool: %v", err)
+	}
+}
+
+// The suppression is addressed at one session, so a message pushed to a peer
+// must still be announced here. Otherwise one recipient's socket delivery would
+// silence everybody else's notification for the same topic message.
+func TestMonitorStillAnnouncesAMessagePushedToSomebodyElse(t *testing.T) {
+	withHome(t)
+	const sid = "mon-pushed-2"
+	m := startMonitor(t, sid)
+
+	msg, err := Send(mailbox(sid), Draft{Text: "pushed to a different session"}, peer())
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	markPushed(t, sid, msg.ID, "somebody-else-0000")
+
+	eventually(t, 6*time.Second, "the message to be announced anyway", func() bool {
+		return m.stdout.has("pushed to a different session")
+	})
 }

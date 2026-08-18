@@ -190,6 +190,38 @@ func checkAs(name string) error {
 	return pigeon.ValidName(name)
 }
 
+// viaFlag adds --via, the per-call spelling of the delivery transport. Left
+// empty it falls through to PIGEON_TRANSPORT and then the machine config; see
+// pigeon.CurrentTransport for the full precedence.
+func viaFlag(fs *flag.FlagSet, into *string) {
+	fs.StringVar(into, "via", "", "how to wake the recipient: auto (default), socket, or monitor")
+}
+
+// transportOf resolves --via up front, so an unusable value costs the command
+// rather than the message. The same reasoning as checkAs: a transport silently
+// falling back to the default is exactly the kind of quiet wrong answer that
+// makes a delivery problem take an afternoon to find.
+func transportOf(via string) (pigeon.Transport, error) {
+	if strings.TrimSpace(via) == "" {
+		return "", nil
+	}
+	return pigeon.ValidTransport(via)
+}
+
+// viaNote reports the socket half of a delivery, and says nothing at all when
+// the message took the ordinary path. A line that appears on every send is a
+// line nobody reads.
+func viaNote(msg *pigeon.Message) string {
+	switch n := len(msg.PushedTo); n {
+	case 0:
+		return ""
+	case 1:
+		return " (delivered over the socket)"
+	default:
+		return fmt.Sprintf(" (delivered over the socket to %d session(s))", n)
+	}
+}
+
 // repeatableFlag collects every occurrence of a flag given more than once,
 // e.g. `--for alice --for bob`, since flag.FlagSet has no built-in for that.
 type repeatableFlag []string
@@ -285,6 +317,10 @@ func cmdList(args []string, w, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// A listing is read by a person deciding whether a peer can be reached, so
+	// it is worth a probe per entry to answer that with both transports rather
+	// than only the monitor. See AnnotateReach for why this is not everywhere.
+	pigeon.AnnotateReach(entries)
 	if *asJSON {
 		// Status is derived, not stored, so expose it explicitly for scripts.
 		type view struct {
@@ -354,12 +390,16 @@ func cmdList(args []string, w, stderr io.Writer) error {
 		fmt.Fprintf(w, "%s and cannot be replied to.\n", pigeon.ShellIdentity())
 	}
 
+	// Only a genuinely unreachable session earns the warning. One showing
+	// `socket` has a dead monitor too, but it receives mail, and warning about
+	// it would spend the reader's attention on a working session.
 	for _, e := range entries {
 		if e.Status == pigeon.StatusDeaf {
-			fmt.Fprintf(w, "\nwarning: %s is running but its monitor is not listening.\n",
+			fmt.Fprintf(w, "\nwarning: %s is running, but its monitor is not listening and its\n",
 				e.Display())
-			fmt.Fprintln(w, "messages queue on its spool, but only a monitor for the same session id")
-			fmt.Fprintln(w, "will read them (claude --resume); a new session gets a new id.")
+			fmt.Fprintln(w, "socket did not answer either. messages queue on its spool, but only a")
+			fmt.Fprintln(w, "monitor for the same session id will read them (claude --resume); a new")
+			fmt.Fprintln(w, "session gets a new id.")
 			break
 		}
 	}
@@ -371,11 +411,12 @@ func cmdList(args []string, w, stderr io.Writer) error {
 
 func cmdSend(args []string, w, stderr io.Writer) error {
 	fs := flags("send", stderr)
-	var nsName, asName, subject, brief, supersedes, replyTo string
+	var nsName, asName, subject, brief, supersedes, replyTo, via string
 	var alert bool
 	var attach repeatableFlag
 	nsFlag(fs, &nsName)
 	asFlag(fs, &asName)
+	viaFlag(fs, &via)
 	fs.StringVar(&subject, "subject", "", "one-line subject, max 120 characters; the only part guaranteed to arrive")
 	fs.StringVar(&brief, "brief", "", "a short summary, max 600 characters; what `pigeon inbox` shows by default")
 	fs.BoolVar(&alert, "alert", false, "mark this urgent: it interrupts work in progress and bypasses a digest. Use it to stop people, not to inform them")
@@ -388,9 +429,13 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 	if err := checkAs(asName); err != nil {
 		return err
 	}
+	transport, err := transportOf(via)
+	if err != nil {
+		return err
+	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf("usage: pigeon send [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] [--alert] [--supersedes <id>] [--reply-to <id>] [--attach <path>]... <target> <text>")
+		return fmt.Errorf("usage: pigeon send [-n <namespace>] [--as <name>] [--via <transport>] [--subject <text>] [--brief <text>] [--alert] [--supersedes <id>] [--reply-to <id>] [--attach <path>]... <target> <text>")
 	}
 	if err := misplacedFlag(rest[1:]); err != nil {
 		return err
@@ -415,23 +460,28 @@ func cmdSend(args []string, w, stderr io.Writer) error {
 	}
 	msg, err := ns.Send(to, pigeon.Draft{
 		Text: text, Subject: subject, Brief: brief, Priority: priority,
-		Supersedes: supersedes, ReplyTo: replyTo, Attach: attach,
+		Supersedes: supersedes, ReplyTo: replyTo, Attach: attach, Via: transport,
 	}, pigeon.ActingSender(asName))
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "sent -> %s (%s) in %s\n", pigeon.Short(to.SessionID), to.Display(), ns)
+	fmt.Fprintf(w, "sent -> %s (%s) in %s%s\n", pigeon.Short(to.SessionID), to.Display(), ns, viaNote(msg))
 	if msg.Payload != "" {
 		fmt.Fprintf(w, "body exceeded %d chars; full text at %s\n", pigeon.BodyBudget, msg.Payload)
 	}
 	if len(msg.Attach) > 0 {
 		fmt.Fprintf(w, "attached %d file(s)\n", len(msg.Attach))
 	}
-	if to.Status == pigeon.StatusDeaf {
+	// A deaf session that took the message over its socket is not the case this
+	// warning is about. The whole point of the socket transport is that a dead
+	// monitor stops meaning undelivered mail, so warning anyway would train
+	// readers to ignore the one line that still means something.
+	if to.Status == pigeon.StatusDeaf && len(msg.PushedTo) == 0 {
 		fmt.Fprintf(stderr,
-			"warning: %s has no listening monitor. The message is queued on its spool, but\n"+
-				"only a monitor for the same session id will ever read it (claude --resume).\n"+
-				"A brand-new session gets a new id and will not see it.\n",
+			"warning: %s has no listening monitor and could not be reached over its socket.\n"+
+				"The message is queued on its spool, but only a monitor for the same session id\n"+
+				"will ever read it (claude --resume). A brand-new session gets a new id and will\n"+
+				"not see it.\n",
 			to.Display())
 	}
 	if nudge := pigeon.SubjectNudge(msg); nudge != "" {
@@ -458,7 +508,7 @@ func misplacedFlag(rest []string) error {
 			name = name[:i]
 		}
 		switch name {
-		case "subject", "brief", "alert", "for", "supersedes", "reply-to", "attach", "n", "namespace", "as", "deadline":
+		case "subject", "brief", "alert", "for", "supersedes", "reply-to", "attach", "n", "namespace", "as", "deadline", "via":
 			return fmt.Errorf("%q came after a positional argument, so it was read as message text rather than as a flag; put flags before the target and the body", a)
 		}
 	}
@@ -467,11 +517,12 @@ func misplacedFlag(rest []string) error {
 
 func cmdPublish(args []string, w, stderr io.Writer) error {
 	fs := flags("publish", stderr)
-	var nsName, asName, subject, brief, supersedes, replyTo string
+	var nsName, asName, subject, brief, supersedes, replyTo, via string
 	var alert bool
 	var forNames, attach repeatableFlag
 	nsFlag(fs, &nsName)
 	asFlag(fs, &asName)
+	viaFlag(fs, &via)
 	fs.StringVar(&subject, "subject", "", "one-line subject, max 120 characters; the only part guaranteed to arrive")
 	fs.StringVar(&brief, "brief", "", "a short summary, max 600 characters; what `pigeon inbox` shows by default")
 	fs.BoolVar(&alert, "alert", false, "mark this urgent: it interrupts work in progress and bypasses a digest. Use it to stop people, not to inform them")
@@ -485,9 +536,13 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	if err := checkAs(asName); err != nil {
 		return err
 	}
+	transport, err := transportOf(via)
+	if err != nil {
+		return err
+	}
 	rest := fs.Args()
 	if len(rest) < 2 {
-		return fmt.Errorf("usage: pigeon publish [-n <namespace>] [--as <name>] [--subject <text>] [--brief <text>] [--alert] [--for <name>]... [--supersedes <id>] [--reply-to <id>] [--attach <path>]... <topic> <text>")
+		return fmt.Errorf("usage: pigeon publish [-n <namespace>] [--as <name>] [--via <transport>] [--subject <text>] [--brief <text>] [--alert] [--for <name>]... [--supersedes <id>] [--reply-to <id>] [--attach <path>]... <topic> <text>")
 	}
 	if err := misplacedFlag(rest[1:]); err != nil {
 		return err
@@ -509,17 +564,26 @@ func cmdPublish(args []string, w, stderr io.Writer) error {
 	}
 	msg, err := ns.Publish(topic, pigeon.Draft{
 		Text: text, Subject: subject, Brief: brief, Priority: priority, For: forNames,
-		Supersedes: supersedes, ReplyTo: replyTo, Attach: attach,
+		Supersedes: supersedes, ReplyTo: replyTo, Attach: attach, Via: transport,
 	}, pigeon.ActingSender(asName))
 	if err != nil {
 		return err
 	}
 	live, deaf := ns.SubscriberBreakdown(msg.Topic, pigeon.CurrentSessionID())
-	fmt.Fprintf(w, "published to %s (%d subscriber(s) besides you)\n",
-		pigeon.TopicLabel(msg.Topic), live)
+	// A subscriber the socket reached has received this message, whatever its
+	// monitor is doing, so it counts as reached rather than as deaf. Both
+	// numbers are corrected: reporting a socket-delivered subscriber as deaf
+	// would describe a delivery that worked as one that did not.
+	if n := ns.PushedDeaf(msg); n > 0 {
+		deaf -= n
+		live += n
+	}
+	fmt.Fprintf(w, "published to %s (%d subscriber(s) besides you)%s\n",
+		pigeon.TopicLabel(msg.Topic), live, viaNote(msg))
 	if deaf > 0 {
-		fmt.Fprintf(w, "NOTE: %d subscriber(s) are deaf -- running but not listening. "+
-			"They will only see this if they resume under the same session id.\n", deaf)
+		fmt.Fprintf(w, "NOTE: %d subscriber(s) are deaf -- running, not listening, and not "+
+			"reachable over their socket. They will only see this if they resume under the "+
+			"same session id.\n", deaf)
 	}
 	if live == 0 {
 		if deaf > 0 {

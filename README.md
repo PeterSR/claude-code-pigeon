@@ -95,6 +95,9 @@ Targets resolve as **exact session id → pid → declared name → id prefix �
 basename**, within one [namespace](#namespaces). `ls`, `send`, `publish`, `topics` and `prune` take
 `-n`/`--namespace <ns>`; `ls`, `topics` and `prune` also take `--all-namespaces`.
 
+`send` and `publish` take `--via monitor|socket|auto` to choose how the recipient is woken.
+See [Two transports](#two-transports).
+
 Sender identity is attached automatically. A session never has to know its own address for
 replies to work; a message from a plain shell is stamped `shell:user@host` and carries no
 reply handle, because there is nowhere to reply to. From a shell that is
@@ -588,24 +591,120 @@ sessions keep their queued mail, their cursors and their addresses.
 
 ## Knowing when a session has stopped listening
 
-A session can be running while its monitor is not. `pigeon ls` reports three states:
+A session can be running while its monitor is not. `pigeon ls` reports four states:
 
 | Status | Meaning |
 |---|---|
 | `live` | monitor is listening; a message arrives in about a second |
-| `deaf` | the session is running but nothing is listening — see below |
+| `socket` | no monitor, but the session's own inbox socket answers — see [Two transports](#two-transports) |
+| `deaf` | the session is running and neither way in works — see below |
 | `dead` | the process is gone; `pigeon prune` clears it |
 
-This is not a heuristic. The monitor holds an exclusive `flock` for its entire lifetime and
-the kernel releases it the instant that process exits — cleanly, crashed, or `SIGKILL`ed —
-so any other process can detect a dead monitor just by trying to take the lock. A stale
-heartbeat catches the rarer case of a monitor that is alive but wedged.
+Neither of the first two is a heuristic. The monitor holds an exclusive `flock` for its
+entire lifetime and the kernel releases it the instant that process exits — cleanly,
+crashed, or `SIGKILL`ed — so any other process can detect a dead monitor just by trying to
+take the lock. A stale heartbeat catches the rarer case of a monitor that is alive but
+wedged. `socket` is Claude Code's own liveness test: pigeon connects to the session's inbox
+socket, which is what Claude Code itself does before calling a peer reachable.
 
 Sending to a `deaf` session warns you. The message is kept on that session's spool, and a
 monitor that starts later for **the same session id** (`claude --resume`) will read it. A
 brand-new session gets a new id and will not see it, so treat `deaf` as "probably will not
 arrive" rather than "will arrive eventually". `pigeon prune` clears the spool once the
 process is gone.
+
+A `socket` session gets no such warning, because nothing is wrong with it. Its monitor is
+gone, so it will not receive `digest` or `quiet` topics until it restarts, but a direct
+message and any ordinary topic message reach it immediately.
+
+## Two transports
+
+A pigeon message is two separable things: a **record**, written to the spool, and a
+**doorbell** that makes a session look at it. Everything you read back — `inbox`, `thread`,
+`--catchup`, `--supersedes`, both cursors — is the record. Only the doorbell has ever been
+fragile.
+
+There are now two ways to ring it.
+
+| | how | reaches |
+|---|---|---|
+| `monitor` | append to the spool; the session's own background monitor tails it | a session whose monitor is alive |
+| `socket` | connect to the session's Claude Code inbox socket and push the line | a session that is **running**, monitor or no monitor |
+
+The record is written identically either way. A message delivered over the socket reads
+back the same in `pigeon inbox`, threads the same, and is superseded the same — the
+transport decides who rings the bell, not what the message is.
+
+```console
+$ pigeon send --via socket alpha "the migration finished"
+sent -> aaaa1111 (alpha) in default (delivered over the socket)
+```
+
+`--via socket|monitor|auto`, or `PIGEON_TRANSPORT`, or `"transport"` in
+`$XDG_CONFIG_HOME/pigeon/config.json`. Highest wins; the default is `auto`, which pushes
+over the socket when the session can be reached that way and leaves the message for the
+monitor otherwise.
+
+Like [private namespaces](#private-namespaces), this is deliberately **not** a
+`.claude/pigeon.json` field. That file arrives with a `git clone`, and how your sessions
+get interrupted is not a cloned repository's call.
+
+The socket protocol itself -- the discovery files, the frame format, the auth-key layout --
+is not pigeon's. It lives in
+[claude-code-socket-transport](https://github.com/PeterSR/claude-code-socket-transport), a
+standalone Go library, and pigeon is one of its callers. If you want to push into a session
+from something that is not pigeon -- a CI runner, a file watcher, a deploy script -- use
+that directly rather than shelling out to this.
+
+### What this fixes
+
+The socket transport exists for the failure mode documented at length in
+[How it works](#how-it-works): a monitor is armed once, by Claude Code, at session start,
+and nothing respawns one that dies. A session that resumes gets a monitor under a new
+address; one that merely idles and gets cache-restored comes back with none at all. Both
+silently. Until now that meant mail piling up on a spool nobody was reading.
+
+A session in that state is still *running*, and a running session still has its inbox
+socket bound. So it still gets its mail.
+
+### What stays on the monitor
+
+`digest` and `quiet` subscribers are never pushed to, whatever `--via` says.
+
+A socket push is irrevocable, and a sender cannot batch a minute of several senders'
+traffic into one line — which is the entire thing those two modes buy. `--supersedes`
+works by pulling a message *out* of a digest buffer before it fires, and a pushed message
+is already in front of the reader. So the two modes that trade latency for control keep
+the only transport that can give them control.
+
+Worth knowing if you are counting on it: **the monitor cannot be retired without retiring
+`digest` and `quiet` with it**, unless something else grows a per-recipient buffer.
+
+### Two things it changes
+
+**Rate limiting moves hosts.** pigeon's 30-per-minute limiter, including its ten-slot
+alert reserve, lives in the monitor. A socket push is governed by Claude Code's own inbound
+controls instead, which pigeon cannot see. `--via socket` means pigeon is no longer the
+thing throttling you.
+
+**A session that refuses cross-session inbound gets mail in its inbox, not as an
+interruption.** pigeon cannot learn that synchronously — the answer comes back later on a
+separate connection — so a push is recorded optimistically. The message is never lost; it
+is on the spool and in `pigeon inbox`. A session configured to refuse inbound messages, and
+therefore not interrupted, is behaving as configured.
+
+### Upgrading from 0.2
+
+`auto` is the default, so the socket path turns on the moment you upgrade. The check that
+stops a message arriving twice lives in the **recipient's** monitor, and a monitor is armed
+once at session start and keeps running the binary it was armed with. So a session that was
+already running when you upgraded will announce a socket-delivered message that its session
+has already been shown, and you will see it twice.
+
+It is the safe direction to fail in -- nothing is lost, one thing is doubled -- and it
+clears as soon as that session restarts. To skip the window, restart your sessions after
+`pigeon install`, or set `"transport": "monitor"` in the machine config until they have
+turned over.
 
 ### Diagnosing it: `pigeon doctor`
 
@@ -809,7 +908,16 @@ are written to `payloads/` and the recipient gets a path instead.
   session look alive until something prunes it.
 - A monitor that dies mid-session is not respawned. A session that restarts gets a new one
   under a new address; one that only idles stays deaf. Silently, either way -- see
-  [How it works](#how-it-works).
+  [How it works](#how-it-works). The [socket transport](#two-transports) delivers to such a
+  session anyway, which is what it is for, but it does not bring the monitor back: that
+  session's `digest` and `quiet` topics stay undelivered until it restarts.
+- Socket delivery needs Claude Code 2.1.224 or newer, and is unavailable on native Windows,
+  where cross-session messaging does not run. Everywhere it is unavailable, `auto` is
+  simply the monitor path, which is the whole of the previous behaviour.
+- A socket push reports only that the receiver took the frame. Whether the session was
+  interrupted, held it for approval, or dropped it under its own inbound rules is not
+  something pigeon learns -- the answer arrives later on a separate connection, which
+  nothing here binds today.
 - `pigeon prune` does not compact topic logs on Windows. Compaction replaces a log by
   rename, which Windows refuses while any process still holds it open. Forgetting dead
   sessions still works; only the space reclaim is skipped.

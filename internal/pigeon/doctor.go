@@ -91,6 +91,7 @@ func Diagnose() []Check {
 	out = append(out, checkPlugin()...)
 	out = append(out, checkProjectConfig())
 	out = append(out, checkRegistration()...)
+	out = append(out, checkSocket())
 	out = append(out, checkClaudeSession())
 	out = append(out, checkPeers())
 	return out
@@ -409,8 +410,20 @@ func checkRegistration() []Check {
 	case StatusLive:
 		out = append(out, ok("this session", "live, reachable as `pigeon send "+e.Addr()+"`"))
 	case StatusDeaf:
-		out = append(out, fail("this session", "registered but no monitor is listening",
-			"the monitor died or never started; restart the session, or run `pigeon arm`"))
+		// A dead monitor used to be the end of the story, and this check said so
+		// with a FAIL. It is now only half of it: a session whose socket answers
+		// still receives every message a sender chooses to push there, so
+		// reporting a failure would send someone restarting a session that works
+		// -- the same false alarm the `socket` status exists to remove from `ls`.
+		if SocketReachable(e) {
+			out = append(out, warn("this session",
+				"no monitor is listening, but its socket answers, so mail sent over the socket still arrives",
+				"topics on digest or quiet still need a monitor; restart the session to get one back"))
+		} else {
+			out = append(out, fail("this session",
+				"registered, no monitor is listening, and its socket did not answer either",
+				"the monitor died or never started; restart the session, or run `pigeon arm`"))
+		}
 	default:
 		out = append(out, fail("this session", "registered but its process looks gone",
 			"run `pigeon prune`"))
@@ -428,6 +441,49 @@ func checkRegistration() []Check {
 		out = append(out, ok("topics", strings.Join(e.Subscriptions, ", ")))
 	}
 	return out
+}
+
+// checkSocket reports whether this session can be reached over Claude Code's
+// own inbox socket, which is the delivery path that does not depend on a
+// monitor being alive.
+//
+// It is reported separately from "this session" on purpose. That check answers
+// "can I receive", and the honest answer now has two independent halves that
+// fail for unrelated reasons: a monitor dies when the host does not respawn it,
+// a socket is missing when the host is too old or has messaging turned off.
+// Folding them into one line would mean the recovery advice is right half the
+// time.
+//
+// Never a FAIL. A machine where nothing binds a socket is exactly pigeon before
+// this transport existed, and it still delivers; what is lost is the fallback,
+// which is worth a warning and not an alarm.
+func checkSocket() Check {
+	_, e, err := Self()
+	if err != nil {
+		return ok("socket", "not registered; nothing to probe")
+	}
+	s, err := claudeSessionFor(e)
+	if err != nil {
+		return warn("socket", "this session has no reachable inbox socket",
+			"socket delivery is unavailable here, so mail depends entirely on the monitor; "+
+				"cross-session messaging needs Claude Code 2.1.224 or newer and is not available on native Windows")
+	}
+	if !s.Reachable(socketProbeTimeout) {
+		return warn("socket", "registered at "+s.SocketPath+" but it did not answer",
+			"the path is stale or the session stopped listening; mail depends entirely on the monitor until it comes back")
+	}
+	detail := s.SocketPath
+	// Named only when the two registries disagree, which is the case that
+	// confuses a reader of `pigeon ls`: the id pigeon addresses this session by
+	// is not the id Claude Code currently holds, because /clear minted a new one
+	// and the monitor kept the old. Delivery is unaffected -- the join is on the
+	// process, see claudeSessionFor -- but silence here would make the mismatch
+	// look like a bug the one time someone compares the two by hand.
+	if s.SessionID != "" && s.SessionID != e.SessionID {
+		detail += fmt.Sprintf(" (claude session %s, pigeon addresses this session as %s; they diverge after /clear and that is expected)",
+			Short(s.SessionID), Short(e.SessionID))
+	}
+	return ok("socket", detail)
 }
 
 func checkPeers() Check {

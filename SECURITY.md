@@ -35,6 +35,33 @@ That last point is not cosmetic: waking a session with imperative text makes the
 incoming messages as untrusted input from a third party — which is what they are — and do
 not let an agent act on one in a way you would not let a stranger's email trigger.
 
+## The socket transport moves the sanitising, and moves the forgery surface
+
+When pigeon delivers over a session's Claude Code inbox socket rather than through its
+monitor, everything above still applies — the line is rendered by the same code, with the
+same stripping and the same phrasing — but two things are different, and both are worth
+knowing before you make `socket` your default.
+
+**The record and the delivery come apart.** On the monitor path, the line a session sees
+was produced by pigeon's own process reading pigeon's own spool, so anything that arrived
+is on the log. A socket push puts text in front of a session directly. pigeon writes its
+record either way, but *anything else that can reach that socket* can put a line there too,
+formatted exactly like a pigeon notification, with nothing on any log behind it. Observed
+in practice while building this: a `[pigeon #deploys] from sh :: shipped` line arrived in a
+session that was not subscribed to `#deploys`, on a machine where no such topic existed.
+
+This is not a new privilege — reaching the socket needs the same access as writing
+`~/.claude/pigeon` — but it is a new way to spend it, and one that leaves no trace. **If a
+notification matters, confirm it with `pigeon inbox`**, which reads the record rather than
+the doorbell.
+
+**Sender attribution comes from Claude Code, not from pigeon.** A socket push is wrapped in
+Claude Code's own `cross-session-message` envelope, so the receiving session attributes it
+to whatever name the sender supplied. That name is bounded and stripped of the characters
+that would break the envelope, and Claude Code re-serializes what it parses and compares it
+against what arrived, so a message body cannot forge the end of its own envelope. It is
+still a claim, exactly like the `from` stamp on the spool.
+
 ## Monitors are unsandboxed
 
 A plugin monitor runs arbitrary code for the lifetime of your session, at the same trust

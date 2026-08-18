@@ -412,6 +412,22 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 				markOwnAsRead(fm)
 				continue
 			}
+			// Already delivered over the socket, before this line was written
+			// (see Message.PushedTo and Namespace.wake). This session has been
+			// shown the message; announcing it again would cost a second
+			// interruption for one message.
+			//
+			// The monitor cursor moves and the READ cursor deliberately does
+			// not, which is the same split every other delivery here observes:
+			// the session was doorbelled, not made to read, so the message is
+			// still unread in `pigeon inbox` exactly as it would be after a
+			// notification. Conflating the two would let a socket push silently
+			// mark mail as read that nobody opened.
+			if pushedToSession(fm.msg, sid) {
+				logf("already delivered over the socket, not notifying again")
+				advanceCursor(fm)
+				continue
+			}
 			deliver(fm)
 		}
 	}
@@ -940,7 +956,7 @@ func CheckoutTopic(dir string) string {
 // directory counts: that is what a linked worktree has.
 func repoRoot(dir string) string {
 	for {
-		if _, err := os.Lstat(filepath.Join(dir, ".git")); err == nil {
+		if isGitDir(filepath.Join(dir, ".git")) {
 			return dir
 		}
 		parent := filepath.Dir(dir)
@@ -949,6 +965,31 @@ func repoRoot(dir string) string {
 		}
 		dir = parent
 	}
+}
+
+// isGitDir reports whether path is git's marker for a working tree, applying
+// the same test git itself does rather than merely checking the name exists.
+//
+// The distinction is not pedantic. An empty directory called .git is not a
+// checkout to git and must not be one to pigeon: a stray /tmp/.git, which is
+// easy to create by accident and which this machine actually had, would
+// otherwise make every session under /tmp announce itself into a room called
+// "tmp" and see strangers there. The room a session joins is derived from this
+// answer, so a false positive here silently merges unrelated work.
+//
+// Two shapes are valid. A linked worktree has a .git FILE holding a gitdir
+// pointer, and its mere existence is the marker. A primary checkout has a .git
+// DIRECTORY, which git considers a repository only once it contains HEAD.
+func isGitDir(path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	if !fi.IsDir() {
+		return true
+	}
+	_, err = os.Lstat(filepath.Join(path, "HEAD"))
+	return err == nil
 }
 
 // topicNameFrom folds a directory name into a valid topic name, or "" if it

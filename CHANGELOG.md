@@ -6,7 +6,66 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-18
+
+### Upgrading
+
+The socket transport is on by default, and the suppression that stops a message arriving
+twice lives in the RECIPIENT's monitor. So during the window where you have upgraded pigeon
+but a session is still running the monitor it armed from an older build, a socket-delivered
+message arrives twice: once pushed to the socket, once announced by a monitor that does not
+yet know to stay quiet. It is the safe direction to fail in, and it clears the moment a
+session restarts. To skip the window entirely, restart your sessions after `pigeon install`,
+or set `"transport": "monitor"` in the machine config until they have turned over.
+
 ### Added
+- A second delivery transport: pigeon can now wake a session by pushing a line to Claude
+  Code's own inbox socket, instead of relying on that session's background monitor to find
+  it on the spool. `--via monitor|socket|auto` on `send` and `publish`, `PIGEON_TRANSPORT`,
+  or `"transport"` in the machine config; `auto` is the default and uses the socket when
+  the session can be reached that way. This is deliberately not a project-config field, on
+  the same reasoning that keeps `private` out of one: a file that arrives with a `git clone`
+  does not get to decide how your sessions are interrupted.
+
+  This exists for the failure mode the README has documented and been unable to do anything
+  about. Monitors are armed once, by Claude Code, at session start; nothing respawns one
+  that dies, so a session that resumes or merely idles can go deaf silently and mail piles
+  up on a spool nothing reads. That session is still *running*, and a running session still
+  has its inbox socket bound, so it can still be reached. `pigeon ls` grows a `socket`
+  status for exactly that state, `doctor` reports the two paths separately because they
+  fail for unrelated reasons, and the status line's `pigeon.wait` alarm no longer fires for
+  a session that is receiving perfectly well.
+
+  The spool stays the record. Only the doorbell changes: a socket-delivered message reads
+  back identically in `inbox`, threads the same, and is superseded the same. A message
+  carries the session ids it was pushed to, and a monitor seeing itself listed advances its
+  cursor without announcing the message, so a recipient reachable both ways is not
+  interrupted twice. Note that suppression lives in the monitor, so during any period where
+  senders have this build and receivers are still running an older monitor, socket-delivered
+  messages arrive twice -- the safe direction, but not free.
+
+  `digest` and `quiet` subscribers are never pushed to, whatever `--via` says. A push is
+  irrevocable and a sender cannot batch a minute of several senders' traffic into one line,
+  which is the whole of what those modes buy; `--supersedes` works by pulling a message out
+  of a digest buffer before it fires, and a pushed message is already in front of the
+  reader. The consequence worth stating: retiring the monitor would retire those two modes
+  with it.
+
+  Two behaviours move. pigeon's 30-per-minute rate limiter lives in the monitor, so a socket
+  push is governed by Claude Code's inbound controls instead, which pigeon cannot see. And a
+  session that refuses cross-session inbound gets its mail in `inbox` rather than as an
+  interruption -- pigeon cannot learn that synchronously, so a push is recorded
+  optimistically. Nothing is lost either way; the record is written first.
+
+  The join between pigeon's registry and Claude Code's is on `(pid, procStart)`, not on the
+  session id, and that is load-bearing rather than incidental. `/clear` mints a fresh
+  session id which Claude Code records immediately, while a monitor keeps the id it was
+  armed with for its whole lifetime because monitors cannot be rebound. Measured on a
+  machine with fifteen live sessions, two disagreed that way; keying on the session id would
+  have refused to deliver to both, for a reason neither registry explains. The process start
+  token is identical in both registries and is a strictly stronger guard against a recycled
+  pid than the id ever was.
+
 - A message can carry a `subject` and a `brief` alongside its body, so a reader has three
   tiers instead of two. A notification clips the body at about 300 characters, which in the
   run this came from cut every single message on the topic -- the median was 2019 characters
@@ -307,6 +366,14 @@ All notable changes to this project are documented here. Format follows
   how. Nothing else changes: the widget reports the same states from the same registry.
 
 ### Fixed
+- A directory was treated as a git checkout on the strength of a `.git` entry existing,
+  without checking it was a repository. An empty `.git` directory is not a checkout to git,
+  which requires `HEAD`, and it is easy to create by accident -- this was found because one
+  existed at `/tmp` on the author's machine. Every session whose working directory sat
+  anywhere under it therefore resolved `here` to a room named after that directory, so
+  unrelated sessions were placed in a shared room and saw each other's broadcasts. A `.git`
+  directory now counts only when it contains `HEAD`; a `.git` file still counts on sight,
+  because that is how a linked worktree marks itself.
 - A monitor rearm erased every delivery mode the session had set. `register` carried a
   session's name, description and subscriptions across a restart and left `Delivery` out of
   that list, and since `WriteEntry` replaces the whole entry, a field left out is not stale
@@ -737,6 +804,7 @@ First release.
   nothing is not enough: recipients read the `shell:user@host` stamp as an address
   and waste a call discovering it is not one.
 
-[Unreleased]: https://github.com/PeterSR/claude-code-pigeon/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/PeterSR/claude-code-pigeon/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/PeterSR/claude-code-pigeon/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/PeterSR/claude-code-pigeon/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/PeterSR/claude-code-pigeon/releases/tag/v0.1.0

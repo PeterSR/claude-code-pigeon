@@ -56,6 +56,11 @@ const (
 	// speaking as. It only takes effect outside a real Claude Code session; see
 	// ActingIdentity.
 	EnvAs = "PIGEON_AS"
+	// EnvTransport selects how a recipient is woken -- see Transport. Per
+	// invocation, for the same reason as the two above: a script states how it
+	// wants its mail delivered, and that outranks a standing preference set
+	// weeks ago in the machine config.
+	EnvTransport = "PIGEON_TRANSPORT"
 )
 
 // Home is the state directory. Everything pigeon knows lives here.

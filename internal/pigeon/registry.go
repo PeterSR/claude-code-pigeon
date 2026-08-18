@@ -27,6 +27,20 @@ const (
 	StatusDeaf Status = "deaf"
 	// StatusDead: the claude process is gone. The entry is garbage.
 	StatusDead Status = "dead"
+	// StatusSocket: no monitor is listening, but the session's own Claude Code
+	// inbox socket answers, so pigeon can still put a message in front of it.
+	//
+	// This status is never produced by Entry.status, which knows only about the
+	// monitor lock. It is a PROMOTION of StatusDeaf, applied by AnnotateReach
+	// and only by callers that asked for it -- see that function for why the
+	// probe is opt-in rather than folded into every listing.
+	//
+	// It exists because "deaf" was coined when the monitor was the only way in.
+	// A session with a dead monitor and a good socket is the single most common
+	// state on a machine that has been running a while (see the README on
+	// monitors dying at resume), and reporting it as deaf tells you to restart
+	// a session that would have received your message perfectly well.
+	StatusSocket Status = "socket"
 )
 
 // heartbeatInterval is how often a live monitor refreshes its entry.

@@ -1,2 +1,4 @@
+github.com/PeterSR/claude-code-socket-transport v0.1.1 h1:xirJZhJT2rl6vm3+9ejsUkVcVP9S9/s+pI0VxPtgPec=
+github.com/PeterSR/claude-code-socket-transport v0.1.1/go.mod h1:6C1DXhlyaOYFEqOzjflPX3AtlePC1v/0Urc4duPhYqc=
 github.com/PeterSR/claude-code-weaverbird v0.3.0 h1:seGVrWtntWz/ZD+CDKFVyB12gFRM2HSMoeFDpEOg2LY=
 github.com/PeterSR/claude-code-weaverbird v0.3.0/go.mod h1:593wUH9JFeb1pgjWa5tfHLko/T63WF50SmJBjKNFiEQ=

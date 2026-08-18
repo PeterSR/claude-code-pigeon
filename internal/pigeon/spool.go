@@ -160,6 +160,21 @@ type Message struct {
 	// rule Render applies to Payload (see writeInboxItem). An attachment's
 	// bytes are untrusted input from a peer: read them, never execute them.
 	Attach []string `json:"attach,omitempty"`
+	// PushedTo lists the session ids that were already woken about this message
+	// over the Claude Code inbox socket, at send time, before this line was
+	// written (see Namespace.wake). It is how a monitor knows to stay quiet
+	// about a message its own session has already been shown: without it, a
+	// recipient reachable by both transports would be interrupted twice for one
+	// message.
+	//
+	// It records what was DELIVERED, not what was intended, so a push that
+	// failed leaves that id out and the monitor announces the message exactly as
+	// it always has. That is the whole fallback mechanism, and it needs no
+	// retraction because the line is written after the pushes rather than before.
+	//
+	// Not a routing field and never read as one: a session absent from this list
+	// is not excluded from anything, it is merely still owed its notification.
+	PushedTo []string `json:"pushedTo,omitempty"`
 	// AskID marks a message as the question half of a blocking ask (see
 	// ask.go's Ask). Set only by Ask itself, never by an ordinary sender --
 	// Send rejects a non-empty one outright, the same way it rejects For --
@@ -181,6 +196,11 @@ type Draft struct {
 	ReplyTo    string
 	// AskID is set only by Ask (see ask.go); see Message.AskID for why.
 	AskID string
+	// Via names the transport to wake recipients with, empty for the resolved
+	// default (see CurrentTransport). A delivery instruction rather than
+	// message content, which is why nothing about it survives onto Message: the
+	// record says who was woken, not who the sender hoped to wake.
+	Via Transport
 	// Attach lists local file paths to copy into the recipient's payload
 	// directory at send time (see attachFiles); Message.Attach then names
 	// where each one landed. Never reaches Render -- see the note on
@@ -767,6 +787,20 @@ func (n Namespace) Send(to *Entry, d Draft, from Sender) (*Message, error) {
 		}
 		msg.Attach = stored
 	}
+
+	// Wake the recipient before the line is written, so the ids of whoever was
+	// actually reached can be stamped into it -- see Namespace.wake for why
+	// that order is the safe one.
+	//
+	// A direct message never consults a delivery mode: it is mail for exactly
+	// one reader rather than chatter to be batched, which is the same reason
+	// RunMonitor's deliver does not look one up for the spool either. So the
+	// recipient is the whole audience, unconditionally.
+	pushed, problems := n.wake(d.transport(), msg, []*Entry{to})
+	if len(problems) > 0 {
+		return nil, fmt.Errorf("could not deliver over the socket to %s: %s", to.Addr(), strings.Join(problems, "; "))
+	}
+	msg.PushedTo = pushed
 
 	line, err := json.Marshal(msg)
 	if err != nil {

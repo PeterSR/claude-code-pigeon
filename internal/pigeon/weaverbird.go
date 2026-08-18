@@ -151,10 +151,22 @@ func WeaverbirdValue(sess wb.Session, _ []string) ([]wb.Value, error) {
 			vals = append(vals, notArmedValue())
 		}
 	} else {
-		switch e.Status {
-		case StatusLive:
+		switch {
+		case e.Status == StatusLive:
 			vals = append(vals, monitorValue(e))
-		case StatusDeaf, StatusDead:
+		// A deaf session whose socket answers is not an alarm. The widget's
+		// whole discipline is that it renders nothing when a session can
+		// receive, so that the one time it lights up it is worth reading; a
+		// session that takes every message pushed to it over the socket can
+		// receive, and lighting up for it would make the alarm wallpaper on
+		// every machine that has been running long enough for monitors to die.
+		//
+		// pigeon.monitor still reports deaf, because that widget answers a
+		// different question -- what is the monitor doing -- and the answer is
+		// still "nothing". Only the ALARM is withdrawn, not the fact.
+		case e.Status == StatusDeaf && SocketReachable(e):
+			vals = append(vals, monitorValue(e))
+		case e.Status == StatusDeaf, e.Status == StatusDead:
 			vals = append(vals, waitingValue(ns.Pending(sid)), monitorValue(e))
 		}
 	}

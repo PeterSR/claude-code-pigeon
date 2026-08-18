@@ -456,6 +456,28 @@ func (n Namespace) Publish(topic string, d Draft, from Sender) (*Message, error)
 		msg.Attach = stored
 	}
 
+	// Wake the subscribers before the line is written, so the ids of whoever was
+	// actually reached can be stamped into it (see Namespace.wake).
+	//
+	// The log itself stays one append regardless of how many subscribers there
+	// are -- cursors, catch-up and supersede are all untouched by this, and the
+	// record is complete whether anyone was pushed to or not. What fans out is
+	// only the doorbell. See publishTargets for which subscribers are eligible
+	// and, more importantly, which two delivery modes are deliberately not.
+	//
+	// Done outside the topic lock: a push is a network round trip to another
+	// process, and holding a lock that every publisher on this topic contends
+	// for across a fan-out would let one unreachable session stall everybody.
+	if t := d.transport(); t != TransportMonitor {
+		targets := n.publishTargets(msg, n.matchingSubscribers(ref, from.SessionID), from.SessionID)
+		pushed, problems := n.wake(t, msg, targets)
+		if len(problems) > 0 {
+			return nil, fmt.Errorf("could not deliver over the socket to %d of %d subscriber(s): %s",
+				len(problems), len(targets), strings.Join(problems, "; "))
+		}
+		msg.PushedTo = pushed
+	}
+
 	line, err := json.Marshal(msg)
 	if err != nil {
 		return nil, err
@@ -1027,6 +1049,33 @@ func (n Namespace) SubscriberBreakdown(topic, exceptSessionID string) (live, dea
 		}
 	}
 	return live, deaf
+}
+
+// PushedDeaf counts the subscribers a socket push reached that
+// SubscriberBreakdown would otherwise have counted as deaf.
+//
+// It exists because "deaf" was coined when the monitor was the only way in, and
+// it now means two different things that a publisher needs told apart: a
+// session whose monitor is gone AND whose socket refused the message, which is
+// the one the warning is about, and a session whose monitor is gone but which
+// took the message anyway, which is a delivery that worked. Counting the second
+// as deaf would report a rescue as a failure, on exactly the run the socket
+// transport exists for.
+func (n Namespace) PushedDeaf(m *Message) int {
+	if m == nil || len(m.PushedTo) == 0 {
+		return 0
+	}
+	ref, err := ParseTopicRef(m.Topic)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, e := range n.matchingSubscribers(ref, m.From.SessionID) {
+		if e.Status == StatusDeaf && pushedToSession(m, e.SessionID) {
+			count++
+		}
+	}
+	return count
 }
 
 // TopicInfo is one row of `pigeon topics`.

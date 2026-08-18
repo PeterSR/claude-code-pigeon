@@ -812,8 +812,15 @@ func mcpSend(ns Namespace, to, text, subject, brief, priority, supersedes, reply
 	if len(msg.Attach) > 0 {
 		fmt.Fprintf(&b, " Attached %d file(s).", len(msg.Attach))
 	}
-	if target.Status == StatusDeaf {
-		b.WriteString(" WARNING: that session is running but has no listening monitor. The message is queued on its spool, but only a monitor for the same session id will ever read it; a newly started session gets a new id and will not see it.")
+	// No transport is offered as a tool argument, deliberately: which wire a
+	// message goes down is an operator's concern, and a model asked to choose
+	// would be choosing from the one thing it cannot observe, namely whether
+	// the far end's monitor is alive. The resolved default already picks the
+	// transport that works.
+	if len(msg.PushedTo) > 0 {
+		b.WriteString(" It was delivered straight into that session over its socket, so it has already been shown rather than queued.")
+	} else if target.Status == StatusDeaf {
+		b.WriteString(" WARNING: that session is running, has no listening monitor, and could not be reached over its socket either. The message is queued on its spool, but only a monitor for the same session id will ever read it; a newly started session gets a new id and will not see it.")
 	}
 	b.WriteString(SubjectNudge(msg))
 	return b.String(), nil
@@ -831,6 +838,12 @@ func mcpPublish(ns Namespace, topic, text, subject, brief, priority string, forN
 		return "", err
 	}
 	live, deaf := ns.SubscriberBreakdown(topic, CurrentSessionID())
+	// See PushedDeaf: a subscriber the socket reached has received this, so it
+	// counts as reached rather than as deaf.
+	if n := ns.PushedDeaf(msg); n > 0 {
+		deaf -= n
+		live += n
+	}
 	out := fmt.Sprintf("Published to %s. %d other live session(s) subscribe to it.",
 		TopicLabel(msg.Topic), live)
 	// A For list now decides who is interrupted, so a name that matches nobody
@@ -845,7 +858,7 @@ func mcpPublish(ns Namespace, topic, text, subject, brief, priority string, forN
 		out += " That topic is machine-wide, so subscribers in every namespace received it."
 	}
 	if deaf > 0 {
-		out += fmt.Sprintf(" NOTE: %d subscriber(s) are deaf -- running but not listening. They will only see this if they resume under the same session id.", deaf)
+		out += fmt.Sprintf(" NOTE: %d subscriber(s) are deaf -- running, not listening, and not reachable over their socket. They will only see this if they resume under the same session id.", deaf)
 	}
 	if live == 0 {
 		if deaf > 0 {

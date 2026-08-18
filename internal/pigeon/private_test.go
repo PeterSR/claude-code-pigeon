@@ -237,9 +237,7 @@ func TestAPrivateCheckoutDoesNotJoinARoomNamedAfterItself(t *testing.T) {
 	withHome(t)
 	dir := t.TempDir()
 	repo := filepath.Join(dir, "secret-client-work")
-	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	mkCheckout(t, repo)
 
 	open := defaultSubscriptions(DefaultNamespace(), repo, false)
 	if !slices.Contains(open, "secret-client-work") {

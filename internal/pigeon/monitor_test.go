@@ -262,7 +262,14 @@ func TestMonitorPopulatesLabel(t *testing.T) {
 	}
 }
 
-func TestMonitorDeregistersOnShutdown(t *testing.T) {
+// A monitor exiting must not unregister the session it was announcing for.
+// The entry belongs to the SessionStart hook, and the claude process it names
+// is still running and still answering on its socket, so removing it would
+// leave a live session addressable by nobody -- and nothing would put it back,
+// since SessionStart matches only startup and resume. What the exit does give
+// up is the lock, because that is the claim this process is actually
+// relinquishing: delivering.
+func TestMonitorLeavesRegistrationOnShutdown(t *testing.T) {
 	withHome(t)
 	const sid = "mon-shutdown-1"
 	m := startMonitor(t, sid)
@@ -273,8 +280,8 @@ func TestMonitorDeregistersOnShutdown(t *testing.T) {
 
 	m.stop(t)
 
-	if _, err := ReadEntry(sid); err == nil {
-		t.Error("entry survived shutdown; peers would keep addressing a session nothing listens to")
+	if _, err := ReadEntry(sid); err != nil {
+		t.Error("entry removed on shutdown; the session is still running and is now addressable by nobody")
 	}
 	if monitorListening(sid) {
 		t.Error("the lock is still held after shutdown, so this session still looks live")
@@ -289,10 +296,9 @@ func TestMonitorDeregistersOnShutdown(t *testing.T) {
 	}
 }
 
-// A session hard-killed before its monitor's deferred RemoveEntry runs leaves
-// a dead entry behind. The next monitor to register in the same namespace
-// sweeps it, so the namespace tidies itself without anyone running
-// `pigeon prune` by hand.
+// A session that never ran its SessionEnd hook leaves a dead entry behind. The
+// next monitor to register in the same namespace sweeps it, so the namespace
+// tidies itself without anyone running `pigeon prune` by hand.
 func TestMonitorPrunesDeadEntriesOnRegister(t *testing.T) {
 	withHome(t)
 	if err := WriteEntry(&Entry{SessionID: "mon-dead-leftover", PID: 0}); err != nil {

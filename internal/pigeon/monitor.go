@@ -135,16 +135,11 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	// stays.
 	//
 	// The registry entry is deliberately left behind, which is the one thing
-	// that makes this mode work at all. Everywhere else a monitor exits it
-	// removes its entry (see the deferred RemoveEntry below), because a missing
-	// monitor used to mean a session nothing could reach. That is no longer
-	// true: a running session still has its inbox socket bound, so an entry
-	// with no monitor behind it is a perfectly good address -- `pigeon ls`
-	// already reports exactly that state as `socket`.
-	//
-	// Nothing leaks. register sweeps entries whose process is gone every time
-	// any session registers, and a session in this mode still registers, so the
-	// sweep keeps running on the same schedule it always did.
+	// that makes this mode work at all: a running session still has its inbox
+	// socket bound, so an entry with no monitor behind it is a perfectly good
+	// address -- `pigeon ls` already reports exactly that state as `socket`.
+	// No exit path of this process removes it, here or below; see the comment
+	// on the way out for why that is the rule rather than this mode's exception.
 	//
 	// The lock goes with us on the way out, via the deferred Close above, and
 	// that is correct rather than incidental: the lock means "a monitor is
@@ -185,9 +180,27 @@ func RunMonitor(stdout io.Writer, stderr io.Writer) error {
 	// Topics: started and stopped as subscriptions change.
 	go manageSubscriptions(ns, sid, lines, done, logf)
 
-	// Deregister on the way out, but leave the spool in place: anything queued
-	// for this session should survive until a monitor actually reads it.
-	defer ns.RemoveEntry(sid)
+	// Nothing is deregistered on the way out, and the absence of that is the
+	// point. The entry is the SessionStart hook's now, not this process's, and
+	// removing something you did not create is how a session ends up alive and
+	// invisible: a monitor exits mid-life -- delivery turned off under it, the
+	// plugin reloaded, the watchdog firing, a signal, a crash -- and takes with
+	// it the address of a claude process that is still running and still
+	// answering on its socket. Nothing puts it back either, because SessionStart
+	// matches startup and resume, and a session already running reaches neither
+	// until someone restarts it.
+	//
+	// The premise that justified removing it is gone. A missing monitor used to
+	// mean a session nothing could reach, so the entry was worthless without
+	// one; now the socket transport reaches a session with no monitor at all,
+	// which is the state `pigeon ls` reports as `socket` and the stand-down path
+	// above deliberately leaves behind. What actually ends a session is
+	// SessionEnd, and DeregisterHook is what runs there.
+	//
+	// Nothing leaks by staying. register sweeps entries whose process is gone
+	// every time any session registers, and reconcileOrphans collects the spool
+	// and cursors behind them, so an entry outliving a hard kill is collected on
+	// the same schedule as before rather than kept forever.
 
 	_, _, perMinute := rt.Budget()
 	emit, emitLine, flushSuppressed, rollWindow := newRateLimiter(stdout, ns, sid, spool, time.Minute, perMinute)
@@ -864,10 +877,11 @@ func currentSessionFacts() sessionFacts {
 }
 
 func register(ns Namespace, sid string, rt Runtime, facts sessionFacts, logf func(string, ...any)) error {
-	// A session hard-killed before its monitor's deferred RemoveEntry runs
-	// leaves a dead entry behind -- otherwise only `pigeon prune` clears it.
-	// Sweeping here means the namespace tidies itself as sessions come and go,
-	// rather than accumulating garbage until someone runs prune by hand.
+	// A session that never ran its SessionEnd hook -- hard-killed, or with the
+	// plugin absent -- leaves a dead entry behind, and otherwise only
+	// `pigeon prune` clears it. Sweeping here means the namespace tidies itself
+	// as sessions come and go, rather than accumulating garbage until someone
+	// runs prune by hand.
 	if pruned := ns.pruneDeadEntries(sid); pruned > 0 {
 		logf("pruned %d dead session entry/entries left by earlier sessions", pruned)
 	}

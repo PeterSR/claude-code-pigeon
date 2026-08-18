@@ -12,6 +12,21 @@ import (
 
 // writeProjectConfig scaffolds a project directory carrying a pigeon config,
 // the way a checkout would.
+// mkCheckout makes dir look like a primary git checkout to repoRoot, which
+// means a .git directory that actually contains HEAD. An empty .git directory
+// is not a repository to git and is deliberately not one to pigeon either, so
+// a fixture that omits HEAD is testing a case that cannot arise.
+func mkCheckout(t *testing.T, dir string) {
+	t.Helper()
+	git := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(git, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(git, "HEAD"), []byte("ref: refs/heads/main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func writeProjectConfig(t *testing.T, body string) string {
 	t.Helper()
 	dir := t.TempDir()

@@ -1,6 +1,7 @@
 package pigeon
 
 import (
+	"encoding/json"
 	"os"
 	"strconv"
 	"strings"
@@ -8,9 +9,25 @@ import (
 )
 
 // hookPayload is what Claude Code writes to a lifecycle hook's stdin.
+//
+// Marshalled rather than concatenated, because cwd is a real path from
+// t.TempDir() and on Windows that is full of backslashes. Pasted between quotes
+// they read as JSON escapes -- \U, \A, \T are not valid ones -- so the payload
+// fails to parse, and readHookInput is deliberately built to treat an
+// unparseable payload as an absent one. The hook then registers nothing and
+// says only that it found no session id, which is a true statement about a
+// fixture that never survived being written down.
 func hookPayload(event, sid, cwd string) *strings.Reader {
-	return strings.NewReader(`{"session_id":"` + sid + `","cwd":"` + cwd +
-		`","transcript_path":"/tmp/t.jsonl","hook_event_name":"` + event + `"}`)
+	b, err := json.Marshal(map[string]string{
+		"session_id":      sid,
+		"cwd":             cwd,
+		"transcript_path": "/tmp/t.jsonl",
+		"hook_event_name": event,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return strings.NewReader(string(b))
 }
 
 // withHookEnv contains what the hooks do to the process they run in.
@@ -105,6 +122,28 @@ func TestRegisterHookFallsBackToTheEnvironment(t *testing.T) {
 			t.Errorf("stdin %q left the session unregistered: %v", in, err)
 		}
 		CurrentNamespace().RemoveEntry(sid)
+	}
+}
+
+// A cwd full of backslashes is just what a Windows session's payload looks
+// like, and it has to survive the trip. This is a platform-independent test of
+// a platform-specific hazard on purpose: the failure is in reading the payload,
+// not in anything the operating system does, so a Unix run can catch it and one
+// did not for as long as the fixture was pasting paths between quotes.
+func TestRegisterHookAcceptsAWindowsStyleCwd(t *testing.T) {
+	withHookEnv(t)
+	sid := "winpath1-4444-4444-4444-444444444444"
+	const cwd = `C:\Users\RUNNER~1\AppData\Local\Temp\proj`
+
+	if err := RegisterHook(hookPayload("SessionStart", sid, cwd), &strings.Builder{}); err != nil {
+		t.Fatalf("RegisterHook: %v", err)
+	}
+	e, err := CurrentNamespace().ReadEntry(sid)
+	if err != nil {
+		t.Fatalf("a session whose cwd has backslashes went unregistered: %v", err)
+	}
+	if e.Cwd != cwd {
+		t.Errorf("entry cwd = %q, want the payload's %q", e.Cwd, cwd)
 	}
 }
 

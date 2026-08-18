@@ -203,14 +203,25 @@ func TestAnswerFromOutsideAudienceIsReportedSeparately(t *testing.T) {
 	}
 }
 
+// Two audience members, where the property under test needs only one, and the
+// second is what makes the test honest rather than lucky. Ask returns the
+// moment quorum is reached, so with a single member the first answer ends the
+// wait and the replacement races a poller that has already been satisfied --
+// passing wherever both writes happen to land inside one polling interval and
+// failing wherever they do not. Needing the second member's answer to reach
+// quorum means the first member's change of mind is always on file before
+// anything reads it.
 func TestSecondAnswerFromTheSameSessionReplacesTheFirst(t *testing.T) {
 	withHome(t)
 	ns := DefaultNamespace()
 	const topic = "deploys"
 
 	member := armed(t, "peer-in0000000", "peer-in")
-	if err := ns.Subscribe(member.SessionID, topic); err != nil {
-		t.Fatal(err)
+	other := armed(t, "peer-two000000", "peer-two")
+	for _, m := range []*Entry{member, other} {
+		if err := ns.Subscribe(m.SessionID, topic); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	from := Sender{Kind: "session", SessionID: "asker-1", Name: "asker"}
@@ -224,6 +235,10 @@ func TestSecondAnswerFromTheSameSessionReplacesTheFirst(t *testing.T) {
 	if err := ns.Answer(id, answerer, VerdictOK, "actually fine"); err != nil {
 		t.Fatal(err)
 	}
+	// Only now can quorum complete, so the reply above cannot be read halfway.
+	if err := ns.Answer(id, Sender{Kind: "session", SessionID: other.SessionID, Name: other.Name}, VerdictOK, "fine here"); err != nil {
+		t.Fatal(err)
+	}
 
 	select {
 	case r := <-done:
@@ -231,19 +246,28 @@ func TestSecondAnswerFromTheSameSessionReplacesTheFirst(t *testing.T) {
 			t.Fatalf("Ask: %v", r.err)
 		}
 		if !r.res.Quorum {
-			t.Error("Quorum = false, want true: the one audience member did answer")
+			t.Error("Quorum = false, want true: both audience members did answer")
 		}
-		if len(r.res.Answers) != 1 {
-			t.Fatalf("len(Answers) = %d, want 1 (a second answer replaces the first, not adds to it)", len(r.res.Answers))
+		if len(r.res.Answers) != 2 {
+			t.Fatalf("len(Answers) = %d, want 2 (a second answer from one session replaces its first, not adds to it)", len(r.res.Answers))
 		}
-		if r.res.Answers[0].Verdict != VerdictOK {
-			t.Errorf("Verdict = %q, want %q (last answer wins)", r.res.Answers[0].Verdict, VerdictOK)
+		var got *Answer
+		for i := range r.res.Answers {
+			if r.res.Answers[i].From.SessionID == member.SessionID {
+				got = &r.res.Answers[i]
+			}
 		}
-		if r.res.Answers[0].Note != "actually fine" {
-			t.Errorf("Note = %q, want the second note", r.res.Answers[0].Note)
+		if got == nil {
+			t.Fatalf("no answer recorded for %s", member.SessionID)
+		}
+		if got.Verdict != VerdictOK {
+			t.Errorf("Verdict = %q, want %q (last answer wins)", got.Verdict, VerdictOK)
+		}
+		if got.Note != "actually fine" {
+			t.Errorf("Note = %q, want the second note", got.Note)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("Ask did not return once the replaced answer completed quorum")
+		t.Fatal("Ask did not return once both audience members had answered")
 	}
 }
 

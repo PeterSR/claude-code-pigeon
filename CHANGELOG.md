@@ -96,6 +96,11 @@ All notable changes to this project are documented here. Format follows
   that same unread path. It resolves through the same lookup as the rest of Claude Code's
   files now. This also makes the setting testable: exercising `monitoring on|off` used to
   mean writing to the real manifest no matter how the environment was redirected.
+- An ask test that passed by luck. `Ask` returns the moment quorum is reached, and the test
+  for a session replacing its own answer had a single audience member, so the first answer
+  ended the wait and the replacement raced a poller that was already satisfied. It held on
+  Linux and macOS and failed on Windows. A second audience member means quorum cannot
+  complete until after the change of mind is on file.
 - A data race between the two stand-down tests, over the poll interval a parked monitor
   reads. A stood-down monitor idles until its claude process exits, so a test that parks
   one on the test binary's own pid can never end it, and that goroutine keeps reading the

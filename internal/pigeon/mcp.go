@@ -922,12 +922,15 @@ func mcpAnswer(askID, verdict, note string) (string, error) {
 // selfEntry resolves the session this process belongs to the way every write
 // path must: through Self(), never through CurrentSessionID().
 //
-// A /clear mints a new session id while the monitor, the registry entry and the
-// cursors all stay under the old one. Writing a subscription or a delivery mode
-// against the environment's id either errors as unregistered, or worse creates
-// state under an id no running monitor is reading -- so the setting silently
-// never takes effect. Self also returns the namespace holding the entry, which
-// need not be the one resolved from this process's working directory.
+// A /clear mints a new session id while the monitor and the cursors stay under
+// the old one. The registry entry follows the new id -- SessionStart matches
+// `clear` -- but the monitor does not, and it is the monitor that reads. Writing
+// a subscription or a delivery mode against the environment's id therefore
+// creates state under an id no running monitor is following, so the setting
+// silently never takes effect; and in the window before the clear's SessionStart
+// lands, that id has no entry at all and the write simply errors as
+// unregistered. Self also returns the namespace holding the entry, which need
+// not be the one resolved from this process's working directory.
 func selfEntry() (Namespace, *Entry, error) {
 	ns, e, err := Self()
 	if err != nil {

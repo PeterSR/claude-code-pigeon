@@ -322,3 +322,121 @@ func TestRegisterHookRecordsTheClaudeProcess(t *testing.T) {
 		t.Error("entry has no start token, so a recycled pid would answer for this session")
 	}
 }
+
+// The transition case, and the one that has to work exactly once per session:
+// a process that was already running when the fix landed, clearing for the
+// first time.
+//
+// Such a session is stranded -- started before the hook existed, or deregistered
+// by a clear the old matcher never covered -- so it has no entry under the id it
+// is currently answering to. Its clear fires SessionStart for the new id, which
+// finally registers it, and SessionEnd for the old id, which finds nothing filed
+// under that id at all. locateSession then falls through to its same-process
+// lookup, whose whole job is answering "who am I" for a cleared session, and
+// hands back the entry that was written seconds earlier for the NEW id. Removing
+// it would undo the registration in the same breath that made it, leaving the
+// session exactly as unregistered as before and no more able to say why.
+//
+// So an entry filed under an id this event does not name is not this event's to
+// remove.
+func TestDeregisterAfterAClearKeepsTheNewSessionsEntry(t *testing.T) {
+	withHookEnv(t)
+	const (
+		stranded = "clear111-1111-1111-1111-111111111111"
+		after    = "clear222-2222-2222-2222-222222222222"
+	)
+	cwd := t.TempDir()
+
+	// Claude Code's own index still names the id being left, pointing at this
+	// process. That is what lets the same-process lookup resolve the old id to a
+	// live process at all, and it is the real state: the index is rewritten as the
+	// new session starts, and SessionEnd can reach the hook before it is.
+	writeClaudeIndex(t, os.Getpid(), stranded, "", "")
+
+	// No RegisterHook for the stranded id: having no entry is what being
+	// stranded means.
+	if err := RegisterHook(hookPayload("SessionStart", after, cwd), &strings.Builder{}); err != nil {
+		t.Fatalf("RegisterHook(after): %v", err)
+	}
+	if err := DeregisterHook(hookPayload("SessionEnd", stranded, cwd), &strings.Builder{}); err != nil {
+		t.Fatalf("DeregisterHook: %v", err)
+	}
+
+	if _, err := CurrentNamespace().ReadEntry(after); err != nil {
+		t.Errorf("the clear that rescued this session deregistered it again: %v", err)
+	}
+}
+
+// Two processes can hold one session id: `claude --continue` on a session
+// another window still has open is all it takes, and the second one to register
+// owns the entry. When the first window then clears or exits, its SessionEnd
+// names an id whose entry belongs to somebody else's live process -- and
+// removing it leaves that window running, working, and unreachable, with
+// nothing in it able to say why.
+func TestDeregisterLeavesAnEntryOwnedByAnotherLiveProcess(t *testing.T) {
+	withHookEnv(t)
+	const sid = "shared11-1111-1111-1111-111111111111"
+	cwd := t.TempDir()
+
+	if err := RegisterHook(hookPayload("SessionStart", sid, cwd), &strings.Builder{}); err != nil {
+		t.Fatalf("RegisterHook: %v", err)
+	}
+	ns := CurrentNamespace()
+	e, err := ns.ReadEntry(sid)
+	if err != nil {
+		t.Fatalf("ReadEntry: %v", err)
+	}
+	// Hand the entry to another process that is genuinely running. The test's
+	// own parent is the cheapest one to hand: alive for the length of the run,
+	// and never this process.
+	owner := os.Getppid()
+	if owner == os.Getpid() || owner <= 0 {
+		t.Skip("no distinct live process to stand in for the other window")
+	}
+	e.PID = owner
+	e.ProcStart = ProcStart(owner)
+	if err := ns.WriteEntry(e); err != nil {
+		t.Fatalf("WriteEntry: %v", err)
+	}
+
+	var stderr strings.Builder
+	if err := DeregisterHook(hookPayload("SessionEnd", sid, cwd), &stderr); err != nil {
+		t.Fatalf("DeregisterHook: %v", err)
+	}
+	if _, err := ns.ReadEntry(sid); err != nil {
+		t.Errorf("one window's SessionEnd deregistered another window's live session: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "still running") {
+		t.Errorf("nothing said why the entry was left in place:\n%s", stderr.String())
+	}
+}
+
+// The other half of the guard: an entry whose owning process is gone is a
+// leftover, and clearing it is exactly what this hook is for. Protecting it
+// would trade one leak for another.
+func TestDeregisterStillRemovesAnEntryWhoseOwnerIsGone(t *testing.T) {
+	withHookEnv(t)
+	const sid = "stale111-1111-1111-1111-111111111111"
+	cwd := t.TempDir()
+
+	if err := RegisterHook(hookPayload("SessionStart", sid, cwd), &strings.Builder{}); err != nil {
+		t.Fatalf("RegisterHook: %v", err)
+	}
+	ns := CurrentNamespace()
+	e, err := ns.ReadEntry(sid)
+	if err != nil {
+		t.Fatalf("ReadEntry: %v", err)
+	}
+	e.PID = deadPID(t)
+	e.ProcStart = ""
+	if err := ns.WriteEntry(e); err != nil {
+		t.Fatalf("WriteEntry: %v", err)
+	}
+
+	if err := DeregisterHook(hookPayload("SessionEnd", sid, cwd), &strings.Builder{}); err != nil {
+		t.Fatalf("DeregisterHook: %v", err)
+	}
+	if _, err := ns.ReadEntry(sid); err == nil {
+		t.Error("an entry whose process is gone survived deregistration")
+	}
+}

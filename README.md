@@ -745,6 +745,21 @@ well as `startup`, so a resumed session registers every time; the monitor did no
 Claude Code rearms it inconsistently across a resume, sometimes under a new id and
 sometimes not at all.
 
+It fires on `clear` too, and it has to. A `/clear` keeps the process and the socket but
+mints a new session id, and Claude Code ends the old session first: `SessionEnd` runs with
+reason `clear` and takes the entry with it. Matching only `startup|resume` therefore did
+not skip a registration, it left the session deregistered for the rest of the process's
+life, since no further `SessionStart` is ever coming for a process already running. The
+two events pair off instead: `SessionEnd` removes the entry for the id being left,
+`SessionStart` writes one for the id being entered. `compact` is matched as well, which
+changes nothing on a healthy session and is the one recurring event that lets a session
+stranded by an older version register itself again without a restart.
+
+Deregistration removes only an entry filed under the exact id the event names, and only
+when the process that owns it is this one or is gone. Two windows can hold one session id
+-- `claude --continue` on a session another window still has open is enough -- and without
+that check, one window's `/clear` deregisters the other window's live session.
+
 **If you arm a monitor and then turn delivery off for one session** with
 `PIGEON_MONITOR=off`, that monitor registers and then goes quiet rather than exiting. The
 difference is not academic. Claude Code reports a monitor that exits back into the session

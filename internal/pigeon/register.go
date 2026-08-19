@@ -265,6 +265,34 @@ func DeregisterHook(in io.Reader, stderr io.Writer) error {
 	if err != nil || e == nil {
 		return nil
 	}
+
+	// An exact id match, refusing locateSession's same-process fallback.
+	//
+	// That fallback exists for readers: handed a cleared session's new id it
+	// finds the entry still filed under the old one, which is the right answer
+	// to "who am I". It is the wrong answer to "what should I delete". A clear
+	// fires SessionEnd for the old id and SessionStart for the new one, and if
+	// the start wins the race the fallback would match the just-written entry by
+	// process and remove it -- turning a fixed clear back into an unregistered
+	// session, intermittently, depending on hook ordering. An entry filed under
+	// a different id than the event names is not this event's to remove.
+	if e.SessionID != sid {
+		return nil
+	}
+
+	// And the entry has to be ours. Two processes can hold one session id --
+	// `claude --continue` on a session another window still has open is all it
+	// takes -- and the second one to register owns the entry. Without this, a
+	// clear or an exit in the first window deregisters the second window's live
+	// session, which then goes unreachable for reasons nothing in it can see.
+	//
+	// Only a live owner is protected. An entry whose process is gone is a
+	// leftover, and removing it is the tidying this hook exists for.
+	if mine := claudePIDFor(sid); mine > 0 && e.PID > 0 && e.PID != mine && ProcessAlive(e.PID, e.ProcStart) {
+		logf("session=%s is registered to pid %d, which is still running; leaving its entry alone", Short(sid), e.PID)
+		return nil
+	}
+
 	ns.RemoveEntry(e.SessionID)
 	logf("deregistered session=%s from namespace %s", Short(e.SessionID), ns)
 	return nil

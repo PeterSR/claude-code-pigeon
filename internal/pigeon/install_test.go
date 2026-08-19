@@ -147,8 +147,16 @@ func TestInstallWritesTheWholePlugin(t *testing.T) {
 	// Resume matters as much as startup: it is the case where the monitor's
 	// own rearm has never been reliable, so a session comes back alive and
 	// unregistered.
-	if m := start[0].Matcher; !strings.Contains(m, "startup") || !strings.Contains(m, "resume") {
-		t.Errorf("SessionStart matcher = %q, want it to cover startup and resume", m)
+	//
+	// Clear matters more than either, and it is the one this list was missing.
+	// SessionEnd fires with reason "clear" and takes the entry with it, so a
+	// source not covered here is not a registration skipped, it is a session
+	// deregistered for the rest of its process's life -- and no further
+	// SessionStart is ever coming for a process that is already running.
+	for _, source := range []string{"startup", "resume", "clear"} {
+		if !strings.Contains(start[0].Matcher, source) {
+			t.Errorf("SessionStart matcher = %q, want it to cover %q", start[0].Matcher, source)
+		}
 	}
 	end := hooks.Hooks["SessionEnd"]
 	if len(end) != 1 || len(end[0].Hooks) != 1 {

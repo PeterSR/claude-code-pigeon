@@ -4,6 +4,41 @@ All notable changes to this project are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
 [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **`/clear` no longer leaves a session unregistered for the rest of its life.** The
+  `SessionStart` hook matched `startup|resume` and deliberately not `clear`, on the
+  reasoning that a cleared session keeps its process and its socket and only changes id, so
+  registering again would file a second entry for one session. That was true until
+  `SessionEnd` started running `pigeon deregister` in 0.4.0. Claude Code fires `SessionEnd`
+  with reason `clear` for the id being left, so the entry was deleted and no matched source
+  remained to write a replacement -- and no further `SessionStart` ever comes for a process
+  that is already running. A session that cleared once was unreachable by every transport,
+  socket included, until it was restarted, and the only thing that said so was the status
+  line reading `unregistered`.
+
+  The matcher is now `startup|resume|clear|compact`. The two events pair off: `SessionEnd`
+  removes the entry for the id being left, `SessionStart` writes one for the id being
+  entered. `compact` changes no id and rewrites an entry that is normally already correct;
+  it is there because it is the one recurring event a long-lived session gets, and so the
+  only way a session stranded by this bug can register itself again without a restart.
+
+  `pigeon install` rewrites the manifest, but a session already running keeps the hooks it
+  started with, so this reaches existing sessions only when they next start, resume or
+  compact.
+
+- **Deregistration no longer removes another process's entry.** `SessionEnd` resolved its
+  entry through `locateSession`, which falls back to matching by process for exactly the
+  cleared-session case, and then removed whatever came back. Two failures followed from
+  that. A stranded session's first clear could have its brand new entry deleted by the
+  `SessionEnd` for the id it had just left, undoing the registration in the same breath
+  that made it. And two windows can hold one session id -- `claude --continue` on a session
+  another window still has open is enough -- so one window's clear or exit deregistered the
+  other window's live session, which then went unreachable with nothing in it able to say
+  why. An entry is removed now only when it is filed under the exact id the event names and
+  its owning process is either this one or gone.
+
 ## [0.4.0] - 2026-08-18
 
 ### Added

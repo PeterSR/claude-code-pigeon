@@ -125,17 +125,39 @@ func monitorManifest(exe string, on bool) []monitorSpec {
 // whatever the monitor setting says. Being findable is not the part anybody
 // opted out of.
 //
-// SessionStart matches startup and resume but deliberately not "clear": a
-// cleared session keeps its process and its socket, and Claude Code mints a new
-// id for it, so registering on clear would add a second entry for one session
-// and leave the first answering for a spool nothing writes to.
+// SessionStart matches every source Claude Code fires, and "clear" is the one
+// that matters. It was excluded once, on the reasoning that a cleared session
+// keeps its process and its socket and only its id changes, so registering
+// again would add a second entry for one session and leave the first answering
+// for a spool nothing writes to. That reasoning was sound while nothing removed
+// the first entry. It stopped being sound the moment SessionEnd started running
+// `deregister`, because Claude Code fires SessionEnd with reason "clear" for the
+// OLD id before starting the new one: the entry is deleted, no source matched to
+// write a replacement, and the session spent the rest of its process life
+// unregistered, with no further SessionStart ever coming to fix it. Clearing
+// twice in a morning was enough to make a machine's sessions invisible to each
+// other, and the only symptom was the status line saying so.
+//
+// The two events now pair off: SessionEnd removes the entry for the id being
+// left, SessionStart writes one for the id being entered, and a session that
+// clears stays addressable under whatever id it currently answers to. Their
+// firing order does not matter, because DeregisterHook removes only an entry
+// filed under the exact id it was handed.
+//
+// "compact" is in the list for a different reason. It changes no id and the
+// entry it would rewrite is normally already correct, so it is not a fix for
+// anything -- it is the one recurring event a long-lived session gets, and
+// therefore the only chance a session stranded by some older bug has to come
+// back on its own. Re-registration is safe to repeat: register() preserves the
+// name, subscriptions and delivery modes on the existing entry and seeds only
+// cursors it has never seen.
 func hooksManifest(exe string) hooksFile {
 	q := shellQuote(exe)
 	return hooksFile{
 		Description: "Registers this session with pigeon so other sessions can find it",
 		Hooks: map[string][]hookGroup{
 			"SessionStart": {{
-				Matcher: "startup|resume",
+				Matcher: "startup|resume|clear|compact",
 				Hooks:   []hookSpec{{Type: "command", Command: q + " register", Timeout: 10}},
 			}},
 			"SessionEnd": {{
